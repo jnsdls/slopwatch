@@ -32,6 +32,24 @@ _Avoid_: tracked PR, managed PR
 Every Run of a Watched PR, newest first, including superseded and cancelled ones. It belongs to the PR, so it survives unwatching and re-watching.
 _Avoid_: run group, timeline
 
+### Outcomes
+
+**Outcome**:
+What one Step reports for one Run: a Verdict plus named outputs such as Findings, a probability or a note. It belongs to the Run's head SHA and to nothing else.
+_Avoid_: result, status
+
+**Verdict**:
+The one-word part of an Outcome. The Step reports pass, fail or inconclusive. The daemon assigns error, cancelled, skipped or missing when the Step didn't report. Only pass satisfies a Gate.
+_Avoid_: status, conclusion
+
+**Finding**:
+One specific problem a Step reports about the PR, with a severity and optionally a file and line. Later Steps, such as Fix, read the Findings of the Steps upstream of them.
+_Avoid_: issue, comment, violation
+
+**Effect**:
+A change on GitHub, such as a comment, a label or a merge, that a Step asks for and the daemon carries out only while the Step's Run is still current.
+_Avoid_: action, side effect
+
 ### Attention
 
 **Human Step**:
