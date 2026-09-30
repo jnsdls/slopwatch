@@ -17,9 +17,31 @@ The condition over Step outcomes that declares a PR shippable.
 _Avoid_: shippable check, done condition
 
 **Run**:
-One execution of a Pipeline against a Watched PR. A push made by the Run's own Steps continues it; a push from anyone else ends it and starts a new Run.
+One execution of a Pipeline against one head SHA of a Watched PR. Any push, including one made by a Fix Step, ends the Run and starts a new one.
 _Avoid_: execution, build, job
+
+**End reason**:
+Why a Run stopped: shippable, not shippable, fix pushed, superseded (by a push from outside the Run), or cancelled (by the developer).
+_Avoid_: status, result
 
 **Watched PR**:
 A pull request the app has picked up and runs its repo's Pipeline on.
 _Avoid_: tracked PR, managed PR
+
+**Run history**:
+Every Run of a Watched PR, newest first, including superseded and cancelled ones. It belongs to the PR, so it survives unwatching and re-watching.
+_Avoid_: run group, timeline
+
+### Attention
+
+**Human Step**:
+A Step whose outcome only the developer can supply: approve or reject, with an optional note later Steps can read. Waiting on anyone else, such as a GitHub reviewer, is a different Step.
+_Avoid_: approval step, manual step
+
+**Escalation**:
+The daemon's report that a Run can't go further without the developer, such as a Step error, a Fix round cap reached, a stall, or a not-shippable end. It isn't a node in the Pipeline.
+_Avoid_: alert, failure, incident
+
+**Inbox**:
+The one list, across repos, of open Human Steps and Escalations waiting on the developer, oldest first.
+_Avoid_: queue, notifications, attention list
