@@ -98,6 +98,8 @@ main{flex:1;overflow:hidden;position:relative}
 .a-step.adv{border-style:dashed}
 .a-step .hd{display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer}
 .a-step .hd .nm{font-weight:600}.a-step .bd{padding:2px 12px 10px 27px;border-top:1px solid var(--line)}
+.seg{display:inline-flex}.seg button{border-radius:0;padding:2px 10px}.seg button:first-child{border-radius:6px 0 0 6px}.seg button:last-child{border-radius:0 6px 6px 0}.seg button.on{background:#2b3442;border-color:var(--dim);color:var(--text)}
+.a-graph{margin-top:8px;border:1px solid var(--line);border-radius:8px;overflow:auto;background-image:radial-gradient(#252b34 1px,transparent 1px);background-size:18px 18px}
 .a-gate{border:2px solid #3d3570;background:#17142a;border-radius:8px;padding:7px 10px;display:flex;gap:8px;align-items:center}
 .a-gate.g-pass{border-color:var(--pass)}.a-gate.g-fail{border-color:var(--fail)}.a-gate.g-pending{border-color:var(--inc)}
 
@@ -378,7 +380,12 @@ function runMeta(p,r){const c=cost(r);return `Run ${r.n} · <span class="mono">$
 function links(p){return `<a href="#" onclick="return false">PR on GitHub ↗</a> · <a href="#" onclick="return false">${esc(p.branch)} ↗</a>`}
 
 /* ======================= variant A: three panes ======================= */
-const A={src:'inbox',sel:null,open:{},run:null};
+function skipWhy(p,r,s){
+  if(r.steps[s.id].note)return r.steps[s.id].note;
+  if(s.after)return 'Gate '+(s.after==='pass'?'failed':'passed');
+  const bad=s.needs.filter(n=>!good(r.steps[n]));return bad.length?bad.map(n=>def(p,n).name).join(', ')+" didn't pass":'Condition false';
+}
+const A={src:'inbox',sel:null,open:{},run:null,view:'list',node:null};
 function renderA(){
   const ib=inbox(),repos=[...new Set(PRS.map(p=>p.repo))];
   let list=A.src==='inbox'?ib.map(e=>e.p):A.src==='all'?PRS.filter(p=>!cur(p).end):A.src==='ended'?PRS.filter(p=>cur(p).end):PRS.filter(p=>p.repo===A.src);
@@ -396,15 +403,16 @@ function renderA(){
   for(const s of pipe(p)){
     if(s.after&&s===pipe(p).find(x=>x.after))steps.push(`<div class="a-gate g-${g}"><b style="letter-spacing:.12em;font-size:11px;color:#c8bcff">GATE</b><span class="pill ${g}">${g}</span><span class="dim small">${pipe(p).filter(x=>x.gate).map(x=>x.name).join(' · ')}</span></div>`);
     const o=r.steps[s.id],k=r.n+s.id,open=A.open[k]??(o.s==='ask'||o.s==='error'||(o.s==='fail'));
-    steps.push(`<div class="a-step ${s.gate||s.after?'':'adv'} st-${vis(o)}"><div class="hd" onclick="A.open['${k}']=${!open};render()"><span class="dot"></span><span class="nm">${esc(s.name)}</span>${s.write?'<span class="chip write">commit ends Run</span>':''}${!s.gate&&!s.after?'<span class="chip adv">advisory</span>':''}${o.findings?.length?`<span class="chip">${o.findings.length} finding${o.findings.length>1?'s':''}</span>`:''}<span class="spacer"></span><span class="vl">${vlabel(o)}</span><span class="dim small" style="width:52px;text-align:right">${stepTime(o)}</span></div>${open?`<div class="bd">${evidence(p,r,s.id)}</div>`:''}</div>`);
+    steps.push(`<div class="a-step ${s.gate||s.after?'':'adv'} st-${vis(o)}"><div class="hd" onclick="A.open['${k}']=${!open};render()"><span class="dot"></span><span class="nm">${esc(s.name)}</span>${s.write?'<span class="chip write">commit ends Run</span>':''}${!s.gate&&!s.after?'<span class="chip adv">advisory</span>':''}${o.findings?.length?`<span class="chip">${o.findings.length} finding${o.findings.length>1?'s':''}</span>`:''}<span class="spacer"></span>${o.s==='skipped'?`<span class="dim small">${esc(skipWhy(p,r,s))}</span>`:''}<span class="vl">${vlabel(o)}</span><span class="dim small" style="width:52px;text-align:right">${stepTime(o)}</span></div>${open?`<div class="bd">${evidence(p,r,s.id)}</div>`:''}</div>`);
   }
   if(!pipe(p).some(x=>x.after))steps.push(`<div class="a-gate g-${g}"><b style="letter-spacing:.12em;font-size:11px;color:#c8bcff">GATE</b><span class="pill ${g}">${g}</span></div>`);
   const det=`<div class="a-det"><div style="display:flex;gap:10px;align-items:center"><h2>${esc(p.title)}</h2>${gatePill(p,r)}</div>
     <div class="dim small" style="margin:4px 0 10px">${esc(p.id)} · ${links(p)}</div>
     ${e&&r===cur(p)?askBox(e):''}
     <div class="sect">Run history</div><div style="display:flex;gap:6px;flex-wrap:wrap">${p.runs.map(x=>`<span class="histchip ${x===r?'on':''}" onclick="A.run=${x.n};render()"><span class="dot st-${x.end?(x.end==='merged'||x.end==='shippable'?'pass':x.end==='not shippable'?'fail':'skipped'):'run'}"></span>Run ${x.n} <span class="dim">${x.end?esc(endText(x)):'live'}</span></span>`).join('')}</div>
-    <div class="dim small" style="margin-top:10px">${runMeta(p,r)} ${!r.end&&r===cur(p)?`<button style="margin-left:8px" onclick="ACT.cancel('${p.id}')">Cancel Run</button>`:''}</div>
-    <div class="a-steps">${steps.join('')}</div></div>`;
+    <div class="dim small" style="margin-top:10px;display:flex;align-items:center;gap:8px"><span>${runMeta(p,r)}</span><span class="spacer"></span><span class="seg"><button class="${A.view==='list'?'on':''}" onclick="A.view='list';render()">List</button><button class="${A.view==='graph'?'on':''}" onclick="A.view='graph';render()">Graph</button></span> ${!r.end&&r===cur(p)?`<button style="margin-left:8px" onclick="ACT.cancel('${p.id}')">Cancel Run</button>`:''}</div>
+    ${A.view==='list'?`<div class="a-steps">${steps.join('')}</div>`
+      :`<div class="a-graph">${canvas(p,r,A.node,'A.node')}</div>${A.node?`<div class="a-step" style="margin-top:8px"><div class="hd"><b>${esc(def(p,A.node).name)}</b><span class="spacer"></span><button onclick="A.node=null;render()">×</button></div><div class="bd">${evidence(p,r,A.node)}</div></div>`:'<div class="dim small" style="margin-top:6px">Click a Step for its Outcome.</div>'}`}</div>`;
   return `<div class="a">${src}<div class="a-list">${rows}</div>${det}</div>`;
 }
 
@@ -429,23 +437,27 @@ function layout(p){
   for(const c in cols)cols[c].forEach((id,i)=>pos[id]={x:24+c*205,y:40+i*96});
   pos.__gate={x:24+gc*205,y:40};return pos;
 }
-function renderBRun(){
-  const p=pr(B.open),r=p.runs.find(x=>x.n===B.run)||cur(p),g=gate(p,r),pos=layout(p),e=entryFor(p);
+function canvas(p,r,sel,pick){
+  const g=gate(p,r),pos=layout(p);
   const W=Math.max(...Object.values(pos).map(v=>v.x))+260,H=Math.max(...Object.values(pos).map(v=>v.y))+140;
   const edge=(a,b,dash,lbl)=>{const x1=a.x+(a.w||170),y1=a.y+28,x2=b.x,y2=b.y+28,mx=(x1+x2)/2;return `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" stroke="${dash?'#3d3570':'#56606d'}" stroke-width="1.5" fill="none" ${dash?'stroke-dasharray="5 4"':''}/>${lbl?`<text x="${mx}" y="${(y1+y2)/2-4}" fill="#8a95a3" font-size="11">${lbl}</text>`:''}`};
   let svg='';const G={...pos.__gate,w:150};
   for(const s of pipe(p)){for(const n of s.needs||[])svg+=edge(pos[n],pos[s.id]);if(s.gate)svg+=edge(pos[s.id],G,1);if(s.after)svg+=edge(G,pos[s.id],0,s.after==='pass'?'passes':'fails')}
-  const nodes=pipe(p).map(s=>{const o=r.steps[s.id];return `<div class="node st-${vis(o)} ${!s.gate&&!s.after?'adv':''} ${B.sel===s.id?'sel':''}" style="left:${pos[s.id].x}px;top:${pos[s.id].y}px" onclick="B.sel='${s.id}';render()">
+  const nodes=pipe(p).map(s=>{const o=r.steps[s.id];return `<div class="node st-${vis(o)} ${!s.gate&&!s.after?'adv':''} ${sel===s.id?'sel':''}" style="left:${pos[s.id].x}px;top:${pos[s.id].y}px" onclick="${pick}='${s.id}';render()">
     <div class="top"><span class="dot"></span><b>${esc(s.name)}</b><span class="dim small">${stepTime(o)}</span></div>
     <div class="small"><span class="vl">${vlabel(o)}</span>${o.findings?.length?` · ${o.findings.length} finding${o.findings.length>1?'s':''}`:''}${o.usd?` · $${o.usd.toFixed(2)}`:''}</div>${s.write?'<span class="chip write">commit ends Run</span>':''}</div>`}).join('');
   const gn=`<div class="gnode g-${g}" style="left:${G.x}px;top:${G.y}px"><h4><span>GATE</span><span class="pill ${g}">${g}</span></h4>${pipe(p).filter(s=>s.gate).map(s=>`<div class="term st-${vis(r.steps[s.id])}"><span class="dot"></span>${esc(s.name)}</div>`).join('')}</div>`;
+  return `<div style="position:relative;width:${W}px;height:${H}px"><svg width="${W}" height="${H}" style="position:absolute;inset:0">${svg}</svg>${nodes}${gn}</div>`;
+}
+function renderBRun(){
+  const p=pr(B.open),r=p.runs.find(x=>x.n===B.run)||cur(p),e=entryFor(p);
   const side=B.sel?`<div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0">${esc(def(p,B.sel).name)}</h3><button onclick="B.sel=null;render()">×</button></div>${evidence(p,r,B.sel)}`
     :`<h3 style="margin:0 0 4px">${esc(p.title)}</h3><div class="dim small">${esc(p.id)}</div><div class="small" style="margin:6px 0">${links(p)}</div>${e&&r===cur(p)?askBox(e):''}
      <div class="sect">This Run</div><div class="small">${runMeta(p,r)}</div><div class="small" style="margin-top:4px">${r.end?'Ended: '+esc(endText(r)):'Live'}</div>
      ${!r.end&&r===cur(p)?`<button style="margin-top:8px" class="no" onclick="ACT.cancel('${p.id}')">Cancel Run</button>`:''}
      <div class="dim small" style="margin-top:14px">Click a Step for its Outcome.</div>`;
   return `<div class="b-run"><div class="b-bar"><button onclick="B.open=null;render()">← Board</button><b>${esc(p.title)}</b><span class="dim">${esc(p.id)}</span>${gatePill(p,r)}</div>
-   <div class="b-body"><div class="b-canvas"><div style="position:relative;width:${W}px;height:${H}px"><svg width="${W}" height="${H}" style="position:absolute;inset:0">${svg}</svg>${nodes}${gn}</div></div><div class="b-side">${side}</div></div>
+   <div class="b-body"><div class="b-canvas">${canvas(p,r,B.sel,'B.sel')}</div><div class="b-side">${side}</div></div>
    <div class="b-hist"><span class="dim small" style="align-self:center">Run history</span>${p.runs.map(x=>`<span class="histchip ${x===r?'on':''}" onclick="B.run=${x.n};render()">Run ${x.n} · <span class="mono">${x.sha}</span> <span class="dim">${x.end?esc(endText(x)):'live'} · ${fmtUsd(cost(x))}</span></span>`).join('')}</div></div>`;
 }
 
