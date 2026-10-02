@@ -66,6 +66,10 @@ _Avoid_: override, exception, skip
 One specific problem a Step reports about the PR, with a severity and optionally a file and line. Later Steps, such as Fix, read the Findings of the Steps upstream of them.
 _Avoid_: issue, comment, violation
 
+**Step log**:
+What a Step wrote while it ran, its stderr and log messages, one per attempt. It is kept for a while and then pruned, unlike the Outcome, which stays in Run history.
+_Avoid_: output, transcript
+
 **Effect**:
 A change on GitHub, such as a comment, a label, a check rerun, a rebase or a merge, that a Step asks for and the daemon carries out only while the Step's Run is still current.
 _Avoid_: action, side effect
