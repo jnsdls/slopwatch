@@ -13,8 +13,12 @@ A graph of Steps bound to one repo, with one input (a Watched PR) and one output
 _Avoid_: workflow, flow
 
 **Gate**:
-The condition over Step outcomes that declares a PR shippable.
+The condition over Step Verdicts that declares a PR shippable. It is pass, fail or pending, and it sits in the Pipeline as a node that later Steps such as Merge and Fix run after.
 _Avoid_: shippable check, done condition
+
+**Condition**:
+The rule, over upstream Verdicts, the Gate and facts about the PR, that decides whether a Step runs. A Step whose Condition is false is skipped.
+_Avoid_: filter, trigger, when-clause
 
 **Run**:
 One execution of a Pipeline against one head SHA of a Watched PR. Any push, including a Fix commit or a rebase made by slopwatch, ends the Run and starts a new one.
@@ -35,12 +39,16 @@ _Avoid_: run group, timeline
 ### Outcomes
 
 **Outcome**:
-What one Step reports for one Run: a Verdict plus named outputs such as Findings, a probability or a note. It belongs to the Run's head SHA and to nothing else.
+What one Step reports for one Run: a Verdict plus named outputs such as Findings, a probability or a note. It belongs to the Run's head SHA and to nothing else, so a later Run on the same SHA reuses it unless its Verdict was error, cancelled or missing.
 _Avoid_: result, status
 
 **Verdict**:
-The one-word part of an Outcome. The Step reports pass, fail or inconclusive. The daemon assigns error, cancelled, skipped or missing when the Step didn't report. Only pass satisfies a Gate.
+The one-word part of an Outcome. The Step reports pass, fail or inconclusive. The daemon assigns error, cancelled, skipped or missing when the Step didn't report. A Gate term is satisfied only by pass, unless the term also accepts skipped.
 _Avoid_: status, conclusion
+
+**Waiver**:
+The developer's ruling that one Step's settled, non-pass Verdict counts as pass for one head SHA. It carries a category (false positive, doesn't apply, accepted risk, fix in follow-up) and a reason.
+_Avoid_: override, exception, skip
 
 **Finding**:
 One specific problem a Step reports about the PR, with a severity and optionally a file and line. Later Steps, such as Fix, read the Findings of the Steps upstream of them.
