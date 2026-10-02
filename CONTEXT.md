@@ -9,7 +9,7 @@ A configured, reusable unit of work with a typed outcome, such as a Jev judgemen
 _Avoid_: check, task, job, node
 
 **Plugin**:
-The executable a Step runs, together with the manifest that describes it. Built-in Steps such as Jev, CI and Merge are Plugins that ship with the app. A Plugin runs only once the developer has approved it, which covers what its manifest asks for: a workspace, Effects and Secrets. Built-in Plugins come approved.
+The executable a Step runs, together with the manifest that describes it. Built-in Plugins, such as Jev, CI and Merge, ship with the app. A Plugin runs only once the developer has approved it, which covers what its manifest asks for: a workspace, Effects and Secrets. Built-in Plugins come approved.
 _Avoid_: step type, runner, action
 
 **Approval**:
@@ -33,7 +33,7 @@ A graph of Steps bound to one repo, with one input (a Watched PR) and one output
 _Avoid_: workflow, flow
 
 **Gate**:
-The condition over Step Verdicts that declares a PR shippable. It is pass, fail or pending, and it sits in the Pipeline as a node that later Steps such as Merge and Fix run after.
+The condition over Step Verdicts that declares a PR shippable. It is pass, fail or pending, and it sits in the Pipeline as a node that later Steps such as Merge and Fix run after. A Step the Gate doesn't reference is advisory: it still runs and its Findings still reach later Steps, but it can't hold the PR back.
 _Avoid_: shippable check, done condition
 
 **Condition**:
@@ -41,7 +41,7 @@ The rule, over upstream Verdicts, the Gate and facts about the PR, that decides 
 _Avoid_: filter, trigger, when-clause
 
 **Run**:
-One execution of a Pipeline against one head SHA of a Watched PR, using the Pipeline as it stands on the PR's root base when the Run starts. The root base is the PR's base branch, or for a PR in a Stack, the base of the Stack's bottom PR. Any push, including a Fix commit or a rebase made by slopwatch, ends the Run and starts a new one. A change to the Pipeline on the base branch starts a new Run on the same SHA for a PR whose latest Run has ended.
+One execution of a Pipeline against one head SHA of a Watched PR, using the Pipeline as it stands on the PR's root base when the Run starts. The root base is the PR's base branch, or for a PR in a Stack, the base of the Stack's bottom PR. Any push, including a Fix commit or a rebase made by slopwatch, ends the Run and starts a new one. A change to the Pipeline on the root base starts a new Run on the same SHA for a PR whose latest Run has ended.
 _Avoid_: execution, build, job
 
 **End reason**:

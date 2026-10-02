@@ -1,5 +1,7 @@
 # Every push starts a new Run, and Fix is a terminal Step
 
+Amended by ADR 0008: any Step that declares `workspace: write` is terminal, and the Fix round cap counts commits from all of them.
+
 A Run executes the Pipeline against one head SHA. Any push ends it, including a push made by slopwatch's own Fix Step, and the next Run starts from the new SHA. We first had Fix loop inside a Run, with the daemon's own pushes continuing it. We dropped that because the Pipeline would need cycles, and outcomes would need SHA-keying rules within a single Run. With this design the Pipeline is a DAG and every outcome in a Run belongs to the same SHA.
 
 ## Consequences
