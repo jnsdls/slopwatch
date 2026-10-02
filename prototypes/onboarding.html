@@ -10,6 +10,10 @@
     A  setup sheet: a linear five-step modal over the main window
     B  canvas first: the repo opens straight into the Pipeline editor with a readiness rail
     C  repo page: one-click add, then a non-linear checklist on the repo's page that stays until the first Run
+  Round 2, after "B is closest by far, move more into the center, make it a guided tour":
+    D  B's canvas with a coach-mark tour: spotlight plus a card that walks starter, Gate, Fix, keys, publish, watch, first Run
+    E  chapters: the canvas sits in the center and fills in as a bottom card walks six chapters; the Library is a drawer
+  Settled in round 1: merge-it-now button, watching before the Pipeline merges, fixed auto-created label, no dry run.
   All three share one fake daemon. Nothing touches GitHub. Press "state" to see what the daemon holds.
   Open questions every variant has to answer, flagged in the UI with a ?:
     Q1  starter Pipelines (bundles) or pick Library Steps one by one?
@@ -104,6 +108,32 @@ main{flex:1;overflow:hidden;position:relative}
 .c-item .bd{padding:0 12px 12px 38px}
 .c-item.done .hd b{color:var(--dim)}
 .prl{display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)}
+
+/* shared tour canvas */
+.node.r-run{border-color:#1f4a7a}.node.r-pass{border-color:#23582f}.node.r-error{border-color:#6b2427}.node.r-skip{opacity:.5}.node.r-ask{border-color:#5e4a18}
+.inode{position:absolute;width:130px;background:#12151b;border:1.5px dashed var(--muted);border-radius:22px;padding:8px 12px;font-size:12px}
+.hot{outline:2px solid var(--accent);outline-offset:3px;border-radius:10px}
+/* D: coach marks */
+.d{display:flex;height:100%}
+.d-can{flex:1;position:relative;overflow:auto;background-image:radial-gradient(#252b34 1px,transparent 1px);background-size:18px 18px}
+.spot{position:fixed;border-radius:12px;box-shadow:0 0 0 9999px #000b;pointer-events:none;z-index:30;transition:all .25s}
+.coach{position:fixed;width:340px;background:var(--panel);border:1px solid var(--accent);border-radius:12px;padding:14px;z-index:31;box-shadow:0 10px 30px #000c;transition:top .25s,left .25s}
+.coach .k{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);font-weight:700}
+.coach h3{margin:4px 0 6px;font-size:15px}
+.coach .ft{display:flex;gap:8px;align-items:center;margin-top:12px}
+.center-card{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:560px;max-height:80%;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;z-index:5}
+.d-bar{position:absolute;top:10px;left:50%;transform:translateX(-50%);display:flex;gap:8px;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:4px 12px;z-index:6;font-size:12px}
+/* E: chapters */
+.e{display:flex;flex-direction:column;height:100%;position:relative}
+.e-steps{display:flex;justify-content:center;gap:6px;padding:10px;border-bottom:1px solid var(--line)}
+.e-steps span{padding:3px 10px;border-radius:999px;font-size:12px;color:var(--muted);border:1px solid var(--line);cursor:pointer}
+.e-steps span.on{color:var(--text);border-color:var(--accent);background:#1a1730}.e-steps span.done{color:var(--pass)}
+.e-can{flex:1;position:relative;overflow:auto;display:flex;align-items:center;justify-content:center;background-image:radial-gradient(#252b34 1px,transparent 1px);background-size:18px 18px}
+.e-card{position:absolute;left:50%;bottom:70px;transform:translateX(-50%);width:720px;max-height:46%;overflow:auto;background:var(--panel);border:1px solid var(--accent);border-radius:14px;padding:16px 18px;box-shadow:0 10px 30px #000c}
+.e-card .k{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);font-weight:700}
+.e-card h3{margin:4px 0 6px;font-size:17px}
+.e-drawer{position:absolute;left:0;top:0;bottom:0;width:250px;background:var(--panel);border-right:1px solid var(--line);overflow:auto;padding:10px;z-index:8}
+.e-drawer .preset{margin-bottom:6px;padding:6px 8px;flex-direction:column;gap:2px}
 </style>
 </head>
 <body>
@@ -152,7 +182,7 @@ function reset(){S={
   watched:[],            // PR numbers carrying the label
   runs:{},               // pr -> {steps:{id:state}, t}
   dry:null,              // C only: dry run on one PR
-  A:{open:false,step:0}, B:{}, C:{open:{}},
+  A:{open:false,step:0}, B:{}, C:{open:{}}, D:{}, E:{},
 };}
 reset();
 const repo=()=>GH_REPOS.find(r=>r.id===S.repo);
@@ -314,16 +344,92 @@ function dryBox(){const r=S.dry;const el=(Date.now()-r.t)/1000;let i=0;
   const cls={wait:'wait',run:'run',pass:'pass',skip:'skip',error:'fail',ask:'run'};
   return `<div class="card" style="margin-top:8px"><b class="small">Dry run on #${r.pr}</b>${S.steps.map(id=>`<div class="row small" style="padding:2px 0"><span class="dotx ${cls[r.steps[id]]}"></span><span style="width:170px">${esc(P(id).name)}</span><span class="dim">${r.steps[id]}${P(id).write||P(id).plugin==='merge'?' (never in a dry run)':''}</span></div>`).join('')}</div>`}
 
+
+/* ======================= shared tour pieces (D, E) ======================= */
+const firstRunState=()=>{const n=Object.keys(S.runs)[0];if(!n)return null;tickRun(S.runs[n]);return S.runs[n]};
+function tourCanvas({input=false,hot=null}={}){
+  const pos=layoutB(),G=pos.__gate,dx=input?170:0;for(const k in pos)pos[k]={x:pos[k].x+dx,y:pos[k].y};
+  const run=firstRunState();let svg='';
+  const W=Math.max(700,...Object.values(pos).map(v=>v.x+230)),H=Math.max(260,...Object.values(pos).map(v=>v.y+120));
+  const edge=(a,b,dash,lbl)=>{const x1=a.x+(a.w||170),y1=a.y+28,x2=b.x,y2=b.y+28,mx=(x1+x2)/2;return `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" stroke="${dash?'#3d3570':'#56606d'}" stroke-width="1.5" fill="none" ${dash?'stroke-dasharray="5 4"':''}/>${lbl?`<text x="${mx}" y="${(y1+y2)/2-4}" fill="#8a95a3" font-size="11">${lbl}</text>`:''}`};
+  const I={x:20,y:40,w:130};
+  for(const id of S.steps){const p=P(id);const n=(p.needs||[]).filter(x=>pos[x]);for(const x of n)svg+=edge(pos[x],pos[id]);if(input&&!n.length&&!p.after)svg+=edge(I,pos[id]);if(p.gate)svg+=edge(pos[id],{...pos.__gate,w:150},1);if(p.after)svg+=edge({...pos.__gate,w:150},pos[id],0,p.after==='pass'?'passes':'fails')}
+  const miss=id=>{const p=P(id);return (p.secret&&!S.secrets[p.secret])||(p.login&&!S.logins[p.login])};
+  const rcls=id=>run?'r-'+run.steps[id]:'';
+  const lbl={wait:'waiting',run:'running…',pass:'pass',skip:'skipped',error:'error',ask:'waiting on you'};
+  const nodes=S.steps.map(id=>{const p=P(id);return `<div id="n-${id}" class="node ${!p.gate&&!p.after?'adv':''} ${miss(id)&&!run?'miss':''} ${rcls(id)} ${hot===id?'hot':''}" style="left:${pos[id].x}px;top:${pos[id].y}px"><b>${esc(p.name)}</b><span class="mono dim small">${p.inline?p.plugin:'lib/'+id}</span>${run?`<span class="small">${lbl[run.steps[id]]}</span>`:miss(id)?`<span class="chip bad" style="cursor:pointer" onclick="${p.secret?`ACT.setSecret('${p.secret}')`:`ACT.login('${p.login}')`}">${p.secret?'set '+p.secret:p.login+' login'}</span>`:''}${p.write?'<span class="chip write">commit ends Run</span>':''}</div>`}).join('');
+  const gate=`<div id="n-gate" class="gnode ${hot==='gate'?'hot':''}" style="left:${G.x+dx}px;top:${G.y}px"><h4>GATE</h4>${S.steps.filter(id=>P(id).gate).map(id=>`<div class="small">${esc(P(id).name)}${P(id).gate==='skip'?' <span class="dim">or skipped</span>':''}</div>`).join('')||'<div class="small dim">no terms yet</div>'}</div>`;
+  const inp=input?`<div class="inode" style="left:${I.x}px;top:${I.y}px"><b>Watched PR</b><div class="dim small">${run?'#'+Object.keys(S.runs)[0]:'any PR you label'}</div></div>`:'';
+  return `<div style="position:relative;width:${W}px;height:${H}px;flex:none"><svg width="${W}" height="${H}" style="position:absolute;inset:0">${svg}</svg>${inp}${nodes}${gate}</div>`;
+}
+function palette(id){return `<div id="${id}"><div class="sect" style="margin-top:0">Start from</div><div id="pal-starters">${Object.entries(STARTERS).map(([k,s])=>`<div class="preset ${S.starter===k?'on':''}" onclick="ACT.starter('${k}')"><span class="nm">${esc(s.name)}</span><span class="dim small">${esc(s.blurb)}</span></div>`).join('')}</div>
+  <div class="sect">Library</div>${Object.keys(PRESETS).map(id=>`<div class="preset ${S.steps.includes(id)?'on':''}" onclick="ACT.toggle('${id}')" title="${esc(P(id).what)}"><span class="nm">${S.steps.includes(id)?'✓ ':'+ '}${esc(P(id).name)}</span><span class="dim small">${P(id).inline?P(id).plugin:'lib/'+id}${P(id).cost?' · '+P(id).cost:''}</span></div>`).join('')}</div>`}
+function publishMerge(){const pr=S.pipelinePR,r=repo();
+  if(!pr)return `<button class="primary" onclick="ACT.publish()">Publish as PR</button>`;
+  if(pr.state==='open')return `<span class="row"><span class="dotx run"></span><a href="#">${r.id}#${pr.n}</a> open</span><button class="primary" onclick="ACT.mergePipeline('slopwatch')">Merge it now</button><span class="dim small">or merge it on GitHub</span>`;
+  return `<span class="row"><span class="dotx pass"></span><a href="#">${r.id}#${pr.n}</a> merged. The Pipeline is live on <span class="mono">${r.def}</span>.</span>`}
+function watchList(){return repo().prs.map(p=>{const w=S.watched.includes(p.n),run=S.runs[p.n];
+  return `<div class="prl"><input type="checkbox" ${w?'checked':''} onchange="ACT.watch(${p.n})"><span class="dim">#${p.n}</span><span style="flex:1">${esc(p.t)}</span>${w&&!run?'<span class="chip warn">waits for the Pipeline</span>':''}${run?runStrip(run):''}</div>`}).join('')}
+
+/* ======================= D: coach marks over B ======================= */
+function dSteps(){const m=missing(),w=S.steps.find(id=>P(id).write),mn=S.steps.find(id=>{const p=P(id);return (p.secret&&!S.secrets[p.secret])||(p.login&&!S.logins[p.login])});
+  return [
+  {k:'repo',center:true,title:'Which repo?',body:repoPicker('ACT.addRepo'),done:!!S.repo},
+  {k:'starter',anchor:'pal-starters',title:'Start from a starter',body:'Each starter is a Pipeline: Steps, the order they run in, and the Gate. Pick the closest one. You can add or remove Steps from the Library below it anytime.',done:S.steps.length>0},
+  {k:'gate',anchor:'n-gate',title:'This is the Gate',body:'The PR is shippable when every Step listed here passes. Dashed Steps aren\'t in the Gate: they advise, and their Findings still reach Fix.',next:true},
+  ...(w?[{k:'fix',anchor:'n-'+w,title:'Fix runs when the Gate fails',body:'It reads the Findings behind the failing terms and commits a fix. That commit ends the Run and starts a new one, up to 3 rounds.',next:true}]:[]),
+  ...(m.length||S.D.sawSecrets?[{k:'sec',anchor:mn?'n-'+mn:'n-gate',title:m.length?'This Step needs a key':'Keys are set',body:m.length?`${esc(m[0])}. Click the red badge on the node. The daemon keeps it in the Keychain and never shows it back.${m.length>1?` ${m.length-1} more after this.`:''}`:'Everything the Pipeline needs is in place.',done:!m.length}]:[]),
+  {k:'pub',center:true,title:'Put it in the repo',body:`<div class="dim" style="margin-bottom:10px">slopwatch opens a PR that adds <span class="mono">.slopwatch/pipeline.yml</span>. Runs read the Pipeline from <span class="mono">${repo()?.def}</span>, so nothing runs until it merges.</div><div class="row">${S.repo?publishMerge():''}</div>`,done:!!S.pipelinePR,next:!!S.pipelinePR},
+  {k:'watch',center:true,title:'Pick PRs to watch',body:`<div class="dim" style="margin-bottom:6px">Watching adds the <span class="mono">slopwatch</span> label. ${onBase()?'':'They wait until the Pipeline merges.'}</div>${S.repo?watchList():''}<div class="row" style="margin-top:10px">${S.repo&&S.pipelinePR?publishMerge():''}</div>`,done:S.watched.length>0&&onBase()},
+  {k:'run',anchor:'d-can',title:'Your first Run',body:'Each node lights up as its Step settles. From here the PR lives in the main window. Reopen this tour from the ? in the toolbar.',next:true,last:true},
+]}
+function renderD(){const st=dSteps();if(S.D.i==null)S.D.i=0;
+  if(st[S.D.i]?.k==='sec')S.D.sawSecrets=true;
+  // auto-advance on done for steps without a Next button
+  while(S.D.i<st.length-1&&st[S.D.i].done&&!st[S.D.i].next)S.D.i++;
+  const t=S.D.off?null:st[Math.min(S.D.i,st.length-1)];
+  const can=S.repo?tourCanvas({hot:t&&!t.center&&t.anchor?.startsWith('n-')?t.anchor.slice(2):null}):'';
+  const card=t?(t.center?`<div class="center-card"><div class="k" style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);font-weight:700">Step ${S.D.i+1} of ${st.length}</div><h3 style="margin:4px 0 8px">${t.title}</h3>${t.body}<div class="row" style="margin-top:12px"><a href="#" class="small dim" onclick="S.D.off=true;render();return false">Skip tour</a><span class="spacer"></span>${S.D.i?'<button onclick="S.D.i--;render()">Back</button>':''}${t.next?'<button class="primary" onclick="S.D.i++;render()">Next</button>':''}</div></div>`
+     :`<div class="coach" id="coach" data-anchor="${t.anchor}"><div class="k">Step ${S.D.i+1} of ${st.length}</div><h3>${t.title}</h3><div class="dim">${t.body}</div><div class="ft"><a href="#" class="small dim" onclick="S.D.off=true;render();return false">Skip tour</a><span class="spacer"></span>${S.D.i?'<button onclick="S.D.i--;render()">Back</button>':''}${t.next?`<button class="primary" onclick="${t.last?'S.D.off=true':'S.D.i++'};render()">${t.last?'Done':'Next'}</button>`:''}</div></div><div class="spot" id="spot"></div>`):'';
+  return `<div class="d"><div class="b-pal">${palette('d-pal')}</div><div class="d-can" id="d-can">${S.repo?`<div class="d-bar"><b>${esc(S.repo)}</b><span class="dim">${onBase()?'Pipeline live':S.pipelinePR?'Pipeline PR open':'draft'}</span>${S.D.off?'<button onclick="S.D.off=false;render()" title="Reopen the tour">?</button>':''}</div>`:''}<div style="padding:60px 30px">${can}</div>${card}</div></div>`;
+}
+function placeCoach(){const c=document.getElementById('coach'),sp=document.getElementById('spot');if(!c)return;
+  const a=document.getElementById(c.dataset.anchor);if(!a)return;const r=a.getBoundingClientRect(),pad=6;
+  Object.assign(sp.style,{left:r.left-pad+'px',top:r.top-pad+'px',width:r.width+2*pad+'px',height:r.height+2*pad+'px'});
+  let x=r.right+16,y=r.top;if(x+350>innerWidth)x=Math.max(10,r.left-356);if(c.dataset.anchor==='d-can'){x=r.left+r.width/2-170;y=r.bottom-260}
+  c.style.left=x+'px';c.style.top=Math.min(Math.max(10,y),innerHeight-c.offsetHeight-80)+'px'}
+
+/* ======================= E: chapters, built up in the center ======================= */
+function eChapters(){const m=missing();return [
+  {t:'Your repo',title:'Which repo should slopwatch watch?',body:`<div class="dim" style="margin-bottom:8px">slopwatch takes your open PRs in a repo through a Pipeline until they're shippable. It works in its own clone, never your checkout.</div>${repoPicker('ACT.addRepoE')}`,ok:!!S.repo},
+  {t:'What must be true',title:'When is a PR shippable?',body:`<div class="dim" style="margin-bottom:10px">Pick a starter. Its Steps appear on the canvas, and the ones wired into the <b>Gate</b> must pass. Dashed Steps advise.</div>${starters()}`,ok:S.steps.length>0},
+  {t:'What happens after',title:'Then what?',body:`<div class="dim" style="margin-bottom:8px">Steps after the Gate run once it's decided.</div>${['claude-fix','merge'].map(id=>presetRow(id,S.steps.includes(id),`ACT.toggle('${id}')`)).join('<div style="height:6px"></div>')}`,ok:true},
+  {t:'Keys',title:m.length?'A few Steps need keys':'Keys are set',body:needsBlock(),ok:true},
+  {t:'Go live',title:'Put it in the repo and pick PRs',body:`<div class="dim" style="margin-bottom:8px">The Pipeline lands as a PR against <span class="mono">${repo()?.def}</span>. Pick PRs now, and they start the moment it merges.</div><div class="row" style="margin-bottom:8px">${S.repo?publishMerge():''}</div>${S.repo&&S.pipelinePR?watchList():''}`,ok:onBase()&&S.watched.length>0},
+  {t:'Watch it run',title:'Your first Run',body:`<div class="dim">Each node lights up as its Step settles. From here the PR lives in the main window, and this canvas is where you edit the Pipeline.</div><div class="row" style="margin-top:10px"><button class="primary">Open main window</button></div>`,ok:true},
+]}
+ACT.addRepoE=id=>{ACT.addRepo(id);S.E.i=1;render()};
+function renderE(){const ch=eChapters();if(S.E.i==null)S.E.i=0;const c=ch[S.E.i];
+  const can=S.repo&&S.E.i>0?tourCanvas({input:true}):`<div class="dim" style="font-size:15px">${S.repo?'':'Your Pipeline will appear here.'}</div>`;
+  const gated=i=>i>0&&!ch.slice(0,i).every(x=>x.ok);
+  return `<div class="e"><div class="e-steps">${ch.map((x,i)=>`<span class="${i===S.E.i?'on':x.ok&&i<S.E.i?'done':''}" onclick="${gated(i)?'':`S.E.i=${i};render()`}" style="${gated(i)?'opacity:.4;cursor:default':''}">${x.ok&&i<S.E.i?'✓ ':''}${i+1}. ${x.t}</span>`).join('')}</div>
+   <div class="e-can" style="padding-bottom:${S.E.i===5?'200px':'34vh'}">${can}</div>
+   ${S.E.drawer?`<div class="e-drawer"><div class="row"><b>Library</b><span class="spacer"></span><button onclick="S.E.drawer=false;render()">×</button></div>${palette('e-pal')}</div>`:''}
+   <div class="e-card"><div class="row"><span class="k">Chapter ${S.E.i+1} of ${ch.length}</span><span class="spacer"></span>${S.E.i>0?`<a href="#" class="small" onclick="S.E.drawer=!S.E.drawer;render();return false">Customize Steps</a>`:''}</div><h3>${c.title}</h3>${c.body}
+    <div class="row" style="margin-top:12px"><span class="spacer"></span>${S.E.i?'<button onclick="S.E.i--;render()">Back</button>':''}${S.E.i<ch.length-1?`<button class="primary" ${c.ok?'':'disabled'} onclick="S.E.i++;render()">Next</button>`:''}</div></div></div>`;
+}
+
 /* ======================= shell ======================= */
-const VARIANTS={A:['Setup sheet',renderA],B:['Canvas first',renderB],C:['Repo page checklist',renderC]};
+const VARIANTS={A:['Setup sheet',renderA],B:['Canvas first',renderB],C:['Repo page checklist',renderC],D:['Tour: coach marks over B',renderD],E:['Tour: chapters, built up in the center',renderE]};
 let V=new URLSearchParams(location.search).get('variant')||'A';if(!VARIANTS[V])V='A';
 function render(){
   const ae=document.activeElement;if(ae&&ae.tagName==='SUMMARY')return;
-  const keep=[...document.querySelectorAll('.body,.sheet .in,.b-rail,.b-can')].map(e=>[e.className,e.scrollTop]);
+  const keep=[...document.querySelectorAll('.body,.sheet .in,.b-rail,.b-can,.d-can,.e-can')].map(e=>[e.className,e.scrollTop]);
   const det=[...document.querySelectorAll('details')].map(d=>d.open);
   document.getElementById('main').innerHTML=VARIANTS[V][1]();
   for(const [c,t] of keep){const e=document.getElementsByClassName(c.split(' ').pop())[0];if(e)e.scrollTop=t}
   document.querySelectorAll('details').forEach((d,i)=>{if(det[i])d.open=true});
+  placeCoach();
   document.getElementById('slabel').textContent=V+' ('+VARIANTS[V][0]+')';
   document.getElementById('vname').textContent='Variant '+V+': '+VARIANTS[V][0];
   const sp=document.getElementById('state');if(sp.style.display==='block')sp.textContent=JSON.stringify({repo:S.repo,draft:S.steps,starter:S.starter,secrets:Object.keys(S.secrets),logins:S.logins,missing:missing(),pipelinePR:S.pipelinePR,pipelineOnBase:!!onBase(),label:S.label,watched:S.watched,runs:Object.fromEntries(Object.entries(S.runs).map(([k,r])=>[k,r.steps])),dryRun:S.dry},null,1);
@@ -332,6 +438,7 @@ function go(d){const ks=Object.keys(VARIANTS);V=ks[(ks.indexOf(V)+d+ks.length)%k
 document.getElementById('prev').onclick=()=>go(-1);document.getElementById('next').onclick=()=>go(1);
 document.getElementById('reset').onclick=()=>{reset();render()};
 document.getElementById('stateBtn').onclick=()=>{const s=document.getElementById('state');s.style.display=s.style.display==='block'?'none':'block';render()};
+addEventListener('resize',placeCoach);
 addEventListener('keydown',e=>{if(e.target.closest('input,textarea,select,[contenteditable]'))return;if(e.key==='ArrowLeft')go(-1);if(e.key==='ArrowRight')go(1)});
 setInterval(()=>{if(Object.keys(S.runs).length||S.dry)render()},700);render();
 </script>
