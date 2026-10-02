@@ -63,8 +63,18 @@ One specific problem a Step reports about the PR, with a severity and optionally
 _Avoid_: issue, comment, violation
 
 **Effect**:
-A change on GitHub, such as a comment, a label, a rebase or a merge, that a Step asks for and the daemon carries out only while the Step's Run is still current.
+A change on GitHub, such as a comment, a label, a check rerun, a rebase or a merge, that a Step asks for and the daemon carries out only while the Step's Run is still current.
 _Avoid_: action, side effect
+
+### Fixing
+
+**Fix round**:
+A Run started by a commit from one of slopwatch's own Steps, such as Fix. The Pipeline caps consecutive Fix rounds on a Watched PR. An outside push resets the count, and a rebase made by slopwatch leaves it alone.
+_Avoid_: retry, iteration, attempt
+
+**Guarded path**:
+A file no Step may change through slopwatch, such as CI workflows or the Pipeline file, so that no Step can pass the Gate by weakening it.
+_Avoid_: protected file, denylist
 
 ### Attention
 

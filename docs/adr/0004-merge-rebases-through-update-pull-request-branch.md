@@ -13,6 +13,6 @@ Before merging, the Merge Step checks how far the PR is behind its base (`baseRe
 
 - GitHub can't sign rebased commits, so a branch that requires signed commits rejects the rebase. There the daemon uses `updateMethod: MERGE`, which is believed to produce web-flow-signed merge commits (not yet verified). Merge Step config can force either method.
 - The mutation is async and doesn't return the new head. The daemon marks the PR as rebasing and attributes the next head change to the rebase. A push from someone else in that window gets the wrong end reason, and that is the only harm.
-- A conflicting rebase ends Merge with `fail`, a "conflicts with base" Finding and an Escalation. Agent conflict resolution belongs to the Fix loop.
+- A conflicting rebase ends Merge with `fail`, a "conflicts with base" Finding and an Escalation. Fix can't resolve the conflict either, because `createCommitOnBranch` only appends a single-parent commit (ADR 0008).
 - A base that keeps moving could rebase forever. After 3 consecutive rebase-started Runs without a merge, the daemon raises an Escalation suggesting a merge queue. Rebase-started Runs neither count toward nor reset the Fix round cap.
 - A rebase dismisses stale approvals and triggers CI like any push.

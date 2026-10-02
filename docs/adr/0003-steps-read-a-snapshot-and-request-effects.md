@@ -11,4 +11,4 @@ A Step never talks to GitHub. At the start of a Step, the daemon hands it a snap
 
 - A Step that needs GitHub data the snapshot lacks can't fetch it. The fix is a wider snapshot, which means a protocol feature string.
 - Merge is an ordinary Step that requests the `merge` Effect. The daemon's head-SHA check keeps it from merging a SHA the Gate never saw.
-- The Effect list is closed and small in v1: `comment`, `label`, `rebase`, `merge` (`rebase` added by ADR 0004). New Effects are protocol additions, not plugin code.
+- The Effect list is closed and small in v1: `comment`, `label`, `rerun`, `rebase`, `merge` (`rebase` added by ADR 0004, `rerun` by ADR 0008). New Effects are protocol additions, not plugin code.
