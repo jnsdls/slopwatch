@@ -33,16 +33,20 @@ The rule, over upstream Verdicts, the Gate and facts about the PR, that decides 
 _Avoid_: filter, trigger, when-clause
 
 **Run**:
-One execution of a Pipeline against one head SHA of a Watched PR, using the Pipeline as it stands on the PR's base branch when the Run starts. Any push, including a Fix commit or a rebase made by slopwatch, ends the Run and starts a new one. A change to the Pipeline on the base branch starts a new Run on the same SHA for a PR whose latest Run has ended.
+One execution of a Pipeline against one head SHA of a Watched PR, using the Pipeline as it stands on the PR's root base when the Run starts. The root base is the PR's base branch, or for a PR in a Stack, the base of the Stack's bottom PR. Any push, including a Fix commit or a rebase made by slopwatch, ends the Run and starts a new one. A change to the Pipeline on the base branch starts a new Run on the same SHA for a PR whose latest Run has ended.
 _Avoid_: execution, build, job
 
 **End reason**:
-Why a Run stopped: merged, shippable (the Gate passed and the Pipeline has no Merge Step), not shippable, pushed (by one of the Run's own Steps, such as a Fix commit or a Merge rebase), superseded (by a push from outside the Run), closed (merged or closed on GitHub by someone else), over budget (the Watched PR's or the day's Budget ran out), or cancelled (by the developer).
+Why a Run stopped: merged, shippable (the Gate passed and the Pipeline has no Merge Step), not shippable, pushed (by slopwatch, such as a Fix commit, a Merge rebase or the update after a retarget), superseded (by a push or a base change from outside the Run), closed (merged or closed on GitHub by someone else), over budget (the Watched PR's or the day's Budget ran out), or cancelled (by the developer).
 _Avoid_: status, result
 
 **Watched PR**:
 A pull request the app has picked up and runs its repo's Pipeline on.
 _Avoid_: tracked PR, managed PR
+
+**Stack**:
+A chain of open PRs in one repo where each PR's base branch is the head branch of the PR below it, and the bottom PR's base is the root base. GitHub's native stacked PRs are one kind; branches chained by hand or by another tool are the other.
+_Avoid_: chain, train, dependent PRs
 
 **Run history**:
 Every Run of a Watched PR, newest first, including superseded and cancelled ones. It belongs to the PR, so it survives unwatching and re-watching.
