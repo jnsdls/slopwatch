@@ -5,8 +5,16 @@ A desktop app that takes a pull request from "opened" to "shippable" by running 
 ## Language
 
 **Step**:
-A reusable unit of work with a typed outcome, such as a Jev judgement, waiting for CI, an agent review, or a fix.
+A configured, reusable unit of work with a typed outcome, such as a Jev judgement, waiting for CI, an agent review, or a fix. It runs a Plugin with its own settings.
 _Avoid_: check, task, job, node
+
+**Plugin**:
+The executable a Step runs, together with the manifest that describes it. Built-in Steps such as Jev, CI and Merge are Plugins that ship with the app.
+_Avoid_: step type, runner, action
+
+**Library**:
+The developer's own collection of configured Steps, shared across their repos. Presets ship as Library Steps.
+_Avoid_: catalog, registry, templates
 
 **Pipeline**:
 A graph of Steps bound to one repo, with one input (a Watched PR) and one output (the Gate's verdict).
@@ -21,7 +29,7 @@ The rule, over upstream Verdicts, the Gate and facts about the PR, that decides 
 _Avoid_: filter, trigger, when-clause
 
 **Run**:
-One execution of a Pipeline against one head SHA of a Watched PR. Any push, including a Fix commit or a rebase made by slopwatch, ends the Run and starts a new one.
+One execution of a Pipeline against one head SHA of a Watched PR, using the Pipeline as it stands on the PR's base branch when the Run starts. Any push, including a Fix commit or a rebase made by slopwatch, ends the Run and starts a new one. A change to the Pipeline on the base branch starts a new Run on the same SHA for a PR whose latest Run has ended.
 _Avoid_: execution, build, job
 
 **End reason**:
@@ -39,7 +47,7 @@ _Avoid_: run group, timeline
 ### Outcomes
 
 **Outcome**:
-What one Step reports for one Run: a Verdict plus named outputs such as Findings, a probability or a note. It belongs to the Run's head SHA and to nothing else, so a later Run on the same SHA reuses it unless its Verdict was error, cancelled or missing.
+What one Step reports for one Run: a Verdict plus named outputs such as Findings, a probability or a note. It belongs to the Run's head SHA and the Step's settings, so a later Run on the same SHA reuses it unless its Verdict was error, cancelled or missing, or the Step's settings or Plugin version have changed.
 _Avoid_: result, status
 
 **Verdict**:
