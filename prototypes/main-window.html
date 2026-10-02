@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PROTOTYPE · Main window</title>
+<!--
+  PROTOTYPE, throwaway. Lives on the prototype/main-window branch, never main.
+  Question (issue #14): what does the minimal main window show about Watched PRs and their Runs,
+  and what does digging into one Run look like?
+  Three structurally different variants, switchable via ?variant=A|B|C or the bottom bar (← →).
+  Each variant pairs a way to list Watched PRs with a different way to dig into one Run:
+    A  three panes (sources / PR list / Run as a Step list)
+    B  board by attention state, Run opens full-window on the node canvas from #13
+    C  one dense table, a row expands inline into a Run timeline (the rejected variant C of #13)
+  The real client is GPUI. Data is fake and in memory; the toy simulator follows ADR 0001 and 0006
+  closely enough that approving, rejecting, waiving, retrying and cancelling move things along.
+-->
+<style>
+:root{
+  --bg:#0f1115;--panel:#161a20;--panel2:#1c2129;--line:#2a313b;--text:#d8dee6;--dim:#8a95a3;--muted:#5d6672;
+  --pass:#3fb950;--fail:#f85149;--inc:#e3a33b;--err:#c678dd;--run:#58a6ff;--ask:#e3a33b;--waived:#39c5bb;--accent:#a78bfa;
+  font:13px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;color:var(--text);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+button,select,input,textarea{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
+button{cursor:pointer}button:hover{border-color:var(--dim)}
+button.primary{background:#2d2560;border-color:var(--accent)}
+button.ok{background:#12301a;border-color:#23582f;color:var(--pass)}
+button.no{background:#3a1416;border-color:#6b2427;color:#ffc1bd}
+a{color:#8cb4ff;text-decoration:none}a:hover{text-decoration:underline}
+.mono{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:12px}
+.dim{color:var(--dim)}.muted{color:var(--muted)}.small{font-size:11px}
+header.app{display:flex;align-items:center;gap:12px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+.proto{font-size:10px;letter-spacing:.08em;background:#5a1d1d;color:#ffb4b4;padding:1px 6px;border-radius:4px}
+.dock{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--dim)}
+.dock .badge{background:#e5484d;color:#fff;border-radius:999px;padding:0 6px;font-weight:700}
+.spacer{flex:1}
+main{flex:1;overflow:hidden;position:relative}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:600;border:1px solid var(--line);white-space:nowrap}
+.pill.pass{background:#12301a;color:var(--pass);border-color:#23582f}
+.pill.fail{background:#3a1416;color:var(--fail);border-color:#6b2427}
+.pill.pending{background:#2f2610;color:var(--inc);border-color:#5e4a18}
+.pill.end{color:var(--dim)}
+.chip{display:inline-block;padding:0 6px;border-radius:4px;font-size:11px;background:#232a34;color:#b9c3cf;border:1px solid var(--line);white-space:nowrap}
+.chip.adv{border-style:dashed;color:var(--dim);background:transparent}
+.chip.write{background:#33240f;border-color:#6a4a17;color:#f0c27a}
+.dot{width:9px;height:9px;border-radius:50%;display:inline-block;background:var(--muted);flex:none}
+.st-pass .dot,.dot.st-pass{background:var(--pass)}.st-fail .dot,.dot.st-fail{background:var(--fail)}
+.st-inconclusive .dot,.dot.st-inconclusive{background:var(--inc)}
+.st-error .dot,.dot.st-error,.st-missing .dot{background:var(--err)}
+.st-run .dot,.dot.st-run{background:var(--run);animation:pulse 1s infinite}
+.st-ask .dot,.dot.st-ask{background:var(--ask);animation:pulse 1s infinite}
+.st-waived .dot,.dot.st-waived{background:var(--waived)}
+.st-skipped .dot,.dot.st-skipped,.st-cancelled .dot,.dot.st-cancelled{background:transparent;border:1.5px solid var(--muted)}
+.dot.st-wait,.st-wait .dot{background:#2b323c}
+@keyframes pulse{50%{opacity:.35}}
+.vl{font-size:11px;font-weight:600}
+.st-pass .vl{color:var(--pass)}.st-fail .vl{color:var(--fail)}.st-inconclusive .vl{color:var(--inc)}.st-error .vl{color:var(--err)}
+.st-run .vl{color:var(--run)}.st-ask .vl{color:var(--ask)}.st-waived .vl{color:var(--waived)}
+.st-skipped .vl,.st-cancelled .vl,.st-wait .vl{color:var(--muted)}
+.strip{display:inline-flex;gap:3px;align-items:center}
+.strip .g{width:2px;height:12px;background:#3d3570;margin:0 2px}
+.ask{border:1px solid #5e4a18;background:#211b0c;border-radius:8px;padding:8px 10px}
+.ask.esc{border-color:#6b2427;background:#231011}
+.ask .k{font-size:10px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;color:var(--ask)}
+.ask.esc .k{color:var(--fail)}
+.find{display:flex;gap:6px;padding:3px 0;font-size:12px}
+.sev{font-size:10px;font-weight:700;text-transform:uppercase;padding:0 4px;border-radius:3px;flex:none;height:16px;line-height:16px}
+.sev.high{background:#3a1416;color:var(--fail)}.sev.medium{background:#2f2610;color:var(--inc)}.sev.low{background:#232a34;color:var(--dim)}
+.log{background:#0b0d10;border:1px solid var(--line);border-radius:6px;padding:6px 8px;white-space:pre-wrap;max-height:140px;overflow:auto}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:12px}.kv>:nth-child(odd){color:var(--dim)}
+.sect{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:10px 0 4px}
+.histchip{display:inline-flex;gap:5px;align-items:center;padding:2px 8px;border:1px solid var(--line);border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap}
+.histchip.on{border-color:var(--accent);background:#1d1a33}
+#modal{position:fixed;inset:0;background:#0009;display:none;align-items:center;justify-content:center;z-index:80}
+#modal .box{background:var(--panel);border:1px solid var(--dim);border-radius:10px;padding:16px;width:420px;display:flex;flex-direction:column;gap:10px}
+#state{position:fixed;right:14px;bottom:64px;width:420px;max-height:55vh;overflow:auto;background:#0b0d10;border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre;z-index:40;display:none;font-size:11px}
+#switcher{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);display:flex;align-items:center;gap:10px;background:#fff;color:#111;border-radius:999px;padding:6px 10px;box-shadow:0 6px 24px #000a;z-index:50;font-weight:600}
+#switcher button{background:#111;color:#fff;border:none;border-radius:999px;width:28px;height:28px;padding:0}
+
+/* ---------- A: three panes ---------- */
+.a{display:flex;height:100%}
+.a-src{width:210px;background:var(--panel);border-right:1px solid var(--line);padding:10px 6px;overflow:auto;flex:none}
+.a-src .it{display:flex;justify-content:space-between;padding:5px 10px;border-radius:6px;cursor:pointer}
+.a-src .it:hover{background:#20262f}.a-src .it.on{background:#2b3442}
+.a-src .h{font-size:10px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase;padding:10px 10px 4px}
+.a-src .n{color:var(--dim);font-size:12px}.a-src .n.hot{color:#fff;background:#e5484d;border-radius:999px;padding:0 6px;font-weight:700}
+.a-list{width:380px;border-right:1px solid var(--line);overflow:auto;flex:none}
+.a-row{padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer;display:flex;flex-direction:column;gap:4px}
+.a-row:hover{background:#151920}.a-row.on{background:#1d2330}
+.a-row .t{display:flex;gap:8px;align-items:center}.a-row .t b{font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.a-row .s{font-size:12px;color:var(--dim)}.a-row .s.me{color:var(--ask)}.a-row .s.esc{color:#ff9b95}
+.a-det{flex:1;overflow:auto;padding:14px 18px 80px}
+.a-det h2{margin:0;font-size:17px}
+.a-steps{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+.a-step{border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+.a-step.adv{border-style:dashed}
+.a-step .hd{display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer}
+.a-step .hd .nm{font-weight:600}.a-step .bd{padding:2px 12px 10px 27px;border-top:1px solid var(--line)}
+.a-gate{border:2px solid #3d3570;background:#17142a;border-radius:8px;padding:7px 10px;display:flex;gap:8px;align-items:center}
+.a-gate.g-pass{border-color:var(--pass)}.a-gate.g-fail{border-color:var(--fail)}.a-gate.g-pending{border-color:var(--inc)}
+
+/* ---------- B: board + canvas ---------- */
+.b{display:flex;height:100%;gap:12px;padding:12px;overflow:auto}
+.b-col{width:300px;flex:none;display:flex;flex-direction:column;gap:8px}
+.b-col h3{margin:0;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);display:flex;justify-content:space-between}
+.b-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:6px;cursor:pointer}
+.b-card:hover{border-color:var(--dim)}
+.b-card .ttl{font-weight:600}
+.b-card.me{border-color:#5e4a18}.b-card.esc{border-color:#6b2427}
+.b-run{display:flex;flex-direction:column;height:100%}
+.b-bar{display:flex;align-items:center;gap:10px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+.b-body{flex:1;display:flex;overflow:hidden}
+.b-canvas{flex:1;overflow:auto;position:relative;background-image:radial-gradient(#252b34 1px,transparent 1px);background-size:18px 18px}
+.b-side{width:340px;border-left:1px solid var(--line);background:var(--panel);overflow:auto;padding:12px 14px 80px}
+.b-hist{display:flex;gap:6px;padding:8px 14px;border-top:1px solid var(--line);background:var(--panel);overflow:auto;margin-bottom:58px}
+.node{position:absolute;width:170px;background:var(--panel);border:1.5px solid var(--line);border-radius:10px;padding:7px 10px;cursor:pointer;display:flex;flex-direction:column;gap:3px}
+.node.adv{border-style:dashed;opacity:.85}.node.sel{outline:2px solid var(--accent);outline-offset:2px}
+.node.st-pass{border-color:#23582f}.node.st-fail{border-color:#6b2427}.node.st-run{border-color:#1f4a7a}.node.st-ask{border-color:#5e4a18}.node.st-error{border-color:#6a3a7a}.node.st-waived{border-color:#1f5e59}
+.node.st-wait,.node.st-skipped,.node.st-cancelled{opacity:.55}
+.node .top{display:flex;align-items:center;gap:6px}.node .top b{flex:1;font-weight:600}
+.gnode{position:absolute;width:150px;background:#17142a;border:2px solid #3d3570;border-radius:14px;padding:8px 10px}
+.gnode.g-pass{border-color:var(--pass)}.gnode.g-fail{border-color:var(--fail)}.gnode.g-pending{border-color:var(--inc)}
+.gnode h4{margin:0 0 4px;font-size:11px;letter-spacing:.12em;color:#c8bcff;display:flex;justify-content:space-between}
+.gnode .term{display:flex;gap:6px;align-items:center;font-size:12px}
+
+/* ---------- C: table + timeline ---------- */
+.c{height:100%;overflow:auto;padding:0 0 80px}
+.c-tools{display:flex;gap:8px;align-items:center;padding:8px 14px;position:sticky;top:0;background:var(--bg);z-index:3;border-bottom:1px solid var(--line)}
+table.c-t{width:100%;border-collapse:collapse}
+.c-t th{text-align:left;font-weight:500;color:var(--dim);font-size:11px;padding:6px 10px;border-bottom:1px solid var(--line);position:sticky;top:41px;background:var(--bg);z-index:2}
+.c-t td{padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:middle;white-space:nowrap}
+.c-t tr.row{cursor:pointer}.c-t tr.row:hover td{background:#151920}
+.c-t tr.row.me td:first-child{box-shadow:inset 3px 0 var(--ask)}.c-t tr.row.esc td:first-child{box-shadow:inset 3px 0 var(--fail)}
+.c-t tr.row.open td{background:#1a1f28}
+.c-t tr.repo td{color:var(--dim);font-size:11px;letter-spacing:.06em;text-transform:uppercase;padding-top:14px}
+.c-exp td{background:#12151b;padding:12px 16px;white-space:normal}
+.c-exp .wrap{display:flex;gap:16px}
+.c-tl{flex:1;min-width:520px}
+.tl-row{display:flex;align-items:center;height:24px;gap:8px;cursor:pointer}
+.tl-row .lbl{width:150px;flex:none;display:flex;gap:6px;align-items:center;overflow:hidden;white-space:nowrap}
+.tl-row .lane{flex:1;position:relative;height:14px;background:#171b22;border-radius:3px}
+.tl-row.sel .lbl{color:#fff;font-weight:600}
+.bar{position:absolute;top:0;height:14px;border-radius:3px;min-width:3px}
+.bar.st-pass{background:#23582f}.bar.st-fail{background:#6b2427}.bar.st-inconclusive{background:#5e4a18}.bar.st-error{background:#6a3a7a}
+.bar.st-run{background:#1f4a7a;animation:pulse 1.4s infinite}.bar.st-ask{background:#5e4a18;animation:pulse 1.4s infinite}
+.bar.st-waived{background:#1f5e59}.bar.st-cancelled,.bar.st-skipped{background:transparent;border:1px dashed var(--muted)}
+.tl-gate .lane{background:#17142a}.gband{position:absolute;top:0;bottom:0;border-radius:3px}
+.gband.pending{background:repeating-linear-gradient(45deg,#2f2610,#2f2610 4px,#17142a 4px,#17142a 8px)}
+.gband.pass{background:#23582f}.gband.fail{background:#6b2427}
+.c-side{width:360px;flex:none;border-left:1px solid var(--line);padding-left:14px}
+.c-old{margin-top:8px;display:flex;flex-direction:column;gap:3px}
+</style>
+</head>
+<body>
+<header class="app">
+  <b>slopwatch</b><span class="proto">PROTOTYPE</span>
+  <span class="dim small" id="vname"></span>
+  <span class="spacer"></span>
+  <span class="dock" title="What the Dock icon badge would show">Dock badge <span class="badge" id="dockn">0</span></span>
+  <button id="stateBtn" title="Show the in-memory state">state</button>
+</header>
+<main id="main"></main>
+<div id="state"></div>
+<div id="modal"><div class="box" id="mbox"></div></div>
+<div id="switcher"><button id="prev">←</button><span id="slabel"></span><button id="next">→</button></div>
+<script>
+/* ======================= fake data ======================= */
+const M=60e3, T0=Date.now(), now=()=>Date.now(), ago=m=>T0-m*M;
+const st=(s,start,dur,x={})=>Object.assign({s,t0:start==null?null:ago(start),t1:(start==null||dur==null)?null:ago(start-dur)},x);
+const sha=()=>Math.random().toString(16).slice(2,9);
+const SETTLED=['pass','fail','inconclusive','error','skipped','cancelled','missing'];
+const settled=x=>SETTLED.includes(x.s);
+const good=x=>x.s==='pass'||!!x.waived;
+
+const PIPES={
+  'acme/api':[
+    {id:'ci',name:'CI',uses:'ci',gate:1,needs:[]},
+    {id:'scope',name:'Scope matches issue',uses:'jev',gate:1,needs:[]},
+    {id:'review',name:'Claude review',uses:'claude',gate:1,needs:['ci']},
+    {id:'codex',name:'Codex review',uses:'codex',needs:['ci']},
+    {id:'human',name:'Approve rollout',uses:'human',gate:1,needs:['review','scope'],prompt:'Check the rate-limit defaults are sane for enterprise tenants.'},
+    {id:'merge',name:'Merge',uses:'merge',after:'pass'},
+    {id:'fix',name:'Fix',uses:'claude-fix',after:'fail',write:1}],
+  'acme/web':[
+    {id:'ci',name:'CI',uses:'ci',gate:1,needs:[]},
+    {id:'shots',name:'UI change has screenshots',uses:'jev',gate:1,skipOk:1,needs:[],when:'files touch app/**'},
+    {id:'review',name:'Claude review',uses:'claude',gate:1,needs:['ci']},
+    {id:'merge',name:'Merge',uses:'merge',after:'pass'},
+    {id:'fix',name:'Fix',uses:'claude-fix',after:'fail',write:1}],
+  'jnsdls/slopwatch':[
+    {id:'ci',name:'CI',uses:'ci',gate:1,needs:[]},
+    {id:'review',name:'Claude review',uses:'claude',gate:1,needs:['ci']},
+    {id:'codex',name:'Codex review',uses:'codex',needs:['ci']}],
+};
+const F=(sev,message,file,line)=>({sev,message,file,line});
+const prov={claude:'claude-opus-5-5 · Claude Code 3.2.1',codex:'gpt-5.3-codex · codex 0.94',jev:'jev-1 · gen_8f2c',ci:'GitHub Actions',merge:'',human:'','claude-fix':'claude-opus-5-5 · Claude Code 3.2.1'};
+
+let PRS=[
+ {repo:'acme/api',num:482,title:'Rate-limit the webhook ingest',branch:'jd/ratelimit-ingest',runs:[
+  {n:3,sha:'a1b2c3d',t0:ago(26),fixRound:2,steps:{
+    ci:st('pass',26,9,{log:['✓ test (ubuntu) 7m58s','✓ lint 1m02s']}),
+    scope:st('pass',26,0.2,{usd:0.002,note:'Diff touches only ingest and config, as issue #311 asks.',prob:0.94}),
+    review:st('pass',17,6,{usd:0.38,findings:[F('low','Token bucket refill uses wall clock; monotonic would avoid skew.','src/ingest/limit.rs',88),F('low','Magic number 512 for burst size.','src/config.rs',41)]}),
+    codex:st('inconclusive',17,8,{findings:[F('medium','Could not determine whether 429s are retried by senders.')]}),
+    human:st('ask',11,null),merge:st('wait'),fix:st('wait')}},
+  {n:2,sha:'9f8e7d6',t0:ago(58),t1:ago(29),end:'pushed',endBy:'fix',fixRound:1,steps:{
+    ci:st('pass',58,9),scope:st('pass',58,0.2,{usd:0.002}),review:st('fail',49,6,{usd:0.41,findings:[F('high','Limiter keyed by IP, but ingest sits behind the LB: every tenant shares one bucket.','src/ingest/limit.rs',30)]}),
+    codex:st('pass',49,7),human:st('skipped',43,0),merge:st('skipped',43,0),fix:st('pass',43,14,{usd:0.92,note:'Keyed the limiter by tenant id; added a test.'})}},
+  {n:1,sha:'5a4b3c2',t0:ago(95),t1:ago(61),end:'pushed',endBy:'fix',fixRound:0,steps:{
+    ci:st('fail',95,8,{findings:[F('high','test ingest::limit::burst failed: expected 429, got 200')]}),scope:st('pass',95,0.2,{usd:0.002}),review:st('skipped',87,0),codex:st('skipped',87,0),human:st('skipped',87,0),merge:st('skipped',87,0),fix:st('pass',87,24,{usd:1.10,note:'Fixed off-by-one in burst accounting.'})}},
+ ]},
+ {repo:'acme/api',num:479,title:'Drop legacy v1 auth',branch:'jd/drop-v1-auth',runs:[
+  {n:1,sha:'c0ffee1',t0:ago(12),fixRound:0,steps:{ci:st('run',12,null,{log:['… test (ubuntu) running 11m','✓ lint 58s']}),scope:st('pass',12,0.2,{usd:0.002}),review:st('wait'),codex:st('wait'),human:st('wait'),merge:st('wait'),fix:st('wait')}}]},
+ {repo:'acme/api',num:476,title:'Bump tokio to 1.40',branch:'jd/tokio-140',runs:[
+  {n:1,sha:'7e7e7e7',t0:ago(80),t1:ago(41),end:'merged',fixRound:0,steps:{ci:st('pass',80,10),scope:st('pass',80,0.2,{usd:0.002}),review:st('pass',70,4,{usd:0.22}),codex:st('pass',70,5),human:st('pass',66,24,{note:'fine'}),merge:st('pass',42,1)}}]},
+ {repo:'acme/web',num:1203,title:'Settings page redesign',branch:'jd/settings-v2',runs:[
+  {n:4,sha:'d4d4d4d',t0:ago(35),t1:ago(19),end:'not shippable',fixRound:3,esc:{reason:'Fix round cap reached (3 of 3). Claude review still fails.',since:ago(19)},steps:{
+    ci:st('pass',35,7),shots:st('pass',35,0.2,{usd:0.001}),review:st('fail',28,7,{usd:0.47,findings:[F('high','Form loses unsaved changes on tab switch.','app/settings/page.tsx',212),F('medium','Toggle has no accessible label.','app/settings/Toggle.tsx',14)]}),merge:st('skipped',21,0),fix:st('skipped',21,0,{note:'round cap reached'})}},
+  {n:3,sha:'c3c3c3c',t0:ago(62),t1:ago(38),end:'pushed',endBy:'fix',fixRound:2,steps:{ci:st('pass',62,7),shots:st('pass',62,0.2),review:st('fail',55,7,{usd:0.44}),merge:st('skipped',48,0),fix:st('pass',48,10,{usd:0.70})}},
+  {n:2,sha:'b2b2b2b',t0:ago(90),t1:ago(64),end:'pushed',endBy:'fix',fixRound:1,steps:{ci:st('fail',90,7),shots:st('pass',90,0.2),review:st('skipped',83,0),merge:st('skipped',83,0),fix:st('pass',83,19,{usd:0.81})}},
+  {n:1,sha:'a1a1a1a',t0:ago(130),t1:ago(92),end:'superseded',steps:{ci:st('pass',130,7),shots:st('fail',130,0.2,{findings:[F('medium','PR changes UI but has no screenshots.')]}),review:st('run',123,null),merge:st('wait'),fix:st('wait')}}]},
+ {repo:'acme/web',num:1199,title:'Fix hydration flicker',branch:'jd/hydration',runs:[
+  {n:1,sha:'e1e1e1e',t0:ago(24),fixRound:0,esc:{reason:'Claude review stalled: no message for 5 min.',since:ago(4),step:'review'},steps:{
+    ci:st('pass',24,8),shots:st('pass',24,0.2,{usd:0.001}),review:st('error',16,12,{err:'stall',usd:0.19,log:['reading app/layout.tsx','reading app/providers.tsx','(no output for 5m00s)']}),merge:st('wait'),fix:st('wait')}}]},
+ {repo:'acme/web',num:1201,title:'Add CSV export',branch:'jd/csv-export',runs:[
+  {n:2,sha:'f00dfee',t0:ago(21),fixRound:1,steps:{ci:st('pass',21,8),shots:st('skipped',21,0),review:st('pass',13,5,{usd:0.31}),merge:st('run',7,null,{log:['enqueued in merge queue, position 2']}),fix:st('wait')}},
+  {n:1,sha:'feedf00',t0:ago(52),t1:ago(23),end:'pushed',endBy:'fix',fixRound:0,steps:{ci:st('pass',52,8),shots:st('skipped',52,0),review:st('fail',44,6,{usd:0.35}),merge:st('skipped',38,0),fix:st('pass',38,14,{usd:0.66})}}]},
+ {repo:'jnsdls/slopwatch',num:31,title:'Daemon skeleton',branch:'jd/daemon',runs:[
+  {n:2,sha:'1d1d1d1',t0:ago(240),t1:ago(222),end:'shippable',steps:{ci:st('pass',240,6),review:st('pass',234,9,{usd:0.52}),codex:st('pass',234,12)}},
+  {n:1,sha:'0c0c0c0',t0:ago(300),t1:ago(250),end:'superseded',steps:{ci:st('pass',300,6),review:st('fail',294,8,{usd:0.49}),codex:st('pass',294,10)}}]},
+];
+PRS.forEach(p=>{p.id=p.repo+'#'+p.num;p.runs.forEach(r=>{for(const s of PIPES[p.repo]){const o=r.steps[s.id]||(r.steps[s.id]=st('wait'));if(o.s==='pass'&&s.uses==='human'&&!o.note)o.note='';}})});
+// the seeded running steps finish on their own so the window moves
+setTimeout(()=>finish('acme/api#479','ci','pass'),15000);
+setTimeout(()=>finish('acme/web#1201','merge','pass'),25000);
+
+/* ======================= model ======================= */
+const pr=id=>PRS.find(p=>p.id===id);
+const cur=p=>p.runs[0];
+const pipe=p=>PIPES[p.repo];
+const def=(p,id)=>pipe(p).find(s=>s.id===id);
+const vis=o=>o.waived?'waived':o.s;
+function gate(p,r){
+  let any=0,unk=0;
+  for(const s of pipe(p).filter(s=>s.gate)){const o=r.steps[s.id];
+    if(good(o)||(s.skipOk&&o.s==='skipped'))continue; if(settled(o)){any=1}else unk=1;}
+  return any?'fail':unk?'pending':'pass';
+}
+function cost(r){let u=0,unk=0;for(const k in r.steps){const o=r.steps[k];if(o.usd)u+=o.usd;else if(['claude','codex'].includes(k)&&o.t0&&!o.usd)unk=1;}return {u,unk}}
+const fmtUsd=c=>(c.u?'$'+c.u.toFixed(2):'$0')+(c.unk?'+?':'');
+function dur(ms){ms=Math.max(0,ms);const s=Math.round(ms/1000);if(s<60)return s+'s';const m=Math.floor(s/60);if(m<60)return m+'m';return Math.floor(m/60)+'h'+String(m%60).padStart(2,'0')}
+const agoS=t=>dur(now()-t)+' ago';
+function inbox(){
+  const out=[];
+  for(const p of PRS){const r=cur(p);
+    for(const s of pipe(p))if(r.steps[s.id].s==='ask')out.push({p,r,kind:'human',step:s.id,text:s.prompt,since:r.steps[s.id].t0});
+    if(r.esc)out.push({p,r,kind:'esc',step:r.esc.step,text:r.esc.reason,since:r.esc.since});}
+  return out.sort((a,b)=>a.since-b.since);
+}
+const entryFor=p=>inbox().find(e=>e.p===p);
+function status(p){
+  const r=cur(p),e=entryFor(p);
+  if(e)return {cls:e.kind==='esc'?'esc':'me',text:e.kind==='esc'?'Escalation: '+e.text:'Needs you: '+def(p,e.step).name};
+  if(r.end)return {cls:'',text:endText(r)+' · '+agoS(r.t1)};
+  const run=pipe(p).filter(s=>r.steps[s.id].s==='run').map(s=>s.name+' '+dur(now()-r.steps[s.id].t0));
+  if(gate(p,r)==='pass'&&r.steps.merge?.s==='run')return {cls:'',text:'Gate passed · Merge: '+(r.steps.merge.log?.[0]||'merging')};
+  return {cls:'',text:run.length?'Running: '+run.join(', '):'Waiting'};
+}
+function endText(r){return r.end==='pushed'?'pushed by '+r.endBy:r.end+(r.waivedShip?' (waived)':'')}
+function bucket(p){const r=cur(p);if(entryFor(p))return 'me';if(r.end)return 'ended';if(gate(p,r)==='pass')return 'passed';return 'running';}
+
+/* ======================= toy simulator ======================= */
+function finish(pid,sid,v,x={}){const p=pr(pid),r=cur(p),o=r.steps[sid];if(!o||o.s!=='run')return;Object.assign(o,{s:v,t1:now()},x);advance(p)}
+function startStep(p,r,s){
+  const o=r.steps[s.id];o.s=s.uses==='human'?'ask':'run';o.t0=now();o.t1=null;
+  if(s.uses==='human')return;
+  const ms={ci:9000,jev:1200,claude:6000,codex:7000,merge:4000,'claude-fix':6000}[s.uses]||4000;
+  const v=s.uses==='codex'?'inconclusive':'pass';
+  const x={ci:{log:['✓ test 8m','✓ lint 1m']},claude:{usd:0.3,findings:[F('low','Consider naming the constant.')]},jev:{usd:0.002},'claude-fix':{usd:0.8,note:'Addressed the failing Findings.'}}[s.uses]||{};
+  const run=r.n,pid=p.id;setTimeout(()=>{if(cur(pr(pid)).n===run)finish(pid,s.id,v,x)},ms);
+}
+function advance(p){
+  const r=cur(p);if(r.end)return;
+  let changed=true;
+  while(changed){changed=false;
+    for(const s of pipe(p)){const o=r.steps[s.id];if(o.s!=='wait')continue;
+      if(s.after){const g=gate(p,r);if(g==='pending')continue;
+        const want=s.after===g;o.t0=now();
+        if(!want){o.s='skipped';o.t1=now();changed=true;continue}
+        if(s.uses==='claude-fix'&&(r.fixRound||0)>=3){o.s='skipped';o.t1=now();o.note='round cap reached';r.esc={reason:'Fix round cap reached (3 of 3).',since:now()};changed=true;continue}
+        startStep(p,r,s);changed=true;continue}
+      const ups=s.needs.map(n=>r.steps[n]);if(!ups.every(settled)&&!ups.every(u=>settled(u)||u.waived))continue;
+      if(ups.every(good))startStep(p,r,s);else{o.s='skipped';o.t0=o.t1=now()}changed=true}}
+  const all=Object.values(r.steps).every(o=>settled(o)||o.waived);
+  const g=gate(p,r);
+  if(r.steps.merge?.s==='pass')return endRun(p,'merged');
+  if(r.steps.fix?.s==='pass')return newRun(p,'pushed','fix');
+  if(all){if(g==='pass')return endRun(p,'shippable');
+    const rejectedByMe=pipe(p).some(s=>s.uses==='human'&&r.steps[s.id].s==='fail');
+    if(!r.esc&&!rejectedByMe)r.esc={reason:'Run ended not shippable.',since:now()};
+    endRun(p,'not shippable')}
+  render();
+}
+function endRun(p,why){const r=cur(p);r.end=why;r.t1=now();if(why==='shippable'&&Object.values(r.steps).some(o=>o.waived))r.waivedShip=1;if(why!=='not shippable')delete r.esc;render()}
+function newRun(p,why,by,sameSha){
+  const r=cur(p);if(!r.end){r.end=why;r.endBy=by;r.t1=now();for(const k in r.steps){const o=r.steps[k];if(!settled(o)){o.s='cancelled';o.t1=now()}}}
+  delete r.esc;
+  const n={n:r.n+1,sha:sameSha?r.sha:sha(),t0:now(),fixRound:by==='fix'?(r.fixRound||0)+1:(r.fixRound||0),steps:{}};
+  for(const s of pipe(p)){const o=r.steps[s.id];
+    n.steps[s.id]=sameSha&&['pass','fail','inconclusive','skipped'].includes(o.s)&&!s.after?{...o,reused:1}:st('wait');}
+  if(sameSha)for(const k in r.steps)if(r.steps[k].waived)n.steps[k].waived=r.steps[k].waived;
+  p.runs.unshift(n);advance(p);
+}
+const ACT={
+  approve(pid,sid,note){const o=cur(pr(pid)).steps[sid];Object.assign(o,{s:'pass',t1:now(),note});advance(pr(pid))},
+  reject(pid,sid,note){const o=cur(pr(pid)).steps[sid];Object.assign(o,{s:'fail',t1:now(),note});advance(pr(pid))},
+  retry(pid,sid){const p=pr(pid),r=cur(p);delete r.esc;startStep(p,r,def(p,sid));render()},
+  cancel(pid){const p=pr(pid),r=cur(p);if(r.end)return;for(const k in r.steps){const o=r.steps[k];if(!settled(o)){o.s='cancelled';o.t1=now()}}delete r.esc;endRun(p,'cancelled')},
+  rerun(pid){newRun(pr(pid),'cancelled',null,true)},
+  waive(pid,runN,sid,cat,reason){const p=pr(pid),r=p.runs.find(x=>x.n===runN);r.steps[sid].waived={cat,reason};
+    if(r.end){newRun(p,r.end,r.endBy,true)}else{delete r.esc;advance(p)}},
+};
+function waiveDialog(pid,runN,sid){
+  modal(`<b>Waive ${esc(def(pr(pid),sid).name)}</b><span class="dim small">Counts as pass for this head SHA only. A push clears it.</span>
+  <select id="wcat"><option value="false_positive">false positive</option><option value="doesnt_apply">doesn't apply</option><option value="accepted_risk">accepted risk</option><option value="fix_in_followup">fix in follow-up</option></select>
+  <input id="wr" placeholder="Reason (required)">
+  <div style="display:flex;gap:8px;justify-content:flex-end"><button onclick="modal()">Cancel</button><button class="primary" onclick="if(!wr.value)return;const a=['${pid}',${runN},'${sid}',wcat.value,wr.value];modal();ACT.waive(...a)">Waive</button></div>`);
+}
+function answerDialog(pid,sid,ok){
+  modal(`<b>${ok?'Approve':'Reject'}: ${esc(def(pr(pid),sid).name)}</b><textarea id="an" rows="3" placeholder="Note for later Steps (optional)"></textarea>
+  <div style="display:flex;gap:8px;justify-content:flex-end"><button onclick="modal()">Cancel</button><button class="${ok?'ok':'no'}" onclick="const n=an.value;modal();ACT.${ok?'approve':'reject'}('${pid}','${sid}',n)">${ok?'Approve':'Reject'}</button></div>`);
+}
+function modal(html){const m=document.getElementById('modal');if(!html){m.style.display='none';render();return}document.getElementById('mbox').innerHTML=html;m.style.display='flex';m.querySelector('input,textarea')?.focus()}
+
+/* ======================= shared fragments ======================= */
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const J=x=>esc(JSON.stringify(x));
+function strip(p,r){
+  const first=pipe(p).find(s=>s.after),g='<span class="g" title="Gate"></span>';
+  return '<span class="strip">'+pipe(p).map(s=>(s===first?g:'')+`<span class="dot st-${vis(r.steps[s.id])}" title="${esc(s.name)}: ${vis(r.steps[s.id])}"></span>`).join('')+(first?'':g)+'</span>'}
+function gatePill(p,r){const g=gate(p,r);if(r.end)return `<span class="pill end">${esc(endText(r))}</span>`;return `<span class="pill ${g}">Gate ${g}</span>`}
+function stepTime(o){if(!o.t0)return '';if(o.reused)return 'reused';if(!o.t1)return dur(now()-o.t0);return dur(o.t1-o.t0)}
+function vlabel(o){let v=vis(o);if(o.s==='error'&&o.err)v+=' ('+o.err+')';if(o.s==='ask')v='waiting on you';return v}
+function askBox(e){
+  const pid=J(e.p.id);
+  if(e.kind==='human')return `<div class="ask"><div class="k">Human Step · ${esc(def(e.p,e.step).name)} · ${agoS(e.since)}</div><div>${esc(e.text)}</div>
+   <div style="display:flex;gap:6px;margin-top:6px"><button class="ok" onclick="event.stopPropagation();answerDialog(${pid},'${e.step}',1)">Approve</button><button class="no" onclick="event.stopPropagation();answerDialog(${pid},'${e.step}',0)">Reject</button></div></div>`;
+  const acts=[];
+  if(e.step&&e.r.steps[e.step].s==='error')acts.push(`<button onclick="event.stopPropagation();ACT.retry(${pid},'${e.step}')">Retry ${esc(def(e.p,e.step).name)}</button>`);
+  const failing=pipe(e.p).filter(s=>s.gate&&settled(e.r.steps[s.id])&&!good(e.r.steps[s.id]));
+  for(const s of failing)acts.push(`<button onclick="event.stopPropagation();waiveDialog(${pid},${e.r.n},'${s.id}')">Waive ${esc(s.name)}</button>`);
+  if(!e.r.end)acts.push(`<button class="no" onclick="event.stopPropagation();ACT.cancel(${pid})">Cancel Run</button>`);
+  return `<div class="ask esc"><div class="k">Escalation · ${agoS(e.since)}</div><div>${esc(e.text)}</div><div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">${acts.join('')}</div></div>`;
+}
+function evidence(p,r,sid){
+  const s=def(p,sid),o=r.steps[sid],pid=J(p.id),out=[];
+  out.push(`<div class="kv"><span>Plugin</span><span class="mono">${esc(s.uses)}</span><span>Verdict</span><span class="st-${vis(o)}"><span class="vl">${vlabel(o)}</span></span>`+
+   (o.t0?`<span>Time</span><span>${stepTime(o)}${o.t1?'':' so far'}</span>`:'')+
+   (o.usd!=null?`<span>Cost</span><span>$${o.usd.toFixed(3)}</span>`:(['claude','codex'].includes(s.uses)&&o.t0?`<span>Cost</span><span class="dim">unknown (Plugin reports no usage)</span>`:''))+
+   (o.prob!=null?`<span>Probability</span><span>${o.prob}</span>`:'')+
+   (prov[s.uses]?`<span>Provenance</span><span class="dim">${esc(prov[s.uses])}</span>`:'')+
+   (s.needs?.length?`<span>Reads</span><span>${s.needs.map(n=>esc(def(p,n).name)).join(', ')}</span>`:'')+
+   `<span>Gate</span><span>${s.gate?'required':s.after?'runs after Gate '+s.after:'advisory'}</span></div>`);
+  if(o.waived)out.push(`<div class="sect">Waiver</div><div>${esc(o.waived.cat)}: ${esc(o.waived.reason)}</div>`);
+  if(o.findings?.length)out.push('<div class="sect">Findings</div>'+o.findings.map(f=>`<div class="find"><span class="sev ${f.sev}">${f.sev}</span><span>${esc(f.message)}${f.file?` <span class="mono dim">${esc(f.file)}:${f.line}</span>`:''}</span></div>`).join(''));
+  if(o.note)out.push(`<div class="sect">Note</div><div>${esc(o.note)}</div>`);
+  if(o.log?.length)out.push(`<div class="sect">Log tail</div><div class="log mono">${o.log.map(esc).join('\n')}</div><a class="small" href="#" onclick="return false">Open full log</a>`);
+  const acts=[];
+  if(o.s==='ask'&&r===cur(p))acts.push(`<button class="ok" onclick="answerDialog(${pid},'${sid}',1)">Approve</button><button class="no" onclick="answerDialog(${pid},'${sid}',0)">Reject</button>`);
+  if(o.s==='error'&&r===cur(p)&&!r.end)acts.push(`<button onclick="ACT.retry(${pid},'${sid}')">Retry</button>`);
+  if(settled(o)&&o.s!=='pass'&&o.s!=='skipped'&&!o.waived&&r===cur(p))acts.push(`<button onclick="waiveDialog(${pid},${r.n},'${sid}')">Waive…</button>`);
+  if(acts.length)out.push(`<div style="display:flex;gap:6px;margin-top:10px">${acts.join('')}</div>`);
+  return out.join('');
+}
+function runMeta(p,r){const c=cost(r);return `Run ${r.n} · <span class="mono">${r.sha}</span> · ${r.end?dur(r.t1-r.t0):dur(now()-r.t0)+' so far'} · ${fmtUsd(c)}${r.fixRound?` · Fix round ${r.fixRound}/3`:''}`}
+function links(p){return `<a href="#" onclick="return false">PR on GitHub ↗</a> · <a href="#" onclick="return false">${esc(p.branch)} ↗</a>`}
+
+/* ======================= variant A: three panes ======================= */
+const A={src:'inbox',sel:null,open:{},run:null};
+function renderA(){
+  const ib=inbox(),repos=[...new Set(PRS.map(p=>p.repo))];
+  let list=A.src==='inbox'?ib.map(e=>e.p):A.src==='all'?PRS.filter(p=>!cur(p).end):A.src==='ended'?PRS.filter(p=>cur(p).end):PRS.filter(p=>p.repo===A.src);
+  list=[...new Set(list)];
+  if(!A.sel||!pr(A.sel))A.sel=list[0]?.id||PRS[0].id;
+  const it=(k,l,n,hot)=>`<div class="it ${A.src===k?'on':''}" onclick="A.src='${k}';A.sel=null;A.run=null;render()"><span>${l}</span><span class="n ${hot&&n?'hot':''}">${n}</span></div>`;
+  const src=`<div class="a-src">${it('inbox','Inbox',ib.length,1)}${it('all','Running',PRS.filter(p=>!cur(p).end).length)}${it('ended','Ended',PRS.filter(p=>cur(p).end).length)}
+   <div class="h">Repos</div>${repos.map(r=>it(r,r,PRS.filter(p=>p.repo===r).length)).join('')}</div>`;
+  const rows=list.map(p=>{const r=cur(p),s=status(p);return `<div class="a-row ${A.sel===p.id?'on':''}" onclick="A.sel='${p.id}';A.run=null;render()">
+    <div class="t"><b>${esc(p.title)}</b>${gatePill(p,r)}</div>
+    <div class="t"><span class="dim small">${esc(p.id)}</span><span class="spacer"></span>${strip(p,r)}</div>
+    <div class="s ${s.cls}">${esc(s.text)}</div></div>`}).join('')||'<div class="dim" style="padding:14px">Nothing waiting on you.</div>';
+  const p=pr(A.sel),r=p.runs.find(x=>x.n===A.run)||cur(p),e=entryFor(p),g=gate(p,r);
+  const steps=[];
+  for(const s of pipe(p)){
+    if(s.after&&s===pipe(p).find(x=>x.after))steps.push(`<div class="a-gate g-${g}"><b style="letter-spacing:.12em;font-size:11px;color:#c8bcff">GATE</b><span class="pill ${g}">${g}</span><span class="dim small">${pipe(p).filter(x=>x.gate).map(x=>x.name).join(' · ')}</span></div>`);
+    const o=r.steps[s.id],k=r.n+s.id,open=A.open[k]??(o.s==='ask'||o.s==='error'||(o.s==='fail'));
+    steps.push(`<div class="a-step ${s.gate||s.after?'':'adv'} st-${vis(o)}"><div class="hd" onclick="A.open['${k}']=${!open};render()"><span class="dot"></span><span class="nm">${esc(s.name)}</span>${s.write?'<span class="chip write">commit ends Run</span>':''}${!s.gate&&!s.after?'<span class="chip adv">advisory</span>':''}${o.findings?.length?`<span class="chip">${o.findings.length} finding${o.findings.length>1?'s':''}</span>`:''}<span class="spacer"></span><span class="vl">${vlabel(o)}</span><span class="dim small" style="width:52px;text-align:right">${stepTime(o)}</span></div>${open?`<div class="bd">${evidence(p,r,s.id)}</div>`:''}</div>`);
+  }
+  if(!pipe(p).some(x=>x.after))steps.push(`<div class="a-gate g-${g}"><b style="letter-spacing:.12em;font-size:11px;color:#c8bcff">GATE</b><span class="pill ${g}">${g}</span></div>`);
+  const det=`<div class="a-det"><div style="display:flex;gap:10px;align-items:center"><h2>${esc(p.title)}</h2>${gatePill(p,r)}</div>
+    <div class="dim small" style="margin:4px 0 10px">${esc(p.id)} · ${links(p)}</div>
+    ${e&&r===cur(p)?askBox(e):''}
+    <div class="sect">Run history</div><div style="display:flex;gap:6px;flex-wrap:wrap">${p.runs.map(x=>`<span class="histchip ${x===r?'on':''}" onclick="A.run=${x.n};render()"><span class="dot st-${x.end?(x.end==='merged'||x.end==='shippable'?'pass':x.end==='not shippable'?'fail':'skipped'):'run'}"></span>Run ${x.n} <span class="dim">${x.end?esc(endText(x)):'live'}</span></span>`).join('')}</div>
+    <div class="dim small" style="margin-top:10px">${runMeta(p,r)} ${!r.end&&r===cur(p)?`<button style="margin-left:8px" onclick="ACT.cancel('${p.id}')">Cancel Run</button>`:''}</div>
+    <div class="a-steps">${steps.join('')}</div></div>`;
+  return `<div class="a">${src}<div class="a-list">${rows}</div>${det}</div>`;
+}
+
+/* ======================= variant B: board + canvas ======================= */
+const B={open:null,run:null,sel:null};
+function renderB(){
+  if(B.open)return renderBRun();
+  const cols=[['me','Needs you'],['running','Running'],['passed','Gate passed'],['ended','Ended']];
+  return `<div class="b">${cols.map(([k,l])=>{const ps=PRS.filter(p=>bucket(p)===k);if(k==='me')ps.sort((a,b)=>entryFor(a).since-entryFor(b).since);
+    return `<div class="b-col"><h3><span>${l}</span><span>${ps.length}</span></h3>${ps.map(p=>{const r=cur(p),e=entryFor(p),s=status(p);
+      return `<div class="b-card ${e?e.kind==='esc'?'esc':'me':''}" onclick="B.open='${p.id}';B.run=null;B.sel=null;render()">
+       <div class="dim small">${esc(p.id)} · Run ${r.n}</div><div class="ttl">${esc(p.title)}</div>
+       <div style="display:flex;gap:8px;align-items:center">${strip(p,r)}<span class="spacer"></span>${gatePill(p,r)}</div>
+       ${e?askBox(e):`<div class="dim small">${esc(s.text)}</div>`}
+       <div class="dim small">${fmtUsd(cost(r))}${r.fixRound?` · Fix round ${r.fixRound}/3`:''}</div></div>`}).join('')}</div>`}).join('')}</div>`;
+}
+function layout(p){
+  const ps=pipe(p),depth={};const d=s=>depth[s.id]??(depth[s.id]=s.needs.length?1+Math.max(...s.needs.map(n=>d(def(p,n)))):0);
+  ps.filter(s=>!s.after).forEach(d);const gc=1+Math.max(...ps.filter(s=>!s.after).map(d));
+  const cols={};const pos={};
+  for(const s of ps){const c=s.after?gc+1:depth[s.id];(cols[c]=cols[c]||[]).push(s.id)}
+  for(const c in cols)cols[c].forEach((id,i)=>pos[id]={x:24+c*205,y:40+i*96});
+  pos.__gate={x:24+gc*205,y:40};return pos;
+}
+function renderBRun(){
+  const p=pr(B.open),r=p.runs.find(x=>x.n===B.run)||cur(p),g=gate(p,r),pos=layout(p),e=entryFor(p);
+  const W=Math.max(...Object.values(pos).map(v=>v.x))+260,H=Math.max(...Object.values(pos).map(v=>v.y))+140;
+  const edge=(a,b,dash,lbl)=>{const x1=a.x+(a.w||170),y1=a.y+28,x2=b.x,y2=b.y+28,mx=(x1+x2)/2;return `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" stroke="${dash?'#3d3570':'#56606d'}" stroke-width="1.5" fill="none" ${dash?'stroke-dasharray="5 4"':''}/>${lbl?`<text x="${mx}" y="${(y1+y2)/2-4}" fill="#8a95a3" font-size="11">${lbl}</text>`:''}`};
+  let svg='';const G={...pos.__gate,w:150};
+  for(const s of pipe(p)){for(const n of s.needs||[])svg+=edge(pos[n],pos[s.id]);if(s.gate)svg+=edge(pos[s.id],G,1);if(s.after)svg+=edge(G,pos[s.id],0,s.after==='pass'?'passes':'fails')}
+  const nodes=pipe(p).map(s=>{const o=r.steps[s.id];return `<div class="node st-${vis(o)} ${!s.gate&&!s.after?'adv':''} ${B.sel===s.id?'sel':''}" style="left:${pos[s.id].x}px;top:${pos[s.id].y}px" onclick="B.sel='${s.id}';render()">
+    <div class="top"><span class="dot"></span><b>${esc(s.name)}</b><span class="dim small">${stepTime(o)}</span></div>
+    <div class="small"><span class="vl">${vlabel(o)}</span>${o.findings?.length?` · ${o.findings.length} finding${o.findings.length>1?'s':''}`:''}${o.usd?` · $${o.usd.toFixed(2)}`:''}</div>${s.write?'<span class="chip write">commit ends Run</span>':''}</div>`}).join('');
+  const gn=`<div class="gnode g-${g}" style="left:${G.x}px;top:${G.y}px"><h4><span>GATE</span><span class="pill ${g}">${g}</span></h4>${pipe(p).filter(s=>s.gate).map(s=>`<div class="term st-${vis(r.steps[s.id])}"><span class="dot"></span>${esc(s.name)}</div>`).join('')}</div>`;
+  const side=B.sel?`<div style="display:flex;justify-content:space-between;align-items:center"><h3 style="margin:0">${esc(def(p,B.sel).name)}</h3><button onclick="B.sel=null;render()">×</button></div>${evidence(p,r,B.sel)}`
+    :`<h3 style="margin:0 0 4px">${esc(p.title)}</h3><div class="dim small">${esc(p.id)}</div><div class="small" style="margin:6px 0">${links(p)}</div>${e&&r===cur(p)?askBox(e):''}
+     <div class="sect">This Run</div><div class="small">${runMeta(p,r)}</div><div class="small" style="margin-top:4px">${r.end?'Ended: '+esc(endText(r)):'Live'}</div>
+     ${!r.end&&r===cur(p)?`<button style="margin-top:8px" class="no" onclick="ACT.cancel('${p.id}')">Cancel Run</button>`:''}
+     <div class="dim small" style="margin-top:14px">Click a Step for its Outcome.</div>`;
+  return `<div class="b-run"><div class="b-bar"><button onclick="B.open=null;render()">← Board</button><b>${esc(p.title)}</b><span class="dim">${esc(p.id)}</span>${gatePill(p,r)}</div>
+   <div class="b-body"><div class="b-canvas"><div style="position:relative;width:${W}px;height:${H}px"><svg width="${W}" height="${H}" style="position:absolute;inset:0">${svg}</svg>${nodes}${gn}</div></div><div class="b-side">${side}</div></div>
+   <div class="b-hist"><span class="dim small" style="align-self:center">Run history</span>${p.runs.map(x=>`<span class="histchip ${x===r?'on':''}" onclick="B.run=${x.n};render()">Run ${x.n} · <span class="mono">${x.sha}</span> <span class="dim">${x.end?esc(endText(x)):'live'} · ${fmtUsd(cost(x))}</span></span>`).join('')}</div></div>`;
+}
+
+/* ======================= variant C: table + timeline ======================= */
+const C={open:{},sel:{},run:{},mine:false};
+function timeline(p,r,pid){
+  const end=r.t1||now(),span=Math.max(end-r.t0,60e3);const L=t=>((t-r.t0)/span*100).toFixed(2)+'%';const Wd=(a,b)=>Math.max(((b-a)/span*100),0.4).toFixed(2)+'%';
+  const rows=pipe(p).map(s=>{const o=r.steps[s.id],sel=C.sel[pid]===s.id;
+    const bar=o.t0?`<div class="bar st-${vis(o)}" style="left:${L(o.t0)};width:${Wd(o.t0,o.t1||end)}" title="${esc(s.name)} ${vlabel(o)} ${stepTime(o)}"></div>`:'';
+    return `<div class="tl-row st-${vis(o)} ${sel?'sel':''}" onclick="event.stopPropagation();C.sel['${pid}']='${s.id}';render()"><div class="lbl"><span class="dot"></span>${esc(s.name)}${!s.gate&&!s.after?' <span class="chip adv">adv</span>':''}</div><div class="lane">${bar}</div></div>`});
+  // gate band: pending from start until determined
+  const g=gate(p,r);let gt=null;
+  if(g!=='pending'){const terms=pipe(p).filter(s=>s.gate).map(s=>r.steps[s.id]);gt=g==='pass'?Math.max(...terms.map(o=>o.t1||r.t0)):Math.min(...terms.filter(o=>settled(o)&&!good(o)).map(o=>o.t1||end))}
+  const band=`<div class="gband pending" style="left:0;width:${gt?L(gt):'100%'}"></div>${gt?`<div class="gband ${g}" style="left:${L(gt)};right:0"></div>`:''}`;
+  const gi=pipe(p).findIndex(s=>s.after);const gateRow=`<div class="tl-row tl-gate"><div class="lbl" style="color:#c8bcff;letter-spacing:.1em;font-size:11px;font-weight:700">GATE · ${g}</div><div class="lane">${band}</div></div>`;
+  if(gi<0)rows.push(gateRow);else rows.splice(gi,0,gateRow);
+  return `<div class="dim small" style="margin-bottom:4px">${runMeta(p,r)}</div><div class="tl-row" style="height:16px"><div class="lbl"></div><div class="lane dim small" style="background:none;display:flex;justify-content:space-between"><span>0</span><span>${dur(end-r.t0)}</span></div></div>`+rows.join('');
+}
+function renderC(){
+  const repos=[...new Set(PRS.map(p=>p.repo))];
+  const order=p=>{const e=entryFor(p);return e?e.since-1e13:cur(p).end?1e13+(T0-cur(p).t1):cur(p).t0};
+  let body='';
+  for(const repo of repos){let ps=PRS.filter(p=>p.repo===repo);if(C.mine)ps=ps.filter(p=>entryFor(p));ps.sort((a,b)=>order(a)-order(b));if(!ps.length)continue;
+    body+=`<tr class="repo"><td colspan="8">${esc(repo)}</td></tr>`;
+    for(const p of ps){const r0=cur(p),e=entryFor(p),s=status(p),open=C.open[p.id];const r=p.runs.find(x=>x.n===C.run[p.id])||r0;
+      body+=`<tr class="row ${e?e.kind==='esc'?'esc':'me':''} ${open?'open':''}" onclick="C.open['${p.id}']=${!open};render()">
+       <td>${open?'▾':'▸'} <b>${esc(p.title)}</b> <span class="dim">#${p.num}</span></td><td class="dim">Run ${r0.n}</td><td>${strip(p,r0)}</td><td>${gatePill(p,r0)}</td>
+       <td class="${s.cls==='me'?'':'dim'}" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;color:${s.cls==='me'?'var(--ask)':s.cls==='esc'?'#ff9b95':''}">${esc(s.text)}</td>
+       <td class="dim">${r0.end?dur(r0.t1-r0.t0):dur(now()-r0.t0)}</td><td class="dim">${fmtUsd(cost(r0))}</td><td class="dim">${r0.fixRound?r0.fixRound+'/3':''}</td></tr>`;
+      if(open){const sid=C.sel[p.id];
+        body+=`<tr class="c-exp"><td colspan="8"><div class="wrap"><div class="c-tl">${e&&r===r0?askBox(e)+'<div style="height:8px"></div>':''}${timeline(p,r,p.id)}
+         <div class="c-old"><div class="sect">Run history</div>${p.runs.map(x=>`<div class="tl-row" onclick="event.stopPropagation();C.run['${p.id}']=${x.n};render()" style="height:20px"><div class="lbl small ${x===r?'':'dim'}" style="width:auto">${x===r?'▸ ':''}Run ${x.n} · <span class="mono">${x.sha}</span> · ${x.end?esc(endText(x)):'live'} · ${x.end?dur(x.t1-x.t0):'…'} · ${fmtUsd(cost(x))}</div></div>`).join('')}</div>
+         <div class="small" style="margin-top:8px">${links(p)} ${!r0.end?` · <a href="#" onclick="event.stopPropagation();ACT.cancel('${p.id}');return false">Cancel Run</a>`:''}</div></div>
+         <div class="c-side" onclick="event.stopPropagation()">${sid?`<b>${esc(def(p,sid).name)}</b>${evidence(p,r,sid)}`:'<span class="dim">Click a bar for its Outcome.</span>'}</div></div></td></tr>`}}}
+  const n=inbox().length;
+  return `<div class="c"><div class="c-tools"><label><input type="checkbox" ${C.mine?'checked':''} onchange="C.mine=this.checked;render()"> Only what needs me (${n})</label><span class="dim small">Rows that need you sort to the top of each repo.</span></div>
+   <table class="c-t"><thead><tr><th>PR</th><th>Run</th><th>Steps</th><th>Gate</th><th>Status</th><th>Time</th><th>Cost</th><th>Fix</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+/* ======================= shell ======================= */
+const VARIANTS={A:['Three panes',renderA],B:['Board + Run canvas',renderB],C:['Table + Run timeline',renderC]};
+let V=new URLSearchParams(location.search).get('variant')||'A';if(!VARIANTS[V])V='A';
+function render(){
+  if(document.getElementById('modal').style.display==='flex')return;
+  const keep=[...document.querySelectorAll('.a-list,.a-det,.b-canvas,.b-side,.c')].map(e=>[e.className,e.scrollTop]);
+  document.getElementById('main').innerHTML=VARIANTS[V][1]();
+  for(const [c,t] of keep){const e=document.getElementsByClassName(c)[0];if(e)e.scrollTop=t}
+  document.getElementById('slabel').textContent=V+' ('+VARIANTS[V][0]+')';
+  document.getElementById('vname').textContent='Variant '+V+': '+VARIANTS[V][0];
+  document.getElementById('dockn').textContent=inbox().length;
+  const sp=document.getElementById('state');if(sp.style.display==='block')sp.textContent=JSON.stringify({inbox:inbox().map(e=>({pr:e.p.id,kind:e.kind,step:e.step,text:e.text})),prs:PRS.map(p=>({id:p.id,runs:p.runs.map(r=>({n:r.n,sha:r.sha,end:r.end||null,gate:gate(p,r),steps:Object.fromEntries(Object.entries(r.steps).map(([k,o])=>[k,vis(o)]))}))}))},null,1);
+}
+function go(d){const ks=Object.keys(VARIANTS);V=ks[(ks.indexOf(V)+d+ks.length)%ks.length];const u=new URL(location);u.searchParams.set('variant',V);history.replaceState(null,'',u);render()}
+document.getElementById('prev').onclick=()=>go(-1);document.getElementById('next').onclick=()=>go(1);
+document.getElementById('stateBtn').onclick=()=>{const s=document.getElementById('state');s.style.display=s.style.display==='block'?'none':'block';render()};
+addEventListener('keydown',e=>{if(e.target.closest('input,textarea,select,[contenteditable]'))return;if(e.key==='ArrowLeft')go(-1);if(e.key==='ArrowRight')go(1);if(e.key==='Escape')modal()});
+setInterval(render,1000);render();
+</script>
+</body>
+</html>
