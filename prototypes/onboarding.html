@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>PROTOTYPE · Onboarding a repo</title>
+<!--
+  PROTOTYPE, throwaway. Lives on the prototype/onboarding branch, never main.
+  Question (issue #37): what is the path from "I have a repo" to a first Run, and which presets ship in v1?
+  Three structurally different variants of the same flow, switchable via ?variant=A|B|C or the bottom bar (← →):
+    A  setup sheet: a linear five-step modal over the main window
+    B  canvas first: the repo opens straight into the Pipeline editor with a readiness rail
+    C  repo page: one-click add, then a non-linear checklist on the repo's page that stays until the first Run
+  All three share one fake daemon. Nothing touches GitHub. Press "state" to see what the daemon holds.
+  Open questions every variant has to answer, flagged in the UI with a ?:
+    Q1  starter Pipelines (bundles) or pick Library Steps one by one?
+    Q2  the first Pipeline lands as a PR (ADR 0007), so who merges it: me on GitHub, or a "merge it now" button?
+    Q3  can I watch PRs before the Pipeline PR merges (they wait), or only after?
+    Q4  the opt-in label: fixed `slopwatch`, created by the daemon on first watch?
+    Q5  (C only) a dry run of the draft on one PR, no Effects, not in Run history. Worth a new concept?
+-->
+<style>
+:root{
+  --bg:#0f1115;--panel:#161a20;--panel2:#1c2129;--line:#2a313b;--text:#d8dee6;--dim:#8a95a3;--muted:#5d6672;
+  --pass:#3fb950;--fail:#f85149;--inc:#e3a33b;--run:#58a6ff;--accent:#a78bfa;
+  font:13px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif;color:var(--text);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+button,select,input,textarea{font:inherit;color:inherit;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 10px}
+button{cursor:pointer}button:hover:not(:disabled){border-color:var(--dim)}button:disabled{opacity:.4;cursor:default}
+button.primary{background:#2d2560;border-color:var(--accent)}
+a{color:#8cb4ff;text-decoration:none}
+.mono{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:12px}
+.dim{color:var(--dim)}.muted{color:var(--muted)}.small{font-size:11px}
+header.app{display:flex;align-items:center;gap:12px;padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+.proto{font-size:10px;letter-spacing:.08em;background:#5a1d1d;color:#ffb4b4;padding:1px 6px;border-radius:4px}
+.spacer{flex:1}
+main{flex:1;overflow:hidden;position:relative}
+.q{display:inline-block;background:#3a2f0c;color:#f5cf6a;border:1px solid #6a5413;border-radius:999px;font-size:10px;font-weight:700;padding:0 6px;margin-left:6px;cursor:help;vertical-align:1px}
+.chip{display:inline-block;padding:0 6px;border-radius:4px;font-size:11px;background:#232a34;color:#b9c3cf;border:1px solid var(--line);white-space:nowrap}
+.chip.adv{border-style:dashed;color:var(--dim);background:transparent}
+.chip.write{background:#33240f;border-color:#6a4a17;color:#f0c27a}
+.chip.gate{background:#1d1a33;border-color:#3d3570;color:#c8bcff}
+.chip.ok{background:#12301a;border-color:#23582f;color:var(--pass)}
+.chip.bad{background:#3a1416;border-color:#6b2427;color:#ffb4b4}
+.chip.warn{background:#2f2610;border-color:#5e4a18;color:var(--inc)}
+.sect{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin:14px 0 6px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+.yaml{background:#0b0d10;border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre;overflow:auto;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.5}
+.row{display:flex;gap:8px;align-items:center}
+.preset{display:flex;gap:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;cursor:pointer;background:var(--panel)}
+.preset:hover{border-color:var(--dim)}.preset.on{border-color:var(--accent);background:#1a1730}
+.preset .nm{font-weight:600}
+.starter{flex:1;border:1px solid var(--line);border-radius:10px;padding:12px;cursor:pointer;background:var(--panel);display:flex;flex-direction:column;gap:6px;min-width:0}
+.starter:hover{border-color:var(--dim)}.starter.on{border-color:var(--accent);background:#1a1730}
+.dotx{width:9px;height:9px;border-radius:50%;display:inline-block;background:var(--muted);flex:none}
+.dotx.pass{background:var(--pass)}.dotx.run{background:var(--run);animation:pulse 1s infinite}.dotx.wait{background:#2b323c}.dotx.fail{background:var(--fail)}.dotx.skip{background:transparent;border:1.5px solid var(--muted)}
+@keyframes pulse{50%{opacity:.35}}
+#state{position:fixed;right:14px;bottom:64px;width:400px;max-height:60vh;overflow:auto;background:#0b0d10;border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre;z-index:40;display:none;font-size:11px}
+#switcher{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);display:flex;align-items:center;gap:10px;background:#fff;color:#111;border-radius:999px;padding:6px 10px;box-shadow:0 6px 24px #000a;z-index:50;font-weight:600}
+#switcher button{background:#111;color:#fff;border:none;border-radius:999px;width:28px;height:28px;padding:0}
+
+/* main-window shell, shared by all variants (from #14 variant A) */
+.shell{display:flex;height:100%}
+.src{width:210px;background:var(--panel);border-right:1px solid var(--line);padding:10px 6px;overflow:auto;flex:none}
+.src .it{display:flex;justify-content:space-between;align-items:center;padding:5px 10px;border-radius:6px;cursor:pointer}
+.src .it:hover{background:#20262f}.src .it.on{background:#2b3442}
+.src .h{font-size:10px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase;padding:10px 10px 4px;display:flex;justify-content:space-between}
+.src .add{color:var(--accent);cursor:pointer;font-size:14px;line-height:10px}
+.body{flex:1;overflow:auto;padding:16px 20px 90px;position:relative}
+
+/* A: sheet */
+.veil{position:absolute;inset:0;background:#000a;display:flex;align-items:flex-start;justify-content:center;padding-top:40px;z-index:20}
+.sheet{width:780px;max-height:calc(100% - 80px);display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--dim);border-radius:12px;overflow:hidden}
+.sheet .steps{display:flex;border-bottom:1px solid var(--line)}
+.sheet .steps div{flex:1;padding:9px 12px;font-size:12px;color:var(--muted);border-right:1px solid var(--line)}
+.sheet .steps div.on{color:var(--text);background:#1d2330;font-weight:600}.sheet .steps div.done{color:var(--pass)}
+.sheet .in{padding:16px 18px;overflow:auto;flex:1}
+.sheet .ft{display:flex;gap:8px;padding:10px 18px;border-top:1px solid var(--line);align-items:center}
+
+/* B: canvas */
+.b{display:flex;height:100%}
+.b-pal{width:230px;border-right:1px solid var(--line);background:var(--panel);overflow:auto;padding:10px}
+.b-pal .preset{margin-bottom:6px;padding:6px 8px;flex-direction:column;gap:2px}
+.b-can{flex:1;position:relative;overflow:auto;background-image:radial-gradient(#252b34 1px,transparent 1px);background-size:18px 18px}
+.b-rail{width:320px;border-left:1px solid var(--line);background:var(--panel);overflow:auto;padding:12px 14px 90px}
+.node{position:absolute;width:170px;background:var(--panel);border:1.5px solid var(--line);border-radius:10px;padding:7px 10px;display:flex;flex-direction:column;gap:3px}
+.node.adv{border-style:dashed}.node.miss{border-color:#6b2427}
+.node .x{position:absolute;right:6px;top:4px;cursor:pointer;color:var(--muted)}
+.gnode{position:absolute;width:150px;background:#17142a;border:2px solid #3d3570;border-radius:14px;padding:8px 10px}
+.gnode h4{margin:0 0 4px;font-size:11px;letter-spacing:.12em;color:#c8bcff}
+.chk{display:flex;gap:8px;align-items:flex-start;padding:7px 0;border-bottom:1px solid var(--line)}
+.chk .b0{width:16px;height:16px;border-radius:50%;border:1.5px solid var(--muted);flex:none;margin-top:1px;display:flex;align-items:center;justify-content:center;font-size:10px}
+.chk.done .b0{background:var(--pass);border-color:var(--pass);color:#000}
+.chk.now .b0{border-color:var(--accent)}
+
+/* C: repo page */
+.c-head{display:flex;align-items:center;gap:10px}
+.c-head h2{margin:0;font-size:18px}
+.c-grid{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:16px;margin-top:14px}
+.c-item{border:1px solid var(--line);border-radius:10px;background:var(--panel);margin-bottom:8px}
+.c-item .hd{display:flex;gap:10px;align-items:center;padding:10px 12px;cursor:pointer}
+.c-item .hd b{flex:1}
+.c-item .bd{padding:0 12px 12px 38px}
+.c-item.done .hd b{color:var(--dim)}
+.prl{display:flex;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)}
+</style>
+</head>
+<body>
+<header class="app"><span class="proto">PROTOTYPE</span><b>slopwatch</b><span class="dim" id="vname"></span><span class="spacer"></span><button id="reset">reset</button><button id="stateBtn">state</button></header>
+<main id="main"></main>
+<pre id="state"></pre>
+<div id="switcher"><button id="prev">←</button><span id="slabel"></span><button id="next">→</button></div>
+<script>
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const Q=(n,t)=>`<span class="q" title="${esc(t)}">?${n}</span>`;
+
+/* ======================= v1 presets (the proposal) ======================= */
+// Library Steps that ship. `gate` = the starter puts it in the Gate. Plugins ci, merge, human are also usable inline.
+const PRESETS={
+  'ci':                 {plugin:'ci',     inline:true, name:'CI',                 what:'Waits for the PR\'s checks on the head SHA. Reruns a failed Actions job once.', gate:true},
+  'desc-matches-diff':  {plugin:'jev',    name:'Description matches diff', what:'Jev, 3 boolean questions: does the diff do what the description says, does it change things the description doesn\'t mention, does the description say why.', secret:'AI_GATEWAY_API_KEY', gate:true, cost:'~$0.001'},
+  'resolves-issue':     {plugin:'jev',    name:'Resolves linked issue', what:'Jev: does the PR do what its linked issue asks? Skipped when there is no linked issue.', secret:'AI_GATEWAY_API_KEY', gate:'skip', cost:'~$0.001'},
+  'claude-review':      {plugin:'claude', name:'Claude review',       what:'claude -p, model opus, reads the diff in a read-only worktree, reports Findings by severity, fails on any high.', login:'claude', needs:['ci'], gate:true, cost:'~$0.40'},
+  'codex-review':       {plugin:'codex',  name:'Codex review',        what:'Same prompt on codex exec. Advisory by default, a second opinion whose Findings still reach Fix.', login:'codex', needs:['ci'], cost:'~$0.30'},
+  'claude-fix':         {plugin:'claude', name:'Claude fix',          what:'write Step after the Gate fails. Acts on Findings behind failing, unwaived terms. Guarded paths and fix_rounds: 3 apply.', login:'claude', after:'fail', write:true, cost:'~$0.80'},
+  'ship-it':            {plugin:'human',  inline:true, name:'Ship it?',  what:'Human Step: approve or reject with a note, after the reviews pass.', needs:['claude-review'], gate:true},
+  'merge':              {plugin:'merge',  inline:true, name:'Merge',  what:'Enqueues or merges with expectedHeadOid once the Gate passes.', after:'pass'},
+};
+const STARTERS={
+  review:  {name:'Review and fix', blurb:'Checks, judges and fixes. You merge.', steps:['ci','desc-matches-diff','claude-review','claude-fix']},
+  ask:     {name:'Ask me, then merge', blurb:'Everything green, then one tap from you, then slopwatch merges.', steps:['ci','desc-matches-diff','resolves-issue','claude-review','ship-it','merge','claude-fix']},
+  hands:   {name:'Hands off', blurb:'Two reviewers, fix loop, merge when green. No human Step.', steps:['ci','desc-matches-diff','resolves-issue','claude-review','codex-review','claude-fix','merge']},
+  blank:   {name:'Just CI', blurb:'CI in the Gate. Build up from the Library later.', steps:['ci']},
+};
+
+/* ======================= fake daemon ======================= */
+const GH_REPOS=[
+  {id:'jnsdls/slopwatch',  def:'main', pipeline:null, prs:[{n:44,t:'Daemon: poll loop skeleton'},{n:45,t:'GPUI: sources pane'},{n:46,t:'docs: README install section'}]},
+  {id:'jnsdls/dotfiles',   def:'main', pipeline:null, prs:[{n:12,t:'zsh: lazy-load nvm'}]},
+  {id:'typesafe-ai/web',   def:'main', pipeline:'existing', prs:[{n:301,t:'Pricing page copy'},{n:302,t:'Fix nav overflow on mobile'}]},
+];
+let S;
+function reset(){S={
+  repo:null,             // repo being onboarded
+  steps:[],              // Pipeline draft: preset ids
+  starter:null,
+  secrets:{},            // name -> set?
+  logins:{claude:'subscription',codex:null}, // what `claude`/`codex` report: their own login, never stored by slopwatch
+  pipelinePR:null,       // {n, state:'open'|'merged', by}
+  label:{name:'slopwatch',exists:false},
+  watched:[],            // PR numbers carrying the label
+  runs:{},               // pr -> {steps:{id:state}, t}
+  dry:null,              // C only: dry run on one PR
+  A:{open:false,step:0}, B:{}, C:{open:{}},
+};}
+reset();
+const repo=()=>GH_REPOS.find(r=>r.id===S.repo);
+const P=id=>PRESETS[id];
+const neededSecrets=()=>[...new Set(S.steps.map(id=>P(id).secret).filter(Boolean))];
+const neededLogins=()=>[...new Set(S.steps.map(id=>P(id).login).filter(Boolean))];
+const missing=()=>[...neededSecrets().filter(s=>!S.secrets[s]),...neededLogins().filter(l=>!S.logins[l]).map(l=>l+' login')];
+const onBase=()=>repo()?.pipeline==='existing'||S.pipelinePR?.state==='merged';
+
+const ACT={
+  addRepo(id){S.repo=id;const r=repo();if(r.pipeline==='existing')S.steps=['ci','desc-matches-diff','claude-review','claude-fix'];render()},
+  starter(k){S.starter=k;S.steps=[...STARTERS[k].steps];render()},
+  toggle(id){S.starter=null;const i=S.steps.indexOf(id);if(i>=0)S.steps.splice(i,1);else{S.steps.push(id);for(const n of P(id).needs||[])if(!S.steps.includes(n))S.steps.push(n)}
+    S.steps=S.steps.filter(s=>(P(s).needs||[]).every(n=>S.steps.includes(n)));render()},
+  setSecret(name){const v=prompt(`Paste ${name}. The daemon stores it in the Keychain and never shows it back.`);if(v){S.secrets[name]=true;render()}},
+  login(cli){alert(`Run \`${cli} login\` in a terminal. slopwatch never stores a login token: the ${cli} CLI keeps its own login and the daemon finds it through HOME.\n\n(Prototype: marking it logged in.)`);S.logins[cli]='subscription';render()},
+  publish(){S.pipelinePR=S.pipelinePR||{n:repo().prs.length?Math.max(...repo().prs.map(p=>p.n))+1:1,state:'open'};render()},
+  mergePipeline(by){S.pipelinePR.state='merged';S.pipelinePR.by=by;for(const n of S.watched)startRun(n);render()},
+  watch(n){if(S.watched.includes(n)){S.watched=S.watched.filter(x=>x!==n);delete S.runs[n]}else{S.label.exists=true;S.watched.push(n);if(onBase())startRun(n)}render()},
+  dry(n){S.dry={pr:n,steps:Object.fromEntries(S.steps.map(id=>[id,P(id).write||P(id).plugin==='merge'?'skip':'wait'])),t:Date.now()};render()},
+};
+function startRun(n){S.runs[n]={steps:Object.fromEntries(S.steps.map(id=>[id,'wait'])),t:Date.now()}}
+function tickRun(r){ // toy: Steps settle in Pipeline order, write and merge Steps skip
+  const el=(Date.now()-r.t)/1000;let i=0;
+  for(const id of S.steps){const p=P(id);
+    if(p.write||p.plugin==='merge'){r.steps[id]=el>i*1.6+1?'skip':'wait';continue}
+    if(p.plugin==='human'){r.steps[id]=el>i*1.6?'ask':'wait';i++;continue}
+    if(id==='resolves-issue'){r.steps[id]=el>i*1.6+1?'skip':el>i*1.6?'run':'wait';i++;continue}
+    if(missing().some(m=>m===p.secret||m===p.login+' login')){r.steps[id]=el>i*1.6?'error':'wait';i++;continue}
+    r.steps[id]=el>i*1.6+1.4?'pass':el>i*1.6?'run':'wait';i++}
+}
+
+/* ======================= shared renderers ======================= */
+function yaml(){
+  if(!S.steps.length)return '# empty: add a Step from the Library';
+  let out=`version: 1\nsteps:\n`;
+  for(const id of S.steps){const p=P(id);const needs=p.after?['gate']:(p.needs||[]);
+    const bits=[`uses: ${p.inline?p.plugin:'lib/'+id}`];
+    if(needs.length)bits.push(`needs: [${needs.join(', ')}]`);
+    if(p.after==='pass')bits.push('when: gate');
+    if(p.plugin==='human')bits.push('with: { prompt: "Ship it?" }');
+    out+=`  ${(id+':').padEnd(19)} { ${bits.join(', ')} }${p.after==='fail'?'   # default when: not: [gate]':''}\n`}
+  const g=S.steps.filter(id=>P(id).gate);
+  out+=`gate:\n`+(g.length?g.map(id=>P(id).gate==='skip'?`  - ${id}: [pass, skipped]`:`  - ${id}`).join('\n'):'  []   # load error: a Gate must reference a Step');
+  return out;
+}
+function roleChip(id){const p=P(id);return p.write?'<span class="chip write">write · after Gate fails</span>':p.after==='pass'?'<span class="chip gate">after Gate passes</span>':p.gate?'<span class="chip gate">in Gate</span>':'<span class="chip adv">advisory</span>'}
+function needChip(id){const p=P(id);
+  if(p.secret)return S.secrets[p.secret]?`<span class="chip ok">${p.secret} set</span>`:`<span class="chip bad">needs ${p.secret}</span>`;
+  if(p.login)return S.logins[p.login]?`<span class="chip ok">${p.login}: own login</span>`:`<span class="chip bad">${p.login} not logged in</span>`;
+  return ''}
+function presetRow(id,on,click){const p=P(id);return `<div class="preset ${on?'on':''}" onclick="${click}"><input type="checkbox" ${on?'checked':''} style="pointer-events:none"><div style="flex:1;min-width:0"><div class="row"><span class="nm">${esc(p.name)}</span><span class="mono dim">${p.inline?p.plugin:'lib/'+id}</span><span class="spacer"></span>${roleChip(id)}</div><div class="dim small">${esc(p.what)}</div><div class="row small" style="margin-top:3px">${needChip(id)}${p.cost?`<span class="dim">${p.cost} per Run</span>`:''}</div></div></div>`}
+function starters(){return `<div class="row" style="align-items:stretch">${Object.entries(STARTERS).map(([k,s])=>`<div class="starter ${S.starter===k?'on':''}" onclick="ACT.starter('${k}')"><b>${esc(s.name)}</b><span class="dim small">${esc(s.blurb)}</span><div style="display:flex;flex-wrap:wrap;gap:3px">${s.steps.map(id=>`<span class="chip ${P(id).write?'write':P(id).gate?'gate':'adv'}">${esc(P(id).name)}</span>`).join('')}</div></div>`).join('')}</div>`}
+function needsBlock(){
+  const secs=neededSecrets(),logs=neededLogins();
+  if(!secs.length&&!logs.length)return '<div class="dim">Nothing to enter: these Steps need no Secrets or logins.</div>';
+  return secs.map(s=>`<div class="prl"><span class="dotx ${S.secrets[s]?'pass':'fail'}"></span><span class="mono">${s}</span><span class="dim small" style="flex:1">for ${S.steps.filter(id=>P(id).secret===s).map(id=>P(id).name).join(', ')}. Granted to built-in jev.</span>${S.secrets[s]?'<span class="dim small">set just now</span> <button onclick="ACT.setSecret(\''+s+'\')">Replace</button>':`<button class="primary" onclick="ACT.setSecret('${s}')">Paste…</button>`}</div>`).join('')
+   +logs.map(l=>`<div class="prl"><span class="dotx ${S.logins[l]?'pass':'fail'}"></span><span class="mono">${l}</span><span class="dim small" style="flex:1">${S.logins[l]?`auth: subscription. The ${l} CLI's own login, found through HOME.`:`no login found. Steps would error with an Escalation.`}</span>${S.logins[l]?'':`<button onclick="ACT.login('${l}')">How to log in</button>`}</div>`).join('')
+   +`<div class="dim small" style="margin-top:6px">Missing ones don't block publishing. A Run still starts and those Steps error with one Escalation per name.</div>`}
+function publishBlock(){const pr=S.pipelinePR,r=repo();
+  if(r.pipeline==='existing')return `<div class="dim">This repo already has <span class="mono">.slopwatch/pipeline.yml</span> on <span class="mono">${r.def}</span>. Nothing to publish.</div>`;
+  if(!pr)return `<div>Commits <span class="mono">.slopwatch/pipeline.yml</span> to <span class="mono">slopwatch/pipeline</span> and opens a PR against <span class="mono">${r.def}</span>. Runs read the Pipeline from the base branch (ADR 0007), so nothing runs until it merges.</div><div style="margin-top:8px"><button class="primary" ${S.steps.length?'':'disabled'} onclick="ACT.publish()">Publish as PR</button></div>`;
+  if(pr.state==='open')return `<div class="row"><span class="dotx run"></span><span><a href="#">${r.id}#${pr.n}</a> <b>Add slopwatch Pipeline</b> is open.</span></div>
+    <div style="margin-top:8px" class="row"><button class="primary" onclick="ACT.mergePipeline('slopwatch')">Merge it now</button><button onclick="ACT.mergePipeline('you on GitHub')">(simulate: I merged it on GitHub)</button>${Q(2,'Who merges the first Pipeline PR')}</div>
+    <div class="dim small" style="margin-top:6px">The daemon sees it land on the next poll (2 min when idle, or refresh).</div>`;
+  return `<div class="row"><span class="dotx pass"></span><span><a href="#">${r.id}#${pr.n}</a> merged by ${esc(pr.by)}. The Pipeline is live on <span class="mono">${r.def}</span>.</span></div>`}
+function watchBlock(allowEarly){const r=repo(),live=onBase();
+  return `<div class="dim small" style="margin-bottom:6px">Your open PRs in ${r.id}. Watching adds the <span class="mono">${S.label.name}</span> label${S.label.exists?'':' (the daemon creates it on first use)'}.${Q(4,'Label name and who creates it')}${!live&&allowEarly?` They wait for the Pipeline to land, then start.${Q(3,'Watch before the Pipeline merges?')}`:''}</div>`
+   +r.prs.map(p=>{const w=S.watched.includes(p.n),run=S.runs[p.n];
+    return `<div class="prl"><input type="checkbox" ${w?'checked':''} ${!live&&!allowEarly?'disabled':''} onchange="ACT.watch(${p.n})"><span class="dim">#${p.n}</span><span style="flex:1">${esc(p.t)}</span>${w&&!run?'<span class="chip warn">waiting for Pipeline</span>':''}${run?runStrip(run):''}</div>`}).join('')
+   +(!live&&!allowEarly?'<div class="dim small" style="margin-top:6px">Watching unlocks once the Pipeline is on the base branch.</div>':'')}
+function runStrip(run){tickRun(run);const cls={wait:'wait',run:'run',pass:'pass',skip:'skip',error:'fail',ask:'run'};
+  return `<span class="row" style="gap:3px">${S.steps.map(id=>`<span class="dotx ${cls[run.steps[id]]}" title="${esc(P(id).name)}: ${run.steps[id]}"></span>`).join('')}</span><span class="small dim">Run 1</span>`}
+function firstRun(){const n=Object.keys(S.runs)[0];if(!n)return '';const run=S.runs[n];tickRun(run);
+  const lbl={wait:'waiting',run:'running',pass:'pass',skip:'skipped',error:'error',ask:'waiting on you'};
+  return `<div class="card" style="margin-top:12px;border-color:#23582f"><b>First Run started</b> <span class="dim">on #${n} ${esc(repo().prs.find(p=>p.n==n).t)}</span>
+   <div style="margin-top:8px">${S.steps.map(id=>`<div class="row small" style="padding:2px 0"><span class="dotx ${({wait:'wait',run:'run',pass:'pass',skip:'skip',error:'fail',ask:'run'})[run.steps[id]]}"></span><span style="width:170px">${esc(P(id).name)}</span><span class="dim">${lbl[run.steps[id]]}${run.steps[id]==='error'?' (secret missing → Inbox)':''}</span></div>`).join('')}</div>
+   <div class="dim small" style="margin-top:6px">From here it's the main window from #14: the PR shows up in the Watched PR list.</div></div>`}
+function sources(active){
+  return `<div class="src"><div class="it"><span>Inbox</span><span class="dim">0</span></div><div class="it"><span>Running</span><span class="dim">${Object.keys(S.runs).length}</span></div><div class="it"><span>Ended</span><span class="dim">0</span></div>
+   <div class="h"><span>Repos</span><span class="add" title="Add a repo" onclick="${active}">+</span></div>
+   ${S.repo?`<div class="it on"><span>${esc(S.repo.split('/')[1])}</span><span class="dim">${S.watched.length}</span></div>`:'<div class="it dim small" style="cursor:default">No repos yet</div>'}
+   <div class="h"><span>Library</span></div><div class="it dim"><span>Steps</span><span>${Object.keys(PRESETS).filter(k=>!P(k).inline).length}</span></div><div class="it dim"><span>Secrets</span><span>${Object.values(S.secrets).filter(Boolean).length}</span></div></div>`}
+function repoPicker(click){return GH_REPOS.map(r=>`<div class="prl" style="cursor:pointer" onclick="${click}('${r.id}')"><span class="mono" style="flex:1">${r.id}</span>${r.pipeline?'<span class="chip ok">has a Pipeline</span>':''}<span class="dim small">${r.prs.length} open PR${r.prs.length>1?'s':''} by you</span></div>`).join('')
+  +`<div class="dim small" style="margin-top:6px">From <span class="mono">gh</span>: repos you can push to. The daemon makes its own blobless clone, never your checkout.</div>`}
+function empty(cta){return `<div style="max-width:440px;margin:80px auto;text-align:center"><h2 style="margin:0 0 8px">No repos yet</h2><div class="dim">slopwatch runs your open PRs through a Pipeline you define per repo.</div><div style="margin-top:14px"><button class="primary" onclick="${cta}">Add a repo</button></div></div>`}
+
+/* ======================= A: setup sheet ======================= */
+const A_STEPS=['Repo','Pipeline','Secrets','Publish','Watch'];
+function renderA(){const a=S.A;
+  let inner='',canNext=true;
+  if(a.step===0){inner=`<h3 style="margin-top:0">Which repo?</h3>${repoPicker('ACT.addRepoA')}`;canNext=!!S.repo}
+  if(a.step===1){inner=repo().pipeline==='existing'?`<div class="dim">Found an existing Pipeline. Skipping ahead uses it as is.</div><div class="yaml" style="margin-top:8px">${esc(yaml())}</div>`
+    :`<h3 style="margin-top:0">Start from${Q(1,'Starters or one-by-one')}</h3>${starters()}<div class="sect">Or pick Library Steps</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">${Object.keys(PRESETS).map(id=>presetRow(id,S.steps.includes(id),`ACT.toggle('${id}')`)).join('')}</div><div class="sect">pipeline.yml</div><div class="yaml">${esc(yaml())}</div>`;canNext=S.steps.length>0}
+  if(a.step===2)inner=`<h3 style="margin-top:0">Secrets and logins</h3>${needsBlock()}`;
+  if(a.step===3){inner=`<h3 style="margin-top:0">Publish</h3>${publishBlock()}`;canNext=!!S.pipelinePR||repo().pipeline==='existing'}
+  if(a.step===4)inner=`<h3 style="margin-top:0">Watch PRs</h3>${watchBlock(true)}${firstRun()}`;
+  const sheet=a.open?`<div class="veil"><div class="sheet"><div class="steps">${A_STEPS.map((s,i)=>`<div class="${i===a.step?'on':i<a.step?'done':''}">${i<a.step?'✓ ':(i+1)+'. '}${s}</div>`).join('')}</div>
+   <div class="in">${inner}</div><div class="ft"><button onclick="S.A.open=false;render()">Close</button><span class="dim small">Closing keeps the draft. Reopen from the repo.</span><span class="spacer"></span>${a.step?'<button onclick="S.A.step--;render()">Back</button>':''}${a.step<4?`<button class="primary" ${canNext?'':'disabled'} onclick="S.A.step++;render()">Next</button>`:'<button class="primary" onclick="S.A.open=false;render()">Done</button>'}</div></div></div>`:'';
+  const bodyHtml=S.repo?`<h2 style="margin:0">${esc(S.repo)}</h2><div class="dim" style="margin:4px 0 12px">${onBase()?'Pipeline live':'Setup not finished'} · ${S.watched.length} watched</div>${!a.open&&a.step<4?'<button class="primary" onclick="S.A.open=true;render()">Continue setup</button>':''}${firstRun()}`:empty('S.A.open=true;S.A.step=0;render()');
+  return `<div class="shell">${sources('S.A.open=true;S.A.step=0;render()')}<div class="body">${bodyHtml}</div>${sheet}</div>`;
+}
+ACT.addRepoA=id=>{ACT.addRepo(id);S.A.step=repo().pipeline==='existing'?4:1;render()};
+
+/* ======================= B: canvas first ======================= */
+function layoutB(){const col={},pos={};
+  const depth=id=>{const p=P(id);if(p.after)return 99;return (p.needs||[]).filter(n=>S.steps.includes(n)).reduce((m,n)=>Math.max(m,depth(n)+1),0)};
+  const pre=S.steps.filter(id=>!P(id).after),post=S.steps.filter(id=>P(id).after);
+  const maxD=pre.reduce((m,id)=>Math.max(m,depth(id)),0);
+  for(const id of pre){const d=depth(id);col[d]=(col[d]||0)+1;pos[id]={x:40+d*210,y:40+(col[d]-1)*96}}
+  const gx=40+(maxD+1)*210;pos.__gate={x:gx,y:40};
+  post.forEach((id,i)=>pos[id]={x:gx+200,y:40+i*96});
+  return pos}
+function renderB(){
+  if(!S.repo)return `<div class="shell">${sources("S.B.pick=true;render()")}<div class="body">${S.B.pick?`<div style="max-width:560px;margin:40px auto"><h3>Add a repo</h3>${repoPicker('ACT.addRepo')}<div class="dim small" style="margin-top:8px">The repo opens on an empty canvas. Drag Steps in from the Library.</div></div>`:empty("S.B.pick=true;render()")}</div></div>`;
+  const pos=layoutB(),G=pos.__gate;let svg='';
+  const W=Math.max(900,...Object.values(pos).map(v=>v.x+260)),H=Math.max(420,...Object.values(pos).map(v=>v.y+140));
+  const edge=(a,b,dash,lbl)=>{const x1=a.x+(a.w||170),y1=a.y+28,x2=b.x,y2=b.y+28,mx=(x1+x2)/2;return `<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}" stroke="${dash?'#3d3570':'#56606d'}" stroke-width="1.5" fill="none" ${dash?'stroke-dasharray="5 4"':''}/>${lbl?`<text x="${mx}" y="${(y1+y2)/2-4}" fill="#8a95a3" font-size="11">${lbl}</text>`:''}`};
+  for(const id of S.steps){const p=P(id);for(const n of p.needs||[])if(pos[n])svg+=edge(pos[n],pos[id]);if(p.gate)svg+=edge(pos[id],{...G,w:150},1);if(p.after)svg+=edge({...G,w:150},pos[id],0,p.after==='pass'?'passes':'fails')}
+  const miss=id=>{const p=P(id);return (p.secret&&!S.secrets[p.secret])||(p.login&&!S.logins[p.login])};
+  const nodes=S.steps.map(id=>{const p=P(id);return `<div class="node ${!p.gate&&!p.after?'adv':''} ${miss(id)?'miss':''}" style="left:${pos[id].x}px;top:${pos[id].y}px"><span class="x" onclick="ACT.toggle('${id}')">×</span><b>${esc(p.name)}</b><span class="mono dim small">${p.inline?p.plugin:'lib/'+id}</span>${miss(id)?`<span class="chip bad" style="cursor:pointer" onclick="${p.secret?`ACT.setSecret('${p.secret}')`:`ACT.login('${p.login}')`}">${p.secret?'set '+p.secret:p.login+' login'}</span>`:''}${p.write?'<span class="chip write">commit ends Run</span>':''}</div>`}).join('');
+  const gate=`<div class="gnode" style="left:${G.x}px;top:${G.y}px"><h4>GATE</h4>${S.steps.filter(id=>P(id).gate).map(id=>`<div class="small">${esc(P(id).name)}${P(id).gate==='skip'?' <span class="dim">or skipped</span>':''}</div>`).join('')||'<div class="small" style="color:#ffb4b4">no terms yet</div>'}</div>`;
+  const pal=`<div class="b-pal"><div class="sect" style="margin-top:0">Start from${Q(1,'Starters or one-by-one')}</div>${Object.entries(STARTERS).map(([k,s])=>`<div class="preset ${S.starter===k?'on':''}" onclick="ACT.starter('${k}')"><span class="nm">${esc(s.name)}</span><span class="dim small">${esc(s.blurb)}</span></div>`).join('')}
+    <div class="sect">Library</div>${Object.keys(PRESETS).map(id=>`<div class="preset ${S.steps.includes(id)?'on':''}" onclick="ACT.toggle('${id}')" title="${esc(P(id).what)}"><span class="nm">${S.steps.includes(id)?'✓ ':'+ '}${esc(P(id).name)}</span><span class="dim small">${P(id).inline?P(id).plugin:'lib/'+id}${P(id).cost?' · '+P(id).cost:''}</span></div>`).join('')}</div>`;
+  const live=onBase(),m=missing();
+  const items=[
+    ['Add Steps and Gate terms',S.steps.length&&S.steps.some(id=>P(id).gate),S.steps.length?`${S.steps.length} Steps, ${S.steps.filter(id=>P(id).gate).length} in the Gate`:'Pick a starter or drag Steps in.'],
+    ['Secrets and logins',S.steps.length&&!m.length,m.length?`Missing: ${m.join(', ')}. Click the red badge on a node.`:'All set.'],
+    ['Publish the Pipeline',!!S.pipelinePR||repo().pipeline==='existing',publishBlock()],
+    ['Watch a PR',S.watched.length>0,watchBlock(false)],
+  ];
+  const now=items.findIndex(i=>!i[1]);
+  const rail=`<div class="b-rail"><b>${esc(S.repo)}</b><div class="dim small">${live?'Pipeline live':'Draft, not published'}</div><div class="sect">Ready to run</div>
+   ${items.map(([t,d,detail],i)=>`<div class="chk ${d?'done':i===now?'now':''}"><span class="b0">${d?'✓':''}</span><div style="flex:1;min-width:0"><b>${t}</b><div class="small ${i===now||i>=2?'':'dim'}" style="margin-top:2px">${detail}</div></div></div>`).join('')}
+   ${firstRun()}<div class="sect">pipeline.yml (draft)</div><div class="yaml">${esc(yaml())}</div></div>`;
+  return `<div class="b">${pal}<div class="b-can"><div style="position:relative;width:${W}px;height:${H}px"><svg width="${W}" height="${H}" style="position:absolute;inset:0">${svg}</svg>${nodes}${gate}</div></div>${rail}</div>`;
+}
+
+/* ======================= C: repo page checklist ======================= */
+function renderC(){
+  if(!S.repo)return `<div class="shell">${sources("S.C.pick=true;render()")}<div class="body">${S.C.pick?`<div style="max-width:560px;margin:40px auto"><h3>Add a repo</h3>${repoPicker('ACT.addRepo')}<div class="dim small" style="margin-top:8px">One click adds it. Setup happens on the repo's page, in any order.</div></div>`:empty("S.C.pick=true;render()")}</div></div>`;
+  const live=onBase(),m=missing(),o=S.C.open;
+  const items=[
+    {k:'pipe',t:'Choose a Pipeline',done:S.steps.length>0,sum:S.starter?STARTERS[S.starter].name:S.steps.length?`${S.steps.length} Steps`:'',
+      body:repo().pipeline==='existing'?'<div class="dim">Already on the base branch.</div>':`${starters()}<details style="margin-top:8px"><summary class="dim" style="cursor:pointer">Customize: pick Library Steps${Q(1,'Starters or one-by-one')}</summary><div style="display:flex;flex-direction:column;gap:6px;margin-top:6px">${Object.keys(PRESETS).map(id=>presetRow(id,S.steps.includes(id),`ACT.toggle('${id}')`)).join('')}</div></details>`},
+    {k:'sec',t:'Secrets and logins',done:S.steps.length&&!m.length,sum:m.length?m.length+' missing':'',body:needsBlock()},
+    {k:'dry',t:'Try it on a PR',optional:true,done:!!S.dry,sum:S.dry?'#'+S.dry.pr:'optional',body:`<div class="dim small" style="margin-bottom:6px">Runs the draft against one PR's head. No Effects, no commits, Fix and Merge skipped, not kept in Run history.${Q(5,'Dry run: a new concept?')}</div>${repo().prs.map(p=>`<div class="prl"><span class="dim">#${p.n}</span><span style="flex:1">${esc(p.t)}</span><button ${S.steps.length?'':'disabled'} onclick="ACT.dry(${p.n})">Dry run</button></div>`).join('')}${S.dry?dryBox():''}`},
+    {k:'pub',t:'Publish the Pipeline',done:live,sum:S.pipelinePR&&!live?'PR open':'',body:publishBlock()},
+    {k:'watch',t:'Watch PRs',done:Object.keys(S.runs).length>0,sum:S.watched.length?S.watched.length+' watched':'',body:watchBlock(true)},
+  ];
+  const first=items.findIndex(i=>!i.done&&!i.optional);
+  return `<div class="shell">${sources("S.C.pick=true;S.repo=null;render()")}<div class="body">
+   <div class="c-head"><h2>${esc(S.repo)}</h2>${live?'<span class="chip ok">Pipeline live</span>':'<span class="chip warn">setting up</span>'}<span class="spacer"></span><span class="dim small">${items.filter(i=>i.done).length}/${items.length} done. The checklist stays until the first Run, then folds into the repo header.</span></div>
+   <div class="c-grid"><div>${items.map((it,i)=>{const open=o[it.k]??i===first;return `<div class="c-item ${it.done?'done':''}"><div class="hd" onclick="S.C.open['${it.k}']=${!open};render()"><span class="dotx ${it.done?'pass':i===first?'run':'wait'}"></span><b>${it.t}</b><span class="dim small">${esc(it.sum||'')}</span><span class="dim">${open?'▾':'▸'}</span></div>${open?`<div class="bd">${it.body}</div>`:''}</div>`}).join('')}${firstRun()}</div>
+   <div><div class="sect" style="margin-top:0">pipeline.yml (draft)</div><div class="yaml">${esc(yaml())}</div><div class="dim small" style="margin-top:6px">Open in the graph editor (#13) for anything a starter doesn't cover.</div></div></div></div></div>`;
+}
+function dryBox(){const r=S.dry;const el=(Date.now()-r.t)/1000;let i=0;
+  for(const id of S.steps){if(r.steps[id]==='skip')continue;const p=P(id);const err=(p.secret&&!S.secrets[p.secret])||(p.login&&!S.logins[p.login]);r.steps[id]=el>i*1.2+1?(err?'error':p.plugin==='human'?'ask':id==='resolves-issue'?'skip':'pass'):el>i*1.2?'run':'wait';i++}
+  const cls={wait:'wait',run:'run',pass:'pass',skip:'skip',error:'fail',ask:'run'};
+  return `<div class="card" style="margin-top:8px"><b class="small">Dry run on #${r.pr}</b>${S.steps.map(id=>`<div class="row small" style="padding:2px 0"><span class="dotx ${cls[r.steps[id]]}"></span><span style="width:170px">${esc(P(id).name)}</span><span class="dim">${r.steps[id]}${P(id).write||P(id).plugin==='merge'?' (never in a dry run)':''}</span></div>`).join('')}</div>`}
+
+/* ======================= shell ======================= */
+const VARIANTS={A:['Setup sheet',renderA],B:['Canvas first',renderB],C:['Repo page checklist',renderC]};
+let V=new URLSearchParams(location.search).get('variant')||'A';if(!VARIANTS[V])V='A';
+function render(){
+  const ae=document.activeElement;if(ae&&ae.tagName==='SUMMARY')return;
+  const keep=[...document.querySelectorAll('.body,.sheet .in,.b-rail,.b-can')].map(e=>[e.className,e.scrollTop]);
+  const det=[...document.querySelectorAll('details')].map(d=>d.open);
+  document.getElementById('main').innerHTML=VARIANTS[V][1]();
+  for(const [c,t] of keep){const e=document.getElementsByClassName(c.split(' ').pop())[0];if(e)e.scrollTop=t}
+  document.querySelectorAll('details').forEach((d,i)=>{if(det[i])d.open=true});
+  document.getElementById('slabel').textContent=V+' ('+VARIANTS[V][0]+')';
+  document.getElementById('vname').textContent='Variant '+V+': '+VARIANTS[V][0];
+  const sp=document.getElementById('state');if(sp.style.display==='block')sp.textContent=JSON.stringify({repo:S.repo,draft:S.steps,starter:S.starter,secrets:Object.keys(S.secrets),logins:S.logins,missing:missing(),pipelinePR:S.pipelinePR,pipelineOnBase:!!onBase(),label:S.label,watched:S.watched,runs:Object.fromEntries(Object.entries(S.runs).map(([k,r])=>[k,r.steps])),dryRun:S.dry},null,1);
+}
+function go(d){const ks=Object.keys(VARIANTS);V=ks[(ks.indexOf(V)+d+ks.length)%ks.length];const u=new URL(location);u.searchParams.set('variant',V);history.replaceState(null,'',u);render()}
+document.getElementById('prev').onclick=()=>go(-1);document.getElementById('next').onclick=()=>go(1);
+document.getElementById('reset').onclick=()=>{reset();render()};
+document.getElementById('stateBtn').onclick=()=>{const s=document.getElementById('state');s.style.display=s.style.display==='block'?'none':'block';render()};
+addEventListener('keydown',e=>{if(e.target.closest('input,textarea,select,[contenteditable]'))return;if(e.key==='ArrowLeft')go(-1);if(e.key==='ArrowRight')go(1)});
+setInterval(()=>{if(Object.keys(S.runs).length||S.dry)render()},700);render();
+</script>
+</body>
+</html>
