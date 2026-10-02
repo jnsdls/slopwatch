@@ -24,6 +24,10 @@ _Avoid_: credential, token, key
 The developer's own collection of configured Steps, shared across their repos. Presets ship as Library Steps.
 _Avoid_: catalog, registry, templates
 
+**Starter**:
+A ready-made Pipeline, built from preset Library Steps, offered when the developer adds a repo. Picking one copies its Steps into the repo's draft Pipeline, and the draft keeps no link to the Starter after that.
+_Avoid_: template, preset, recipe
+
 **Pipeline**:
 A graph of Steps bound to one repo, with one input (a Watched PR) and one output (the Gate's verdict).
 _Avoid_: workflow, flow
@@ -45,7 +49,7 @@ Why a Run stopped: merged, shippable (the Gate passed and the Pipeline has no Me
 _Avoid_: status, result
 
 **Watched PR**:
-A pull request the app has picked up and runs its repo's Pipeline on.
+One of the developer's open pull requests, in a repo slopwatch has added, that carries the `slopwatch` label. The daemon creates the label the first time the developer watches a PR, and watching or unwatching from the app adds or removes it. A Watched PR in a repo whose Pipeline hasn't reached the base branch yet waits, and its first Run starts once the Pipeline lands.
 _Avoid_: tracked PR, managed PR
 
 **Stack**:
