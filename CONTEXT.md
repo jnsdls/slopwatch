@@ -33,7 +33,7 @@ One execution of a Pipeline against one head SHA of a Watched PR, using the Pipe
 _Avoid_: execution, build, job
 
 **End reason**:
-Why a Run stopped: merged, shippable (the Gate passed and the Pipeline has no Merge Step), not shippable, pushed (by one of the Run's own Steps, such as a Fix commit or a Merge rebase), superseded (by a push from outside the Run), closed (merged or closed on GitHub by someone else), or cancelled (by the developer).
+Why a Run stopped: merged, shippable (the Gate passed and the Pipeline has no Merge Step), not shippable, pushed (by one of the Run's own Steps, such as a Fix commit or a Merge rebase), superseded (by a push from outside the Run), closed (merged or closed on GitHub by someone else), over budget (the Watched PR's or the day's Budget ran out), or cancelled (by the developer).
 _Avoid_: status, result
 
 **Watched PR**:
@@ -71,6 +71,10 @@ _Avoid_: action, side effect
 **Fix round**:
 A Run started by a commit from one of slopwatch's own Steps, such as Fix. The Pipeline caps consecutive Fix rounds on a Watched PR. An outside push resets the count, and a rebase made by slopwatch leaves it alone.
 _Avoid_: retry, iteration, attempt
+
+**Budget**:
+A cap, in list-price US dollars, on what Steps may spend: per Step in one Run, per Watched PR since its last outside push, and per day across all repos. Usage is priced at list price whatever the developer is actually billed, so Steps on a subscription login spend against it too. A Step that reports no cost isn't budgeted.
+_Avoid_: quota, limit, spend cap
 
 **Guarded path**:
 A file no Step may change through slopwatch, such as CI workflows or the Pipeline file, so that no Step can pass the Gate by weakening it.
