@@ -9,11 +9,15 @@ A configured, reusable unit of work with a typed outcome, such as a Jev judgemen
 _Avoid_: check, task, job, node
 
 **Plugin**:
-The executable a Step runs, together with the manifest that describes it. Built-in Steps such as Jev, CI and Merge are Plugins that ship with the app.
+The executable a Step runs, together with the manifest that describes it. Built-in Steps such as Jev, CI and Merge are Plugins that ship with the app. A Plugin runs only once the developer has approved it, which covers what its manifest asks for: a workspace, Effects and Secrets. Built-in Plugins come approved.
 _Avoid_: step type, runner, action
 
+**Approval**:
+The developer's consent that a Plugin may run with what its manifest asks for. It belongs to the Plugin's name, not its code, so a new build keeps it, but a manifest that asks for more needs a new Approval.
+_Avoid_: trust, permission, allowlist
+
 **Secret**:
-A named credential, such as an API key, that the daemon keeps and passes to a Step only when the developer has granted it to the Step's Plugin. Built-in Plugins come granted the Secrets their manifests name. A Secret is never shown back once set.
+A named credential, such as an API key, that the daemon keeps and passes to a Step only when the Step's Plugin has an Approval that covers it. A Secret is never shown back once set.
 _Avoid_: credential, token, key
 
 **Library**:
