@@ -92,6 +92,29 @@ main{flex:1;overflow:auto;position:relative}
 .orbox .lbl,.andlbl{font-size:10px;color:var(--dim);letter-spacing:.08em}
 .a-loop{position:absolute;font-size:11px;color:#f0c27a;white-space:nowrap}
 
+
+.a-inner{position:relative;margin-top:-40px}
+.a-svg{position:absolute;inset:0;pointer-events:none}
+.a-svg .hit{stroke:transparent;stroke-width:14;fill:none;pointer-events:stroke;cursor:pointer}
+.a-node{user-select:none;touch-action:none}.a-gate{user-select:none;touch-action:none}
+.port{position:absolute;right:-9px;top:50%;margin-top:-9px;width:18px;height:18px;border-radius:50%;background:var(--panel2);border:2px solid var(--accent);color:var(--accent);font-size:13px;line-height:13px;text-align:center;cursor:crosshair;font-weight:700}
+.port:hover{background:var(--accent);color:#000}
+.inport{position:absolute;left:-5px;top:50%;margin-top:-5px;width:10px;height:10px;border-radius:50%;background:#56606d}
+.drop-hot{outline:2px dashed var(--accent)!important;outline-offset:3px}
+.orbox.empty{border:1px dashed #3d3570;border-radius:6px;padding:6px 8px;margin-top:6px}
+.tiny{font-size:10px;padding:0 5px;border-radius:4px;margin-left:2px;background:transparent;color:var(--dim)}
+.tiny.on{color:#8fd3e0;border-color:#24505a;background:#14262c}
+.a-xedge{position:absolute;width:22px;height:22px;padding:0;border-radius:50%;background:var(--fail);border:none;color:#fff;font-weight:700;z-index:6}
+.a-menu{position:absolute;z-index:30;background:var(--panel2);border:1px solid var(--dim);border-radius:8px;box-shadow:0 10px 30px #000a;width:300px;padding:4px}
+.a-menu .mi,.a-pal .pi{display:flex;flex-direction:column;padding:5px 8px;border-radius:6px;cursor:pointer}
+.a-menu .mi span.dim,.a-pal .pi span.dim{font-size:11px}
+.a-menu .mi:hover,.a-pal .pi:hover{background:#2b3442}
+.a-pal{width:220px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:10px 8px;overflow:auto}
+.a-pal .pi{cursor:grab}
+.a-canvas{position:relative}
+.ghost{position:fixed;z-index:100;background:var(--accent);color:#000;padding:2px 8px;border-radius:6px;pointer-events:none}
+.toast{position:fixed;left:50%;top:70px;transform:translateX(-50%);background:#3a1416;border:1px solid var(--fail);color:#ffc1bd;padding:6px 14px;border-radius:8px;z-index:60}
+
 /* ---------- Variant B: stages ---------- */
 .b-wrap{display:flex;flex-direction:column;height:100%}
 .b-top{flex:1;display:flex;gap:0;overflow:auto;padding:16px;align-items:stretch}
@@ -199,9 +222,9 @@ const SCEN = {
 
 const qs = new URLSearchParams(location.search);
 const VARIANTS = ['A','B','C'];
-const VNAMES = {A:'Node canvas', B:'Stages around the Gate', C:'Timeline outline'};
+const VNAMES = {A:'Node canvas, flow-chart editing', B:'Stages around the Gate', C:'Timeline outline'};
 let S = {variant: VARIANTS.includes(qs.get('variant')) ? qs.get('variant') : 'A',
-  mode:'edit', scen:'green', t:0, sel:null, yaml:false, edits:0, waivers:{}, playing:null, frames:[]};
+  mode:'edit', scen:'green', t:0, sel:null, pos:{}, menu:null, edge:null, toast:null, yaml:false, edits:0, waivers:{}, playing:null, frames:[]};
 
 // ---------------------------------------------------------------- model helpers
 const gateRefs = () => P.gate.flatMap(t => t.or ? t.or.map(x => x.ref) : [t.ref]);
@@ -424,56 +447,194 @@ function liveInspector(id){
   </div>`;
 }
 
-// ---------------------------------------------------------------- Variant A: node canvas
-function renderA(){
-  const D = depths(), fr = liveFrame();
-  const W = 190, H = 92, GX = 90, GY = 26, X0 = 30, Y0 = 60;
+// ---------------------------------------------------------------- Variant A: node canvas with flow-chart editing
+// Auto-layout places every node; S.pos holds positions the developer dragged by hand (in memory only).
+const AW = 190, AH = 92;
+function gateHeight(){ return 50 + P.gate.reduce((a, t) => a + (t.or ? 26 + 21 * t.or.length : 21), 0) + (P.gate.some(t => t.or) ? 0 : 30) + 10; }
+function autoLayout(){
+  const D = depths(), GX = 90, GY = 26, X0 = 30, Y0 = 70;
   const cols = {}; [...P.order, 'gate'].forEach(id => (cols[D[id]] = cols[D[id]] || []).push(id));
-  const gateH = 44 + P.gate.reduce((a, t) => a + (t.or ? 22 + 21 * t.or.length : 21), 0) + 22;
   const pos = {};
   Object.entries(cols).forEach(([d, ids]) => {
     let y = Y0;
     ids.sort((a, b) => (isAdvisory(a) - isAdvisory(b)) || P.order.indexOf(a) - P.order.indexOf(b));
-    ids.forEach(id => { const h = id === 'gate' ? gateH : H; pos[id] = {x: X0 + d * (W + GX), y, h}; y += h + GY; });
+    ids.forEach(id => { const h = id === 'gate' ? gateHeight() : AH; pos[id] = {x: X0 + d * (AW + GX), y, h}; y += h + GY; });
   });
-  const wTot = X0 + (Math.max(...Object.keys(cols).map(Number)) + 1) * (W + GX) + 320;
-  const hTot = Math.max(...Object.values(pos).map(p => p.y + p.h)) + 80;
-  const path = (a, b, dash, col) => {
-    const x1 = a.x + W, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2, c = Math.max(40, (x2 - x1) / 2);
-    return `<path d="M${x1},${y1} C${x1 + c},${y1} ${x2 - c},${y2} ${x2},${y2}" fill="none" stroke="${col}" stroke-width="1.6" ${dash ? 'stroke-dasharray="4 4"' : ''} marker-end="url(#ar${dash ? 'g' : ''})"/>`;
+  return pos;
+}
+function layoutA(){
+  const pos = autoLayout();
+  Object.entries(S.pos).forEach(([id, p]) => { if (pos[id]) Object.assign(pos[id], p); });
+  return pos;
+}
+let APOS = {};
+function edgePath(a, b){
+  const x1 = a.x + AW, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2, c = Math.max(40, Math.abs(x2 - x1) / 2);
+  return {d:`M${x1},${y1} C${x1 + c},${y1} ${x2 - c},${y2} ${x2},${y2}`, mx:(x1 + x2) / 2, my:(y1 + y2) / 2};
+}
+function renderA(){
+  const fr = liveFrame(), editing = S.mode === 'edit';
+  const pos = APOS = layoutA();
+  const wTot = Math.max(...Object.values(pos).map(p => p.x)) + AW + 340;
+  const hTot = Math.max(...Object.values(pos).map(p => p.y + p.h)) + 220;
+  let edges = '', handles = '';
+  const edge = (kind, from, to, a, b, col, dash) => {
+    const p = edgePath(a, b), on = S.edge && S.edge.kind === kind && S.edge.from === from && S.edge.to === to;
+    edges += `<path d="${p.d}" fill="none" stroke="${on ? 'var(--accent)' : col}" stroke-width="${on ? 2.6 : 1.6}" ${dash ? 'stroke-dasharray="4 4"' : ''} marker-end="url(#ar${dash ? 'g' : ''})"/>`;
+    if (editing) edges += `<path class="hit" d="${p.d}" data-act="edge" data-kind="${kind}" data-from="${from}" data-to="${to}"/>`;
+    if (on) handles += `<button class="a-xedge" style="left:${p.mx - 11}px;top:${p.my - 11}px" data-act="deledge">×</button>`;
   };
-  let edges = '';
-  P.order.forEach(id => P.steps[id].needs.forEach(n => { if (pos[n]) edges += path(pos[n], pos[id], false, '#56606d'); }));
-  gateRefs().forEach(r => { if (pos[r]) edges += path(pos[r], pos.gate, true, '#7a6bd0'); });
+  P.order.forEach(id => P.steps[id].needs.forEach(n => { if (pos[n]) edge('need', n, id, pos[n], pos[id], '#56606d', false); }));
+  gateRefs().forEach(r => { if (pos[r]) edge('gate', r, 'gate', pos[r], pos.gate, '#7a6bd0', true); });
   const g = gateState(fr);
   const termHtml = t => {
+    if (t.or) return `<div class="orbox" data-drop="gate-or"><div class="lbl">ANY OF</div>${t.or.map(termHtml).join('')}</div>`;
     const v = termVal(t, fr);
-    if (t.or) return `<div class="orbox"><div class="lbl">ANY OF</div>${t.or.map(termHtml).join('')}</div>`;
-    return `<div class="term"><span class="dot ${v || ''}"></span><span class="mono">${t.ref}</span>${t.accept ? `<span class="acc">pass · skipped</span>` : ''}</div>`;
+    return `<div class="term"><span class="dot ${v || ''}"></span><span class="mono">${t.ref}</span>${editing
+      ? `<button class="tiny ${t.accept ? 'on' : ''}" data-act="toggleskip" data-v="${t.ref}" title="also accept skipped">skip ok</button><button class="tiny" data-act="delterm" data-v="${t.ref}">×</button>`
+      : (t.accept ? `<span class="acc">pass · skipped</span>` : '')}</div>`;
   };
+  const port = id => editing ? `<div class="port" data-port="${id}" data-act="noop" title="drag to connect · click to add a Step after">+</div>` : '';
   const nodes = P.order.map(id => {
     const s = P.steps[id], p = pos[id], st = stepStatus(id, fr), lib = libOf(s.uses);
     const tags = [condLabel(s.when) && `<span class="chip cond">${esc(condLabel(s.when))}</span>`,
       isAdvisory(id) && `<span class="chip adv">advisory</span>`, isWrite(id) && `<span class="chip write">write · terminal</span>`].filter(Boolean).join(' ');
-    return `<div class="a-node st-${st.cls} ${isAdvisory(id) ? 'adv' : ''} ${S.sel === id ? 'sel' : ''}" data-act="sel" data-v="${id}" style="left:${p.x}px;top:${p.y}px;height:${H}px">
+    return `<div class="a-node st-${st.cls} ${isAdvisory(id) ? 'adv' : ''} ${S.sel === id ? 'sel' : ''}" data-node="${id}" data-drop="${id}" data-act="sel" data-v="${id}" style="left:${p.x}px;top:${p.y}px;height:${AH}px">
       <div class="top"><span class="dot"></span><span class="id">${id}</span><span class="spacer"></span><span class="vlabel">${st.label}</span></div>
-      <div class="uses mono">${s.uses}<span class="muted"> · ${lib.plugin}</span></div><div>${tags}</div></div>`;
+      <div class="uses mono">${s.uses}<span class="muted"> · ${lib.plugin}</span></div><div>${tags}</div>${editing ? '<div class="inport"></div>' : ''}${isWrite(id) ? '' : port(id)}</div>`;
   }).join('');
-  const loops = P.order.filter(isWrite).map(id => `<div class="a-loop" style="left:${pos[id].x + W + 10}px;top:${pos[id].y + H / 2 - 9}px">⟶ commit ends this Run · next Run re-checks</div>`).join('');
+  const loops = P.order.filter(isWrite).map(id => `<div class="a-loop" style="left:${pos[id].x + AW + 12}px;top:${pos[id].y + AH / 2 - 9}px">⟶ commit ends this Run · next Run re-checks</div>`).join('');
   const gp = pos.gate;
-  return `<div class="a-wrap"><div class="a-canvas">
-    <div class="a-tool">${S.mode === 'edit' ? `<button data-act="sel" data-v="">+ Add Step</button>` : ''}<span class="dim" style="align-self:center">solid: needs · dashed: read by the Gate · dashed box: advisory</span></div>
-    <div style="position:relative;width:${wTot}px;height:${hTot}px;margin-top:-40px">
-      <svg width="${wTot}" height="${hTot}" style="position:absolute;inset:0">
+  const menu = S.menu ? `<div class="a-menu" style="left:${S.menu.x}px;top:${S.menu.y}px"><div class="dim" style="padding:4px 8px;font-size:11px">${S.menu.from ? `Add a Step after <b>${S.menu.from}</b>` : 'Add a Step'}</div>${LIB.map(l => `<div class="mi" data-act="menuadd" data-v="${l.uses}"><span class="mono">${l.uses}</span><span class="dim">${esc(l.title)}</span></div>`).join('')}</div>` : '';
+  const palette = editing ? `<div class="a-pal"><div class="dim" style="font-size:11px;margin-bottom:6px">LIBRARY · drag onto the canvas or onto a Step</div>${LIB.map(l => `<div class="pi" data-pal="${l.uses}" data-act="noop"><span class="mono">${l.uses}</span><span class="dim">${esc(l.title)}</span></div>`).join('')}</div>` : '';
+  return `<div class="a-wrap">${palette}<div class="a-canvas">
+    <div class="a-tool"><span class="dim">solid: needs · dashed: read by the Gate · dashed box: advisory${editing ? ' · drag nodes to arrange · ⌫ deletes the selection' : ''}</span>
+      ${Object.keys(S.pos).length ? `<button data-act="tidy">Tidy (auto-layout)</button>` : ''}</div>
+    <div class="a-inner" style="width:${wTot}px;height:${hTot}px">
+      <svg class="a-svg" width="${wTot}" height="${hTot}">
         <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#56606d"/></marker>
-        <marker id="arg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#7a6bd0"/></marker></defs>${edges}</svg>
+        <marker id="arg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#7a6bd0"/></marker></defs>${edges}<path id="a-temp" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 4"/></svg>
       ${nodes}
-      <div class="a-gate g-${g.cls} ${S.sel === 'gate' ? 'sel' : ''}" data-act="sel" data-v="gate" style="left:${gp.x}px;top:${gp.y}px;min-height:${gp.h}px">
-        <h4>GATE <span class="pill ${g.cls}">${g.label}</span></h4><div class="andlbl">ALL OF</div>${P.gate.map(termHtml).join('')}</div>
-      ${loops}
-    </div></div><aside class="a-side">${inspector()}</aside></div>`;
+      <div class="a-gate g-${g.cls} ${S.sel === 'gate' ? 'sel' : ''}" data-node="gate" data-drop="gate" data-act="sel" data-v="gate" style="left:${gp.x}px;top:${gp.y}px;min-height:${gp.h}px">
+        <h4>GATE <span class="pill ${g.cls}">${g.label}</span></h4><div class="andlbl">ALL OF${editing ? ' · drop a Step here to require it' : ''}</div>${P.gate.map(termHtml).join('')}
+        ${editing && !P.gate.some(t => t.or) ? `<div class="orbox empty" data-drop="gate-or"><div class="lbl">ANY OF · drop here</div></div>` : ''}${port('gate')}</div>
+      ${loops}${handles}${menu}
+    </div></div><aside class="a-side">${inspector()}</aside></div>
+    ${S.toast ? `<div class="toast">${esc(S.toast)}</div>` : ''}`;
 }
 
+// ---- flow-chart interactions (Variant A, Edit mode only, except node dragging which also works in Live)
+function dependsOn(a, b, seen = {}){ // does a (transitively) need b?
+  if (a === b) return true; if (seen[a]) return false; seen[a] = 1;
+  const deps = a === 'gate' ? gateRefs() : (P.steps[a] ? P.steps[a].needs : []);
+  return deps.some(n => dependsOn(n, b, seen));
+}
+function toast(msg){ S.toast = msg; render(); setTimeout(() => { S.toast = null; render(); }, 2200); }
+function addStep(uses, needs){
+  let base = uses.split('/').pop().split('-')[0], nid = base, i = 2; while (P.steps[nid]) nid = base + i++;
+  const afterG = needs.includes('gate');
+  P.steps[nid] = {uses, needs, when: uses === 'merge' ? {t:'gate'} : uses === 'lib/fix' ? {t:'notgate'} : null, with:{}};
+  if (uses === 'merge' || uses === 'lib/fix') { if (!afterG) P.steps[nid].needs = ['gate']; }
+  const at = P.order.findIndex(afterGate); (at < 0 || afterG) ? P.order.push(nid) : P.order.splice(at, 0, nid);
+  S.sel = nid; S.edits++;
+  return nid;
+}
+function connect(from, to){
+  if (to === 'gate' || to === 'gate-or'){
+    if (from === 'gate') return toast('The Gate can\'t read itself');
+    if (isWrite(from)) return toast(`${from} is a write Step; the Gate can't read it`);
+    if (afterGate(from)) return toast(`${from} runs after the Gate, so the Gate can't read it`);
+    setGateRole(from, to === 'gate' ? (gateRole(from) === 'req-skip' ? 'req-skip' : 'req') : 'or');
+  } else {
+    if (from === to) return;
+    if (dependsOn(from, to)) return toast(`That edge would make a cycle: ${from} already runs after ${to}`);
+    const s = P.steps[to]; if (s.needs.includes(from)) return;
+    s.needs.push(from);
+  }
+  S.edits++; render();
+}
+let drag = null, suppressClick = false;
+const canvasPoint = e => { const r = document.querySelector('.a-inner').getBoundingClientRect(); return {x:e.clientX - r.left, y:e.clientY - r.top}; };
+const dropTarget = e => { const el = document.elementFromPoint(e.clientX, e.clientY); return el && el.closest('[data-drop]'); };
+document.addEventListener('pointerdown', e => {
+  if (S.variant !== 'A' || e.button !== 0) return;
+  const port = e.target.closest('[data-port]'), pal = e.target.closest('[data-pal]'), node = e.target.closest('[data-node]');
+  if (e.target.closest('button,select,input')) return;
+  if (S.mode === 'edit' && port){ e.preventDefault(); drag = {kind:'link', from:port.dataset.port, x0:e.clientX, y0:e.clientY, moved:false}; return; }
+  if (S.mode === 'edit' && pal){ e.preventDefault(); drag = {kind:'pal', uses:pal.dataset.pal, x0:e.clientX, y0:e.clientY, moved:false}; return; }
+  if (node){ const id = node.dataset.node, p = APOS[id], c = canvasPoint(e); drag = {kind:'move', id, dx:c.x - p.x, dy:c.y - p.y, x0:e.clientX, y0:e.clientY, moved:false}; }
+});
+document.addEventListener('pointermove', e => {
+  if (!drag) return;
+  if (!drag.moved && Math.hypot(e.clientX - drag.x0, e.clientY - drag.y0) < 5) return;
+  drag.moved = true;
+  document.querySelectorAll('.drop-hot').forEach(el => el.classList.remove('drop-hot'));
+  if (drag.kind === 'move'){
+    const c = canvasPoint(e); S.pos[drag.id] = {x:Math.max(0, Math.round((c.x - drag.dx) / 10) * 10), y:Math.max(30, Math.round((c.y - drag.dy) / 10) * 10)};
+    render(true); return;
+  }
+  const t = dropTarget(e); if (t) t.classList.add('drop-hot');
+  if (drag.kind === 'link'){
+    const a = APOS[drag.from], c = canvasPoint(e), x1 = a.x + AW, y1 = a.y + a.h / 2, k = Math.max(40, Math.abs(c.x - x1) / 2);
+    document.getElementById('a-temp').setAttribute('d', `M${x1},${y1} C${x1 + k},${y1} ${c.x - k},${c.y} ${c.x},${c.y}`);
+  } else {
+    let gh = document.getElementById('ghost'); if (!gh){ gh = document.createElement('div'); gh.id = 'ghost'; gh.className = 'ghost mono'; gh.textContent = drag.uses; document.body.appendChild(gh); }
+    gh.style.left = e.clientX + 8 + 'px'; gh.style.top = e.clientY + 8 + 'px';
+  }
+});
+document.addEventListener('pointerup', e => {
+  if (!drag) return;
+  const d = drag; drag = null;
+  const gh = document.getElementById('ghost'); if (gh) gh.remove();
+  if (d.kind === 'move'){ if (d.moved){ suppressClick = true; setTimeout(() => suppressClick = false, 0); render(); } return; }
+  suppressClick = true; setTimeout(() => suppressClick = false, 0);
+  const t = d.moved ? dropTarget(e) : null, c = canvasPoint(e);
+  setTimeout(() => {
+    if (d.kind === 'link'){
+      if (!d.moved){ const p = APOS[d.from]; S.menu = {x:p.x + AW + 16, y:p.y, from:d.from}; return render(); }
+      if (t) return connect(d.from, t.dataset.drop);
+      S.menu = {x:c.x, y:c.y, from:d.from, at:{x:c.x, y:c.y}}; return render();
+    }
+    // palette item
+    if (!d.moved){ addStep(d.uses, []); return render(); }
+    if (t && P.steps[t.dataset.drop]){ addStep(d.uses, [t.dataset.drop]); return render(); }
+    if (t && t.dataset.drop === 'gate'){ addStep(d.uses, ['gate']); return render(); }
+    if (c.x > 0){ const nid = addStep(d.uses, []); S.pos[nid] = {x:Math.round((c.x - AW / 2) / 10) * 10, y:Math.round((c.y - AH / 2) / 10) * 10}; }
+    render();
+  }, 0);
+});
+document.addEventListener('click', e => {
+  if (suppressClick){ e.stopImmediatePropagation(); return; }
+  if (S.menu && !e.target.closest('.a-menu')){ S.menu = null; if (!e.target.closest('[data-act]')) render(); }
+  if (S.edge && !e.target.closest('[data-act=deledge],[data-act=edge]')){ S.edge = null; if (!e.target.closest('[data-act]')) render(); }
+}, true);
+function variantAAction(a, el){
+  if (a === 'noop') return true;
+  if (a === 'tidy'){ S.pos = {}; render(); return true; }
+  if (a === 'edge'){ S.edge = {kind:el.dataset.kind, from:el.dataset.from, to:el.dataset.to}; S.sel = null; render(); return true; }
+  if (a === 'deledge'){ deleteEdge(); return true; }
+  if (a === 'delterm'){ edit(() => setGateRole(el.dataset.v, 'none')); return true; }
+  if (a === 'toggleskip'){ edit(() => setGateRole(el.dataset.v, gateRole(el.dataset.v) === 'req-skip' ? 'req' : gateRole(el.dataset.v) === 'or' ? 'or' : 'req-skip')); return true; }
+  if (a === 'menuadd'){
+    const m = S.menu; S.menu = null;
+    const nid = addStep(el.dataset.v, m.from ? [m.from] : []);
+    if (m.at) S.pos[nid] = {x:Math.round(m.at.x / 10) * 10, y:Math.round((m.at.y - AH / 2) / 10) * 10};
+    render(); return true;
+  }
+  return false;
+}
+function deleteEdge(){
+  const g = S.edge; S.edge = null; if (!g) return;
+  edit(() => { if (g.kind === 'gate') setGateRole(g.from, 'none'); else P.steps[g.to].needs = P.steps[g.to].needs.filter(n => n !== g.from); });
+}
+document.addEventListener('keydown', e => {
+  if (S.variant !== 'A' || S.mode !== 'edit' || e.target.closest('input,textarea,select,[contenteditable]')) return;
+  if (e.key === 'Escape'){ S.menu = null; S.edge = null; render(); return; }
+  if (e.key !== 'Backspace' && e.key !== 'Delete') return;
+  e.preventDefault();
+  if (S.edge) return deleteEdge();
+  if (S.sel && P.steps[S.sel]){ const v = S.sel; edit(() => { delete P.steps[v]; delete S.pos[v]; P.order = P.order.filter(x => x !== v); setGateRole(v, 'none'); P.order.forEach(x => P.steps[x].needs = P.steps[x].needs.filter(n => n !== v)); S.sel = null; }); }
+});
 // ---------------------------------------------------------------- Variant B: stages around the Gate
 function renderB(){
   const D = depths(), fr = liveFrame(), g = gateState(fr);
@@ -592,7 +753,9 @@ function render(keepHdr){
   const errs = validate();
   if (!keepHdr) document.getElementById('hdr').innerHTML = header();
   document.getElementById('banner').innerHTML = errs.length ? `<div class="err"><b>Invalid Pipeline, no Runs:</b> ${errs.map(esc).join(' · ')}</div>` : '';
+  const sc = document.querySelector('.a-canvas'), keep = sc && [sc.scrollLeft, sc.scrollTop];
   document.getElementById('main').innerHTML = ({A:renderA, B:renderB, C:renderC})[S.variant]();
+  const sc2 = document.querySelector('.a-canvas'); if (keep && sc2){ sc2.scrollLeft = keep[0]; sc2.scrollTop = keep[1]; }
   const y = document.getElementById('yaml'); y.hidden = !S.yaml; y.innerHTML = `<h5>.slopwatch/pipeline.yml${S.edits ? ' (draft)' : ''}</h5><span class="mono">${esc(yaml())}</span>`;
   document.getElementById('switcher').innerHTML = `<button data-act="vprev">←</button><span>${S.variant} (${VNAMES[S.variant]})</span><button data-act="vnext">→</button>`;
 }
@@ -602,6 +765,7 @@ const edit = f => { f(); S.edits++; render(); };
 document.addEventListener('click', e => {
   const el = e.target.closest('[data-act]'); if (!el) return;
   const a = el.dataset.act, v = el.dataset.v, id = el.dataset.id;
+  if (variantAAction(a, el)) return;
   if (a === 'sel'){ S.sel = v || null; render(); }
   else if (a === 'mode'){ S.mode = v; if (v === 'live') S.t = 0; render(); }
   else if (a === 'yaml'){ S.yaml = !S.yaml; render(); }
