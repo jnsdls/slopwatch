@@ -12,6 +12,10 @@ _Avoid_: check, task, job, node
 The executable a Step runs, together with the manifest that describes it. Built-in Steps such as Jev, CI and Merge are Plugins that ship with the app.
 _Avoid_: step type, runner, action
 
+**Secret**:
+A named credential, such as an API key, that the daemon keeps and passes to a Step only when the developer has granted it to the Step's Plugin. Built-in Plugins come granted the Secrets their manifests name. A Secret is never shown back once set.
+_Avoid_: credential, token, key
+
 **Library**:
 The developer's own collection of configured Steps, shared across their repos. Presets ship as Library Steps.
 _Avoid_: catalog, registry, templates
