@@ -1,6 +1,6 @@
 # Merge rebases a behind PR through `updatePullRequestBranch`, then lets a new Run judge it
 
-Before merging, the Merge Step checks how far the PR is behind its base (`baseRef.compare(headRef).behindBy`, which works without branch protection). If it is behind and the base branch has no merge queue, Merge requests the `rebase` Effect instead of `merge`. The daemon runs GraphQL `updatePullRequestBranch` with `updateMethod: REBASE` and `expectedHeadOid`, and the resulting push ends the Run with end reason pushed. The next Run judges the rebased SHA, and its Merge Step lands it. That way the Gate always judged the tree that lands. `createCommitOnBranch` can only append a commit, so it can't rebase, and ADR 0002 rules out `git push`. This is the one place the daemon rewrites a branch.
+Before merging, the Merge Step checks how far the PR is behind its base (`baseRef.compare(headRef).behindBy`, which works without branch protection). If it is behind and the base branch has no merge queue, Merge requests the `rebase` Effect instead of `merge`. The daemon runs GraphQL `updatePullRequestBranch` with `updateMethod: REBASE` and `expectedHeadOid`, and the resulting push ends the Run with end reason pushed. The next Run judges the rebased SHA, and its Merge Step lands it. That way the Gate always judged the tree that lands. `createCommitOnBranch` can only append a commit, so it can't rebase, and ADR 0002 rules out `git push`. This and the update after a retarget (ADR 0011) are the only places the daemon rewrites a branch.
 
 ## Considered options
 
