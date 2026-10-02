@@ -1,5 +1,7 @@
 # Fix commits land through the GitHub API, never `git push`
 
+Amended by ADR 0004: the daemon may also rebase a PR branch, through `updatePullRequestBranch`.
+
 The daemon commits a Fix Step's worktree changes with GraphQL `createCommitOnBranch`, authenticated with the user's `gh` token. It never runs `git push`. GitHub signs API commits, so they come out Verified (tested with a `gh` OAuth token) and pass "require signed commits" without the daemon touching the user's signing key. `expectedHeadOid` makes the write a compare-and-swap. A branch that moved while Fix ran fails with `STALE_DATA`, and nothing gets written. The mutation also returns the new SHA, which the daemon journals as its own push before any poll sees it.
 
 ## Considered options

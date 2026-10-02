@@ -17,11 +17,11 @@ The condition over Step outcomes that declares a PR shippable.
 _Avoid_: shippable check, done condition
 
 **Run**:
-One execution of a Pipeline against one head SHA of a Watched PR. Any push, including one made by a Fix Step, ends the Run and starts a new one.
+One execution of a Pipeline against one head SHA of a Watched PR. Any push, including a Fix commit or a rebase made by slopwatch, ends the Run and starts a new one.
 _Avoid_: execution, build, job
 
 **End reason**:
-Why a Run stopped: shippable, not shippable, fix pushed, superseded (by a push from outside the Run), or cancelled (by the developer).
+Why a Run stopped: merged, shippable (the Gate passed and the Pipeline has no Merge Step), not shippable, pushed (by one of the Run's own Steps, such as a Fix commit or a Merge rebase), superseded (by a push from outside the Run), closed (merged or closed on GitHub by someone else), or cancelled (by the developer).
 _Avoid_: status, result
 
 **Watched PR**:
@@ -47,7 +47,7 @@ One specific problem a Step reports about the PR, with a severity and optionally
 _Avoid_: issue, comment, violation
 
 **Effect**:
-A change on GitHub, such as a comment, a label or a merge, that a Step asks for and the daemon carries out only while the Step's Run is still current.
+A change on GitHub, such as a comment, a label, a rebase or a merge, that a Step asks for and the daemon carries out only while the Step's Run is still current.
 _Avoid_: action, side effect
 
 ### Attention
