@@ -54,7 +54,8 @@ impl World {
 
     /// The `poster` Plugin. Its Step asks for one Effect named by the Step
     /// id, then passes once it hears back. Step `late` asks for nothing
-    /// until it's cancelled, and asks for a comment then.
+    /// until it's cancelled, and asks for a comment then. Step `after`
+    /// passes first and asks for a comment after.
     fn write_poster(&self) {
         use std::os::unix::fs::PermissionsExt as _;
         let script = format!(
@@ -66,6 +67,9 @@ case "$SLOPWATCH_STEP" in
   unwatch) ask off '{{"kind":"label","name":"slopwatch","remove":true}}' ;;
   deploy) ask go '{{"kind":"deploy"}}' ;;
   rerun) ask again '{{"kind":"rerun","check":"test","job":7}}' ;;
+  after)
+    echo '{{"type":"outcome","verdict":"pass"}}'
+    ask after '{{"kind":"comment","body":"After the Outcome"}}' ;;
 esac
 while read line; do
   case "$line" in
@@ -368,6 +372,33 @@ fn an_effect_requested_after_the_run_ended_is_dropped_and_shows_in_its_events() 
             }
         );
         assert!(reason.contains("ended"), "{reason}");
+    });
+
+    assert!(world.github.comments(&repo(), 1).is_empty());
+}
+
+#[test]
+fn an_effect_requested_after_the_step_settled_is_dropped_while_the_run_goes_on() {
+    let world = World::new(&pipeline(&["after", "late"]));
+
+    world.life(async |daemon| {
+        until(daemon, "the drop to show", || {
+            world
+                .runs()
+                .first()
+                .is_some_and(|&run| !world.effects(run).is_empty())
+        })
+        .await;
+        let run = world.runs()[0];
+
+        assert_eq!(world.ended(run), None, "late keeps the Run going");
+        assert_eq!(world.settled(run, "after").unwrap().0, Verdict::Pass);
+        let effects = world.effects(run);
+        let [(step, _, EffectResult::Dropped { reason })] = &effects[..] else {
+            panic!("expected one dropped Effect, got {effects:?}");
+        };
+        assert_eq!(step, "after");
+        assert!(reason.contains("settled"), "{reason}");
     });
 
     assert!(world.github.comments(&repo(), 1).is_empty());

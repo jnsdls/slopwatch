@@ -65,17 +65,20 @@ struct Rerun {
 }
 
 impl Ci {
-    /// The request id for rerunning `check`. The same check always gets
-    /// the same id, so a respawned session asking again repeats nothing.
-    pub fn request_id(check: &str) -> String {
-        format!("rerun:{check}")
+    /// The request id for rerunning `check`'s job `job`. A respawned
+    /// session asking for the same job gets the same id, so the daemon
+    /// repeats nothing.
+    pub fn request_id(check: &str, job: u64) -> String {
+        format!("rerun:{job}:{check}")
     }
 
     /// Notes what became of a rerun this session asked for.
     pub fn effect_result(&mut self, id: &str, result: &EffectResult) {
-        let Some(rerun) = id
-            .strip_prefix("rerun:")
-            .and_then(|check| self.reruns.get_mut(check))
+        let Some(rerun) = self
+            .reruns
+            .iter_mut()
+            .find(|(check, rerun)| Self::request_id(check, rerun.job) == id)
+            .map(|(_, rerun)| rerun)
         else {
             return;
         };
@@ -225,7 +228,7 @@ pub fn run(input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
             Next::Rerun(reruns) => {
                 for (check, job) in reruns {
                     eprintln!("ci: `{check}` failed, rerunning it once");
-                    let id = Ci::request_id(&check);
+                    let id = Ci::request_id(&check, job);
                     send(
                         &mut output,
                         &FromStep::Effect {
@@ -356,7 +359,7 @@ mod tests {
             Next::Wait,
             "the rerun hasn't shown up yet"
         );
-        ci.effect_result(&Ci::request_id("test"), &EffectResult::Done);
+        ci.effect_result(&Ci::request_id("test", 7), &EffectResult::Done);
         assert_eq!(ci.judge(&failed), Next::Wait);
 
         let rerunning = checks(
@@ -415,7 +418,7 @@ mod tests {
         ci.judge(&failed);
 
         ci.effect_result(
-            &Ci::request_id("test"),
+            &Ci::request_id("test", 7),
             &EffectResult::Refused {
                 reason: "already rerun on this SHA".into(),
             },
@@ -478,7 +481,7 @@ mod tests {
             "failure",
             r#"{"name":"test","state":"failure","actions_job":7}"#,
         );
-        let refused = r#"{"type":"effect_result","id":"rerun:test","result":{"status":"failed","reason":"403"}}"#;
+        let refused = r#"{"type":"effect_result","id":"rerun:7:test","result":{"status":"failed","reason":"403"}}"#;
         let input = format!("{failed}\n{refused}\n");
         let mut output = Vec::new();
 
@@ -488,7 +491,7 @@ mod tests {
         assert_eq!(
             sent[0],
             FromStep::Effect {
-                id: "rerun:test".into(),
+                id: "rerun:7:test".into(),
                 effect: Effect::Rerun {
                     check: "test".into(),
                     job: 7,

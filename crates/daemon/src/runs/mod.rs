@@ -774,8 +774,8 @@ impl Engine {
             self.advance(&key)?;
         }
         if !self.reconciled {
-            self.reconciled = true;
             self.reconcile_effects()?;
+            self.reconciled = true;
         }
 
         let mut starts = Vec::new();
@@ -1420,17 +1420,7 @@ impl Engine {
                 }
             }
             Report::ProtocolError(message) if !reported => {
-                let reason = format!("error(protocol): {message}");
-                self.settle(
-                    &key,
-                    &step,
-                    Verdict::Error,
-                    Some(reason),
-                    Outputs::default(),
-                )?;
-                if let Some(running) = self.active[&key].running.get(&step) {
-                    running.handle.cancel();
-                }
+                self.protocol_error(&key, &step, &message)?;
             }
             Report::Tripped(tripped) if !reported => {
                 let reason = match tripped {
@@ -1480,6 +1470,17 @@ impl Engine {
             Report::Message(_) | Report::ProtocolError(_) | Report::Tripped(_) => return Ok(()),
         }
         self.advance(&key)
+    }
+
+    /// Settles a Step that broke the Step protocol as `error(protocol)` and
+    /// cancels its process.
+    fn protocol_error(&mut self, key: &PrKey, step: &str, message: &str) -> Result<(), StoreError> {
+        let reason = format!("error(protocol): {message}");
+        self.settle(key, step, Verdict::Error, Some(reason), Outputs::default())?;
+        if let Some(running) = self.active[key].running.get(step) {
+            running.handle.cancel();
+        }
+        Ok(())
     }
 
     /// Ends `run`. Its running Steps, and the ones a restart interrupted,

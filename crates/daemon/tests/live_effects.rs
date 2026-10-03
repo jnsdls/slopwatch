@@ -96,7 +96,9 @@ async fn a_failed_actions_job_reruns_by_its_check_run_id() {
 
     let failed = flaky(&api, &repo, pr).await;
     assert_eq!(failed.state, CheckState::Failure, "{failed:?}");
-    let job = failed.actions_job.expect("an Actions check run names its job");
+    let job = failed
+        .actions_job
+        .expect("an Actions check run names its job");
 
     api.rerun_job(&repo, job).await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(600);

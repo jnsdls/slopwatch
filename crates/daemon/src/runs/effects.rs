@@ -15,12 +15,11 @@
 //! On the first sync after a start, every intent still open is reconciled:
 //! a comment is looked up by the hidden marker it carries, and whatever
 //! isn't on GitHub yet is done again if its Run is still going, or dropped
-//! if not. Labels and reruns are simply redone.
+//! if not. Labels and reruns are redone.
 
 use std::sync::Arc;
 
-use slopwatch_core::Verdict;
-use slopwatch_protocol::step::{CheckState, Effect, EffectResult, Outputs, ToStep};
+use slopwatch_protocol::step::{CheckState, Effect, EffectResult, ToStep};
 use slopwatch_protocol::{RunEvent, RunId};
 
 use super::{Engine, Input, PrKey};
@@ -42,9 +41,9 @@ pub(super) struct Finished {
     result: EffectResult,
 }
 
-/// How an open intent gets carried out.
+/// Which call on GitHub an open intent gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Attempt {
+enum Call {
     /// Just recorded: nothing has reached GitHub yet.
     First,
     /// Left open by a crash. `current` says whether its Run is still going
@@ -91,14 +90,11 @@ impl Engine {
             .manifest(plugin)
             .is_some_and(|manifest| manifest.effects.contains(&effect.kind()));
         if !declared {
-            let reason = format!(
-                "error(protocol): requested a `{}` Effect its manifest doesn't declare",
+            let message = format!(
+                "requested a `{}` Effect its manifest doesn't declare",
                 effect.kind()
             );
-            self.settle(&key, step, Verdict::Error, Some(reason), Outputs::default())?;
-            if let Some(running) = self.active[&key].running.get(step) {
-                running.handle.cancel();
-            }
+            self.protocol_error(&key, step, &message)?;
             return self.advance(&key);
         }
 
@@ -130,7 +126,7 @@ impl Engine {
             );
         }
 
-        let id = self.store.insert_effect(&NewEffect {
+        let row = self.store.insert_effect(&NewEffect {
             run: run.id,
             step,
             request: &request,
@@ -139,19 +135,8 @@ impl Engine {
             head_sha: &run.head_sha,
             effect: &effect,
         })?;
-        let row = EffectRow {
-            id,
-            run: run.id,
-            step: step.to_owned(),
-            request: request.clone(),
-            repo: run.repo.clone(),
-            number: run.number,
-            head_sha: run.head_sha.clone(),
-            effect,
-            result: None,
-        };
         self.await_result(&key, step, request);
-        self.carry_out(row, Attempt::First);
+        self.carry_out(row, Call::First);
         Ok(())
     }
 
@@ -159,7 +144,7 @@ impl Engine {
     fn refusal(&self, key: &PrKey, effect: &Effect) -> Result<Option<String>, StoreError> {
         let run = &self.active[key];
         Ok(match effect {
-            Effect::Label { name, .. } if name == WATCH_LABEL => Some(format!(
+            Effect::Label { name, .. } if name.eq_ignore_ascii_case(WATCH_LABEL) => Some(format!(
                 "the `{WATCH_LABEL}` label is the developer's to change"
             )),
             Effect::Rerun { check, job } => {
@@ -255,29 +240,20 @@ impl Engine {
             let current = self
                 .run(row.run)
                 .is_some_and(|run| run.head_sha == row.head_sha);
-            self.carry_out(row, Attempt::Reconcile { current });
+            self.carry_out(row, Call::Reconcile { current });
         }
         Ok(())
     }
 
     /// Carries out an open intent on a task of its own, closes it with the
     /// result, and puts that in the Run's events.
-    fn carry_out(&self, row: EffectRow, attempt: Attempt) {
+    fn carry_out(&self, row: EffectRow, call: Call) {
         let github = Arc::clone(&self.github);
-        let store = self.store.clone();
         let journal = Arc::clone(&self.journal);
         let reports = self.reports.clone();
         tokio::spawn(async move {
-            let result = perform(github.as_ref(), &row, attempt).await;
-            let event = RunEvent::Effect {
-                step: row.step.clone(),
-                effect: row.effect.clone(),
-                result: result.clone(),
-            };
-            let recorded = store
-                .finish_effect(row.id, &result)
-                .and_then(|()| journal.append(row.run, event));
-            if let Err(error) = recorded {
+            let result = perform(github.as_ref(), &row, call).await;
+            if let Err(error) = journal.close_effect(&row, result.clone()) {
                 eprintln!("slopwatchd: can't record Effect {}: {error}", row.id);
             }
             let _ = reports.send(Input::Effect(Finished {
@@ -292,8 +268,8 @@ impl Engine {
 
 /// Calls GitHub for an open intent. A reconciled comment is looked up by
 /// its marker first, and one whose Run ended is dropped if it isn't there.
-async fn perform(github: &dyn GitHub, row: &EffectRow, attempt: Attempt) -> EffectResult {
-    if let Attempt::Reconcile { current } = attempt {
+async fn perform(github: &dyn GitHub, row: &EffectRow, call: Call) -> EffectResult {
+    if let Call::Reconcile { current } = call {
         if let Effect::Comment { .. } = row.effect {
             match github
                 .has_comment(&row.repo, row.number, &marker(row.id))
