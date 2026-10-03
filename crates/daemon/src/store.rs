@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, params};
 use slopwatch_core::{EndReason, GateState, ReuseKey, Verdict};
 use slopwatch_protocol::step::{Effect, EffectKind, EffectResult, Outputs};
-use slopwatch_protocol::{EntryId, InboxEntry, RepoName, RunId, RunSummary, Waiver};
+use slopwatch_protocol::{
+    EntryId, InboxEntry, Notification, NotificationId, RepoName, RunId, RunSummary, Waiver,
+};
 
 use crate::github::OpenPr;
 
@@ -152,6 +154,17 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (entry_id, run_id)
     );
     CREATE INDEX inbox_runs_by_run ON inbox_runs (run_id, entry_id);
+",
+    // Notifications (ADR 0013). `pending` holds what a client still has to
+    // do with one, and is NULL once acked. An acked Post about an Inbox
+    // entry stays, so the entry's closing can retract its banner.
+    "
+    CREATE TABLE notifications (
+        id TEXT PRIMARY KEY,
+        entry_id INTEGER,
+        pending TEXT
+    );
+    CREATE INDEX notifications_by_entry ON notifications (entry_id);
 ",
 ];
 
@@ -1120,6 +1133,85 @@ impl Store {
             .collect())
     }
 
+    /// Records a notification for clients to act on, unless one with its id
+    /// was recorded before. True if it's new.
+    pub fn insert_notification(
+        &self,
+        notification: &Notification,
+        entry: Option<EntryId>,
+    ) -> Result<bool, StoreError> {
+        let inserted = self.db().execute(
+            "INSERT OR IGNORE INTO notifications (id, entry_id, pending) VALUES (?1, ?2, ?3)",
+            params![
+                notification.id().to_string(),
+                entry.map(|entry| entry.0 as i64),
+                to_json(notification)
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    /// Every notification no client has acked, oldest first.
+    pub fn pending_notifications(&self) -> Result<Vec<Notification>, StoreError> {
+        let db = self.db();
+        let mut query = db.prepare(
+            "SELECT id, entry_id, pending FROM notifications
+             WHERE pending IS NOT NULL ORDER BY rowid",
+        )?;
+        let rows = query
+            .query_map([], notification_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().filter_map(|row| row.pending).collect())
+    }
+
+    /// The notification `id`, if the store holds it.
+    pub fn notification(&self, id: &NotificationId) -> Result<Option<NotificationRow>, StoreError> {
+        self.db()
+            .query_row(
+                "SELECT id, entry_id, pending FROM notifications WHERE id = ?1",
+                params![id.to_string()],
+                notification_row,
+            )
+            .optional()
+    }
+
+    /// The notification about Inbox entry `entry`, if one was recorded.
+    pub fn entry_notification(
+        &self,
+        entry: EntryId,
+    ) -> Result<Option<NotificationRow>, StoreError> {
+        self.db()
+            .query_row(
+                "SELECT id, entry_id, pending FROM notifications WHERE entry_id = ?1",
+                params![entry.0 as i64],
+                notification_row,
+            )
+            .optional()
+    }
+
+    /// Sets what a client still has to do with notification `id`, or
+    /// clears it with `None`.
+    pub fn set_pending_notification(
+        &self,
+        id: &NotificationId,
+        pending: Option<&Notification>,
+    ) -> Result<(), StoreError> {
+        self.db().execute(
+            "UPDATE notifications SET pending = ?2 WHERE id = ?1",
+            params![id.to_string(), pending.map(to_json)],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets notification `id` for good.
+    pub fn delete_notification(&self, id: &NotificationId) -> Result<(), StoreError> {
+        self.db().execute(
+            "DELETE FROM notifications WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Records a SHA slopwatch pushed.
     pub fn record_push(&self, repo: &RepoName, sha: &str) -> Result<(), StoreError> {
         self.db().execute(
@@ -1306,6 +1398,32 @@ fn effect_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EffectRow> {
         result: row
             .get::<_, Option<String>>(8)?
             .map(|text| json(8, text))
+            .transpose()?,
+    })
+}
+
+/// A notification as the store keeps it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationRow {
+    pub id: NotificationId,
+    /// The Inbox entry it's about, if it's about one.
+    pub entry: Option<EntryId>,
+    /// What a client still has to do with it. `None` once acked.
+    pub pending: Option<Notification>,
+}
+
+fn notification_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NotificationRow> {
+    let id: String = row.get(0)?;
+    let entry: Option<i64> = row.get(1)?;
+    let pending: Option<String> = row.get(2)?;
+    let bad = |what: String| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, what.into())
+    };
+    Ok(NotificationRow {
+        id: id.parse().map_err(bad)?,
+        entry: entry.map(|entry| EntryId(entry as u64)),
+        pending: pending
+            .map(|text| serde_json::from_str(&text).map_err(|error| bad(error.to_string())))
             .transpose()?,
     })
 }

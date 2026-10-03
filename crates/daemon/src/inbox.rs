@@ -16,6 +16,7 @@ use slopwatch_protocol::{
 };
 use tokio::sync::broadcast;
 
+use crate::notifications::Notifications;
 use crate::runs::journal::Journal;
 use crate::runs::{RunError, now};
 use crate::store::{Store, StoreError};
@@ -31,6 +32,8 @@ pub struct Inbox {
 struct State {
     store: Store,
     journal: Arc<Journal>,
+    /// Each entry that opens gets a banner, and each that closes loses it.
+    notifications: Arc<Notifications>,
     open: BTreeMap<EntryId, Open>,
     seq: u64,
     deltas: broadcast::Sender<(u64, InboxDelta)>,
@@ -52,7 +55,11 @@ pub struct InboxSubscription {
 
 impl Inbox {
     /// Loads the entries that were open when the daemon last stopped.
-    pub(crate) fn load(store: Store, journal: Arc<Journal>) -> Result<Self, StoreError> {
+    pub(crate) fn load(
+        store: Store,
+        journal: Arc<Journal>,
+        notifications: Arc<Notifications>,
+    ) -> Result<Self, StoreError> {
         let open = store
             .open_entries()?
             .into_iter()
@@ -62,6 +69,7 @@ impl Inbox {
             state: Mutex::new(State {
                 store,
                 journal,
+                notifications,
                 open,
                 seq: 0,
                 deltas: broadcast::channel(BACKLOG).0,
@@ -346,8 +354,15 @@ impl State {
         };
         let id = self.store.insert_entry(&entry, &runs)?;
         let entry = InboxEntry { id, ..entry };
-        self.open.insert(id, Open { entry, runs });
-        self.publish(id)
+        self.open.insert(
+            id,
+            Open {
+                entry: entry.clone(),
+                runs,
+            },
+        );
+        self.publish(id)?;
+        self.notifications.entry_opened(&entry)
     }
 
     /// Stores and announces what changed in an open entry, which now also
@@ -381,7 +396,7 @@ impl State {
         self.store.put_entry(&open.entry, None)?;
         self.publish(id)?;
         self.open.remove(&id);
-        Ok(())
+        self.notifications.entry_closed(id)
     }
 
     /// Sends the entry as it stands to subscribers and to the journal of

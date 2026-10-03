@@ -13,8 +13,8 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_core::WaiverCategory;
 use slopwatch_protocol::{
-    Command, InboxEntry, LogLevel, LogSource, PrStatus, PullRequest, Reply, RepoName, ResponseBody,
-    RunView, StepStatus, StepView, TopicUpdate,
+    Command, Flavor, InboxEntry, LogLevel, LogSource, PrRef, PrStatus, PullRequest, Reply,
+    RepoName, ResponseBody, RunView, StepStatus, StepView, TopicUpdate,
 };
 
 use crate::agent::Agent;
@@ -23,6 +23,9 @@ use crate::inbox::{InboxModel, actions, badge, held_line, history_line};
 use crate::library_view::LibraryView;
 use crate::link::{LinkEvent, LinkState};
 use crate::link_view::LinkView;
+use crate::notifications::{
+    NotificationCenter, Permission, Poster, SystemCenter, notice, settings_url,
+};
 use crate::prs::{Prs, Source, poll_line, status_line, storage_line};
 use crate::run_graph_view::{run_graph, tone_color};
 use crate::run_pane::{
@@ -45,6 +48,10 @@ pub struct MainView {
     pane: Pane,
     prs: Prs,
     inbox: InboxModel,
+    /// Posts the daemon's notifications.
+    poster: Poster,
+    /// A PR a clicked banner asked for before the PR list had it.
+    pending_reveal: Option<PrRef>,
     library: Entity<LibraryView>,
     run_pane: RunPane,
     /// Repos the developer can add, while the picker is open.
@@ -93,7 +100,14 @@ impl MainView {
                     }
                 },
             ),
+            // The developer may have changed it in System Settings.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.refresh_permission(cx);
+                }
+            }),
         ];
+        SystemCenter::new(cx).refresh();
         Self {
             log_search,
             waiver_reason,
@@ -103,6 +117,8 @@ impl MainView {
             pane: Pane::Prs,
             prs: Prs::default(),
             inbox: InboxModel::default(),
+            poster: Poster::default(),
+            pending_reveal: None,
             library: cx.new(|cx| LibraryView::new(commands.clone(), window, cx)),
             run_pane: RunPane::default(),
             picker: None,
@@ -121,7 +137,7 @@ impl MainView {
                     self.library.read(cx).refresh();
                 }
                 if connected && !matches!(self.link, LinkState::Connected { .. }) {
-                    // The new connection subscribes to `watched_prs` and `inbox` itself.
+                    // The new connection subscribes to its topics itself.
                     for command in self.run_pane.reconnected() {
                         self.send(command);
                     }
@@ -134,6 +150,14 @@ impl MainView {
                 self.inbox.apply(update);
                 dock::set_badge(badge(self.inbox.count()).as_deref());
             }
+            LinkEvent::Topic(update @ TopicUpdate::Notifications { .. }) => {
+                let center = SystemCenter::new(cx);
+                if let Some(ack) = self.poster.apply(update, &center) {
+                    self.send(ack);
+                    // Posting may have asked for permission.
+                    center.refresh();
+                }
+            }
             LinkEvent::Topic(update @ (TopicUpdate::Run { .. } | TopicUpdate::StepLog { .. })) => {
                 for command in self.run_pane.apply(update) {
                     self.send(command);
@@ -141,6 +165,9 @@ impl MainView {
             }
             LinkEvent::Topic(update) => {
                 self.prs.apply(update);
+                if let Some(pr) = self.pending_reveal.take() {
+                    self.reveal(pr);
+                }
                 if let Some((repo, number)) = self.run_pane.selected().cloned() {
                     let commands = self.run_pane.pr_changed(self.prs.pr(&repo, number));
                     for command in commands {
@@ -172,6 +199,45 @@ impl MainView {
             },
         }
         cx.notify();
+    }
+
+    /// Shows `pr` in the PR pane, with its open Inbox entries above its
+    /// latest Run, as a clicked banner asks. A PR the list doesn't have yet
+    /// is shown once it arrives.
+    pub fn reveal(&mut self, pr: PrRef) {
+        match self.prs.pr(&pr.repo, pr.number).cloned() {
+            Some(row) => {
+                self.pane = Pane::Prs;
+                self.prs.source = Source::All;
+                for command in self.run_pane.select_pr(&row) {
+                    self.send(command);
+                }
+            }
+            None if !self.prs.loaded() => self.pending_reveal = Some(pr),
+            // Gone since the banner posted, such as merged.
+            None => {}
+        }
+    }
+
+    /// Asks for notification permission when the developer adds a repo,
+    /// if they haven't been asked, until onboarding asks instead.
+    fn ask_permission(&self, cx: &App) {
+        let center = SystemCenter::new(cx);
+        if center.permission() == Permission::NotAsked {
+            center.ask();
+        }
+    }
+
+    /// Reads the permission again, and redraws once macOS has answered.
+    fn refresh_permission(&self, cx: &mut Context<Self>) {
+        SystemCenter::new(cx).refresh();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
     }
 
     /// Sends the Waiver form with the reason typed in, if it has one.
@@ -358,6 +424,7 @@ impl MainView {
                                 this.send(Command::AddRepo {
                                     repo: chosen.clone(),
                                 });
+                                this.ask_permission(cx);
                                 this.show_prs(Source::Repo(chosen.clone()));
                                 this.picker = None;
                                 cx.notify();
@@ -504,6 +571,32 @@ impl MainView {
             .gap_2()
             .p_4()
             .overflow_y_scroll();
+        if let Some(text) = notice(SystemCenter::new(cx).permission()) {
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(text)
+                    .child(
+                        div().child(
+                            Button::new("notification-settings")
+                                .label("Open System Settings")
+                                .small()
+                                .ghost()
+                                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                    cx.open_url(&settings_url(Flavor::CURRENT.bundle_id()));
+                                })),
+                        ),
+                    ),
+            );
+        }
         if self.inbox.entries().is_empty() {
             list = list.child(
                 div()

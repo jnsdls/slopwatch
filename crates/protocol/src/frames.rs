@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use slopwatch_core::WaiverCategory;
 
 use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
-use crate::{EntryId, RepoName, RunId, Topic, TopicUpdate};
+use crate::{EntryId, Notification, RepoName, RunId, Topic, TopicUpdate};
 
 /// A frame a client sends to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +224,15 @@ pub enum Command {
     /// dismissed.
     DismissEntry {
         entry: EntryId,
+    },
+    /// The client acted on these notifications, or decided not to, such as
+    /// posting with notifications turned off. The daemon won't send them
+    /// again. Each names the whole notification, not only its id, because
+    /// a Post and the Retract that replaces it share an id: an ack for a
+    /// Post that a Retract already replaced is ignored, as is one for a
+    /// notification the daemon no longer holds, so an ack is safe to repeat.
+    AckNotifications {
+        done: Vec<Notification>,
     },
 }
 

@@ -12,8 +12,8 @@ use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::unix::Listener;
 use slopwatch_daemon::{Daemon, DataDir, Library, Watching};
 use slopwatch_protocol::{
-    BUILD_ID, ClientHello, Command, DIALECT, PrStatus, RefusalReason, Reply, RepoName,
-    ResponseBody, TopicUpdate, WatchedPrsUpdate, socket_path,
+    BUILD_ID, ClientHello, Command, DIALECT, NotificationsUpdate, PrStatus, RefusalReason, Reply,
+    RepoName, ResponseBody, TopicUpdate, WatchedPrsUpdate, socket_path,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -264,6 +264,23 @@ fn the_link_follows_the_daemon_going_away_and_coming_back() {
             daemon_build_id: BUILD_ID.into()
         }
     );
+}
+
+#[test]
+fn the_link_follows_the_notifications_so_the_daemon_knows_a_gui_listens() {
+    let dir = tempfile::tempdir().unwrap();
+    let _daemon = RunningDaemon::start(dir.path(), BUILD_ID);
+    let (_commands, events) = run_link(dir.path());
+
+    let update = loop {
+        if let LinkEvent::Topic(TopicUpdate::Notifications { update, .. }) =
+            events.recv_timeout(WAIT).unwrap()
+        {
+            break update;
+        }
+    };
+
+    assert_eq!(update, NotificationsUpdate::Snapshot(Vec::new()));
 }
 
 #[test]

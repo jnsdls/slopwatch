@@ -10,6 +10,7 @@ mod flavor;
 mod frames;
 mod inbox;
 pub mod logs;
+mod notifications;
 pub mod runs;
 pub mod step;
 mod topics;
@@ -25,6 +26,9 @@ pub use inbox::{
 pub use logs::{
     LogFilter, LogKey, LogLevel, LogPage, LogRecord, LogSource, MAX_PAGE, StepLogPage,
     StorageWarning, Truncation,
+};
+pub use notifications::{
+    About, Notification, NotificationId, NotificationsDelta, NotificationsUpdate,
 };
 pub use runs::{
     EffectView, GateTerm, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView,
@@ -65,6 +69,9 @@ pub const DIALECT: u32 = 1;
 ///
 /// `inbox`: the `inbox` topic, the `dismiss_entry` command, and the
 /// `inbox` Run event.
+///
+/// `notifications`: the `notifications` topic and the
+/// `ack_notifications` command (ADR 0013).
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -74,6 +81,7 @@ pub const FEATURES: &[&str] = &[
     "step_logs",
     "waivers",
     "inbox",
+    "notifications",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

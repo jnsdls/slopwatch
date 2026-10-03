@@ -248,6 +248,14 @@ impl Watching {
             .collect()
     }
 
+    /// The title of `repo#number`, if the daemon knows the PR.
+    pub fn title(&self, repo: &RepoName, number: u64) -> Option<String> {
+        self.state()
+            .prs
+            .get(&(repo.clone(), number))
+            .map(|pr| pr.title.clone())
+    }
+
     /// Shows or clears the storage warning.
     pub fn set_storage_warning(&self, warning: Option<StorageWarning>) {
         let mut state = self.state();
