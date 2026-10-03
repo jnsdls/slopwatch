@@ -3,7 +3,7 @@
 //! watched, so watching from the app and labelling on github.com are the
 //! same change, and the next poll picks up either.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -37,6 +37,10 @@ struct State {
     store: Store,
     repos: Vec<RepoName>,
     prs: BTreeMap<(RepoName, u64), OpenPr>,
+    /// Repos a poll has covered since the daemon started. Until then a
+    /// repo's PRs are what the store kept, without their detail. A repo
+    /// that vanished counts once a poll found it gone.
+    polled: HashSet<RepoName>,
     /// What Runs report for each PR, shown on its row.
     runs: BTreeMap<(RepoName, u64), RunInfo>,
     poll: PollState,
@@ -98,6 +102,7 @@ impl Watching {
                 store,
                 repos,
                 prs,
+                polled: HashSet::new(),
                 runs: BTreeMap::new(),
                 poll: PollState::Pending,
                 seq: 0,
@@ -144,7 +149,15 @@ impl Watching {
             state.publish(WatchedPrsDelta::RepoAdded { repo: repo.clone() });
         }
         state.reconcile(&repo, prs)?;
+        state.polled.insert(repo);
         Ok(())
+    }
+
+    /// Whether GitHub has answered for every added repo since the daemon
+    /// started, so the PRs are current rather than what the store kept.
+    pub fn fresh(&self) -> bool {
+        let state = self.state();
+        state.repos.iter().all(|repo| state.polled.contains(repo))
     }
 
     /// Adds or removes the `slopwatch` label on a PR, creating the label
@@ -206,6 +219,7 @@ impl Watching {
                 }
             }
         }
+        state.polled.extend(repos);
         state.set_poll(PollState::Online);
         Ok(())
     }

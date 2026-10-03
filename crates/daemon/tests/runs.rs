@@ -2,12 +2,13 @@
 //! transport, and real Step processes from the `slopwatchd` binary.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use slopwatch_core::{EndReason, GateState, Verdict};
-use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::fake::FakeGitHub;
+use slopwatch_daemon::github::{GitHub, GitHubError};
 use slopwatch_daemon::plugins::Plugins;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::in_process::InProcessClient;
@@ -51,6 +52,21 @@ fn harness() -> Harness {
 }
 
 fn daemon(github: &Arc<FakeGitHub>, store: &Store, data: &tempfile::TempDir) -> Arc<Daemon> {
+    daemon_running(
+        github,
+        store,
+        data,
+        Path::new(env!("CARGO_BIN_EXE_slopwatchd")),
+    )
+}
+
+/// A daemon whose built-in Plugins run from `plugin_exe`.
+fn daemon_running(
+    github: &Arc<FakeGitHub>,
+    store: &Store,
+    data: &tempfile::TempDir,
+    plugin_exe: &Path,
+) -> Arc<Daemon> {
     let dyn_github: Arc<dyn GitHub> = Arc::clone(github) as Arc<dyn GitHub>;
     let watching = Arc::new(Watching::new(store.clone(), Arc::clone(&dyn_github)).unwrap());
     let library = Arc::new(Library::open(data.path().join("steps")).unwrap());
@@ -60,7 +76,7 @@ fn daemon(github: &Arc<FakeGitHub>, store: &Store, data: &tempfile::TempDir) -> 
         Arc::clone(&watching),
         RunsConfig {
             data_dir: data.path().to_owned(),
-            plugins: Plugins::new(env!("CARGO_BIN_EXE_slopwatchd"), Arc::clone(&library)),
+            plugins: Plugins::new(plugin_exe, Arc::clone(&library)),
         },
     )
     .unwrap();
@@ -535,4 +551,313 @@ async fn a_run_resolves_library_steps_from_the_library() {
 
     assert_eq!(client.run(run).steps[0].info.plugin, "ci");
     assert_eq!(*client.ci(run), StepStatus::Running);
+}
+
+// Crash-only restart (ADR 0009). Each life of the daemon gets a runtime of
+// its own, and dropping that runtime drops every task at once, the way a
+// SIGKILL would. The Step processes stay behind, as they would.
+
+/// A Pipeline with `ci` and a `slow` Step, both in the Gate.
+const SLOW_PIPELINE: &str =
+    "version: 1\nsteps:\n  ci: { uses: ci }\n  slow: { uses: ci }\ngate: [ci, slow]\n";
+
+/// A PR whose base has [`SLOW_PIPELINE`], with passing checks, and a data
+/// dir that outlives each daemon.
+struct Restarts {
+    github: Arc<FakeGitHub>,
+    data: tempfile::TempDir,
+    bin: tempfile::TempDir,
+}
+
+impl Restarts {
+    fn new() -> Self {
+        let github = Arc::new(FakeGitHub::new("me"));
+        github.add_repo(&repo());
+        github.open_pr(&repo(), 1, "me", "Add the thing");
+        github.label_on_github(&repo(), 1, true);
+        github.set_pipeline(&repo(), "main", SLOW_PIPELINE);
+        github.set_checks(
+            &repo(),
+            1,
+            checks(ChecksState::Success, CheckState::Success),
+        );
+        let restarts = Self {
+            github,
+            data: tempfile::tempdir().unwrap(),
+            bin: tempfile::tempdir().unwrap(),
+        };
+        restarts.write_plugins();
+        restarts
+    }
+
+    /// Stands in for the built-in Plugins. Step `slow` starts a child in
+    /// its group, notes both pids, and waits until the daemon goes away and
+    /// its stdin closes. Its leader then exits and leaves the child behind.
+    /// Once `release` exists, `slow` runs as `ci`.
+    fn write_plugins(&self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin = self.bin.path().display();
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$SLOPWATCH_STEP\" = slow ] && [ ! -e '{bin}/release' ]; then\n\
+             \x20 sleep 600 &\n\
+             \x20 echo $$ $! >> '{bin}/slow.pids'\n\
+             \x20 while read line; do :; done\n\
+             \x20 exit 0\n\
+             fi\n\
+             exec '{exe}' \"$@\"\n",
+            exe = env!("CARGO_BIN_EXE_slopwatchd"),
+        );
+        let path = self.plugins();
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn plugins(&self) -> PathBuf {
+        self.bin.path().join("plugins.sh")
+    }
+
+    /// Lets later `slow` Steps pass.
+    fn release_slow(&self) {
+        std::fs::write(self.bin.path().join("release"), "").unwrap();
+    }
+
+    /// The leader and child pid of each `slow` process so far.
+    fn slow_pids(&self) -> Vec<(i32, i32)> {
+        std::fs::read_to_string(self.bin.path().join("slow.pids"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let (leader, child) = line.split_once(' ').unwrap();
+                (leader.parse().unwrap(), child.parse().unwrap())
+            })
+            .collect()
+    }
+
+    /// Runs one life of the daemon: `life` drives it, and then the daemon
+    /// dies with no warning.
+    fn life<T>(&self, life: impl AsyncFnOnce(&Arc<Daemon>, &mut Client) -> T) -> T {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let store = Store::open(&self.data.path().join("state.db")).unwrap();
+            let daemon = daemon_running(&self.github, &store, &self.data, &self.plugins());
+            let mut client = Client::connect(&daemon).await;
+            life(&daemon, &mut client).await
+        });
+        drop(runtime);
+        result
+    }
+
+    fn events(&self, run: RunId) -> Vec<RunEvent> {
+        let store = Store::open(&self.data.path().join("state.db")).unwrap();
+        store
+            .events_after(run, 0)
+            .unwrap()
+            .into_iter()
+            .map(|(_, text)| serde_json::from_str(&text).unwrap())
+            .collect()
+    }
+
+    /// How many times the Run started `step`.
+    fn starts(&self, run: RunId, step: &str) -> usize {
+        self.events(run)
+            .iter()
+            .filter(|event| matches!(event, RunEvent::StepStarted { step: s } if s == step))
+            .count()
+    }
+}
+
+/// The first life: the Run starts, `ci` passes, and `slow` is running when
+/// the daemon dies.
+async fn crash_mid_run(restarts: &Restarts, client: &mut Client) -> RunId {
+    client.ok(Command::AddRepo { repo: repo() }).await;
+    let run = client.history()[0];
+    client.subscribe(run, None).await;
+    client
+        .until("ci to pass", |c| {
+            matches!(
+                c.ci(run),
+                StepStatus::Settled {
+                    verdict: Verdict::Pass,
+                    ..
+                }
+            )
+        })
+        .await;
+    until(|| restarts.slow_pids().len() == 1).await;
+    run
+}
+
+async fn until(done: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: kill with signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn slow_status(client: &Client, run: RunId) -> StepStatus {
+    client.run(run).step("slow").unwrap().status.clone()
+}
+
+#[test]
+fn a_restart_resumes_the_run_with_its_settled_outcomes_and_kills_what_was_left() {
+    let restarts = Restarts::new();
+    let run = restarts.life(async |_, client| crash_mid_run(&restarts, client).await);
+    let (_, child) = restarts.slow_pids()[0];
+    assert!(alive(child), "a crash leaves the Step's child running");
+    restarts.release_slow();
+
+    restarts.life(async |_, client| {
+        until(|| !alive(child)).await;
+        let run_dir = restarts.data.path().join("worktrees").join(run.to_string());
+        assert!(!run_dir.join("slow").exists(), "its directory went too");
+
+        client.subscribe(run, None).await;
+        client.refresh().await;
+        client.until("the Run to end", |c| ended(c, run)).await;
+
+        assert_eq!(client.history(), [run], "the same Run, no cancelled one");
+        assert_eq!(client.run(run).end, Some(EndReason::Shippable));
+        assert!(matches!(
+            slow_status(client, run),
+            StepStatus::Settled {
+                verdict: Verdict::Pass,
+                ..
+            }
+        ));
+    });
+
+    assert_eq!(restarts.starts(run, "ci"), 1, "ci's Outcome was kept");
+    assert_eq!(restarts.starts(run, "slow"), 2, "slow started again");
+}
+
+#[test]
+fn nothing_resumes_until_a_poll_has_answered() {
+    let restarts = Restarts::new();
+    let run = restarts.life(async |_, client| crash_mid_run(&restarts, client).await);
+    restarts.release_slow();
+    restarts
+        .github
+        .fail_polls(Some(GitHubError::Other("offline".into())));
+
+    restarts.life(async |daemon, client| {
+        client.subscribe(run, None).await;
+        let _ = daemon.poll().await;
+        client
+            .ok(Command::Watch {
+                repo: repo(),
+                number: 1,
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(restarts.starts(run, "slow"), 1, "slow waits for a poll");
+
+        restarts.github.fail_polls(None);
+        client.refresh().await;
+        client.until("the Run to end", |c| ended(c, run)).await;
+        assert_eq!(client.run(run).end, Some(EndReason::Shippable));
+    });
+}
+
+#[test]
+fn a_push_while_the_daemon_was_down_ends_the_run_and_starts_another() {
+    let restarts = Restarts::new();
+    let first = restarts.life(async |_, client| crash_mid_run(&restarts, client).await);
+    let pushed = restarts.github.push(&repo(), 1);
+    restarts.release_slow();
+
+    restarts.life(async |_, client| {
+        client.subscribe(first, None).await;
+        client.refresh().await;
+        client
+            .until("the first Run to end", |c| ended(c, first))
+            .await;
+
+        assert_eq!(client.run(first).end, Some(EndReason::Superseded));
+        assert!(matches!(
+            slow_status(client, first),
+            StepStatus::Settled {
+                verdict: Verdict::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(client.history().len(), 2);
+        assert_eq!(client.pr().runs[0].head_sha, pushed);
+    });
+
+    assert_eq!(restarts.starts(first, "slow"), 1, "slow didn't start again");
+}
+
+#[test]
+fn a_step_interrupted_by_two_restarts_in_a_row_ends_in_error() {
+    let restarts = Restarts::new();
+    let run = restarts.life(async |_, client| crash_mid_run(&restarts, client).await);
+    // The second restart is the `restart` command an update sends.
+    restarts.life(async |daemon, client| {
+        client.refresh().await;
+        until(|| restarts.slow_pids().len() == 2).await;
+        daemon.kill_steps().await;
+    });
+
+    restarts.life(async |_, client| {
+        let (_, child) = restarts.slow_pids()[1];
+        until(|| !alive(child)).await;
+        client.subscribe(run, None).await;
+        client.refresh().await;
+        client.until("the Run to end", |c| ended(c, run)).await;
+
+        let StepStatus::Settled {
+            verdict, reason, ..
+        } = slow_status(client, run)
+        else {
+            panic!("slow settled");
+        };
+        assert_eq!(verdict, Verdict::Error);
+        let reason = reason.unwrap_or_default();
+        assert!(reason.starts_with("error(daemon_restart)"), "{reason}");
+        assert_eq!(client.run(run).end, Some(EndReason::NotShippable));
+    });
+
+    assert_eq!(restarts.slow_pids().len(), 2, "no third start");
+}
+
+#[test]
+fn a_run_whose_pipeline_stopped_loading_ends_not_shippable_and_its_steps_die() {
+    let restarts = Restarts::new();
+    let steps = restarts.data.path().join("steps");
+    std::fs::create_dir_all(&steps).unwrap();
+    std::fs::write(steps.join("slow.yml"), "uses: ci\n").unwrap();
+    restarts.github.set_pipeline(
+        &repo(),
+        "main",
+        "version: 1\nsteps:\n  ci: { uses: ci }\n  slow: { uses: lib/slow }\ngate: [ci, slow]\n",
+    );
+    let run = restarts.life(async |_, client| crash_mid_run(&restarts, client).await);
+    let (_, child) = restarts.slow_pids()[0];
+    std::fs::remove_file(steps.join("slow.yml")).unwrap();
+
+    restarts.life(async |_, client| {
+        until(|| !alive(child)).await;
+        client.subscribe(run, None).await;
+
+        assert_eq!(client.run(run).end, Some(EndReason::NotShippable));
+        let StepStatus::Settled {
+            verdict, reason, ..
+        } = slow_status(client, run)
+        else {
+            panic!("slow settled");
+        };
+        assert_eq!(verdict, Verdict::Error);
+        let reason = reason.unwrap_or_default();
+        assert!(reason.contains("no longer loads"), "{reason}");
+    });
 }

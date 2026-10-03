@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use crate::clones::{Clones, PipelineAt};
 use crate::github::{GitHub, OpenPr};
 use crate::plugins::Plugins;
-use crate::store::{NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
+use crate::store::{ActiveRun, NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
 use crate::watching::{RunInfo, Watching};
 
 use journal::Journal;
@@ -118,10 +118,15 @@ impl Runs {
         Ok(runs)
     }
 
-    /// Brings Runs in line with the PRs as the last poll saw them.
+    /// Brings Runs in line with the PRs as the last poll saw them. Until
+    /// GitHub has answered for every repo since the daemon started, the
+    /// PRs are only what the store kept, so nothing moves (ADR 0009).
     pub async fn sync(&self) {
         let starts = {
             let mut engine = self.engine.lock().await;
+            if !engine.watching.fresh() {
+                return;
+            }
             let prs = engine.watching.prs();
             engine.sync(prs)
         };
@@ -229,7 +234,16 @@ struct Active {
     outcomes: HashMap<String, Outcome>,
     attempts: HashMap<String, u32>,
     running: HashMap<String, Running>,
+    /// Steps a restart killed before they reported, with how many restarts
+    /// in a row did. Each starts again or settles once the first poll has
+    /// run (ADR 0009).
+    interrupted: BTreeMap<String, u32>,
 }
+
+/// How many restarts in a row may interrupt a Step before it ends
+/// `error(daemon_restart)` instead of starting again, so a Step that
+/// crashes the daemon can't loop it (ADR 0009).
+const RESTARTS_BEFORE_ERROR: u32 = 2;
 
 struct Running {
     attempt: u32,
@@ -246,26 +260,36 @@ struct StepReport {
 }
 
 impl Engine {
-    /// Picks up the Runs that hadn't ended when the daemon last stopped. A
-    /// Step that was running starts again from scratch, which isn't a
-    /// retry: it never reported.
+    /// Picks up the Runs that hadn't ended when the daemon last stopped,
+    /// keeping their settled Outcomes. A Step that was running is
+    /// interrupted: its leftover process group is killed and its directory
+    /// deleted, and after the first poll it starts again from scratch,
+    /// which isn't a retry because it never reported.
     fn load(&mut self) -> Result<(), StoreError> {
-        for stored in self.store.active_runs()? {
+        for mut stored in self.store.active_runs()? {
+            for row in &mut stored.steps {
+                if let StepRowState::Running {
+                    pgid,
+                    started_us,
+                    sid,
+                } = row.state
+                {
+                    process::kill_leftover(&process::Leftover {
+                        pgid,
+                        started_us,
+                        sid,
+                    });
+                    let _ = std::fs::remove_dir_all(step_dir(&self.data_dir, stored.id, &row.step));
+                    let restarts = self.store.interrupt_step(stored.id, &row.step)?;
+                    row.state = StepRowState::Interrupted { restarts };
+                }
+            }
             let pipeline = match load(&stored.pipeline, &self.plugins) {
                 Ok(pipeline) => pipeline,
                 Err(errors) => {
-                    eprintln!(
-                        "slopwatchd: Run {} no longer loads its Pipeline ({}), ending it",
-                        stored.id,
-                        join(&errors)
-                    );
-                    self.journal.append(
-                        stored.id,
-                        RunEvent::Ended {
-                            reason: EndReason::Cancelled,
-                        },
-                    )?;
-                    self.store.end_run(stored.id, EndReason::Cancelled, now())?;
+                    let reason = format!("the Pipeline no longer loads: {}", join(&errors));
+                    eprintln!("slopwatchd: Run {}: {reason}, ending it", stored.id);
+                    self.end_unloadable(&stored, &reason)?;
                     continue;
                 }
             };
@@ -281,6 +305,7 @@ impl Engine {
                 outcomes: HashMap::new(),
                 attempts: HashMap::new(),
                 running: HashMap::new(),
+                interrupted: BTreeMap::new(),
             };
             for row in stored.steps {
                 active.attempts.insert(row.step.clone(), row.attempt);
@@ -296,19 +321,10 @@ impl Engine {
                             .outcomes
                             .insert(row.step, Outcome { verdict, outputs });
                     }
-                    StepRowState::Running { pgid, started_us } => {
-                        process::kill_leftover(pgid, started_us);
-                        let _ =
-                            std::fs::remove_dir_all(step_dir(&self.data_dir, active.id, &row.step));
-                        self.store.put_step(
-                            active.id,
-                            &StepRow {
-                                state: StepRowState::Pending,
-                                ..row
-                            },
-                        )?;
+                    StepRowState::Interrupted { restarts } => {
+                        active.interrupted.insert(row.step, restarts);
                     }
-                    StepRowState::Pending => {}
+                    StepRowState::Running { .. } | StepRowState::Pending => {}
                 }
             }
             let key = (stored.repo, stored.number);
@@ -319,6 +335,46 @@ impl Engine {
         for (repo, number) in self.store.prs_with_runs()? {
             self.publish(&repo, number)?;
         }
+        Ok(())
+    }
+
+    /// Ends a Run whose Pipeline stopped loading while the daemon was
+    /// down, as after an update dropped a Plugin it uses. Its unsettled
+    /// Steps get `error` with the reason, so the Run ends not shippable
+    /// rather than cancelled, which only the developer does.
+    fn end_unloadable(&mut self, run: &ActiveRun, reason: &str) -> Result<(), StoreError> {
+        for row in &run.steps {
+            if matches!(row.state, StepRowState::Settled { .. }) {
+                continue;
+            }
+            let state = StepRowState::Settled {
+                verdict: Verdict::Error,
+                reason: Some(reason.to_owned()),
+                outputs: Outputs::default(),
+            };
+            self.store.put_step(
+                run.id,
+                &StepRow {
+                    step: row.step.clone(),
+                    state,
+                    attempt: row.attempt,
+                },
+            )?;
+            self.journal.append(
+                run.id,
+                RunEvent::StepSettled {
+                    step: row.step.clone(),
+                    verdict: Verdict::Error,
+                    reason: Some(reason.to_owned()),
+                    outputs: Outputs::default(),
+                },
+            )?;
+        }
+        let ended = EndReason::NotShippable;
+        self.store.end_run(run.id, ended, now())?;
+        self.journal
+            .append(run.id, RunEvent::Ended { reason: ended })?;
+        let _ = std::fs::remove_dir_all(run_dir(&self.data_dir, run.id));
         Ok(())
     }
 
@@ -372,6 +428,7 @@ impl Engine {
             run.state.pr = facts(&snapshot);
             run.snapshot = Some(snapshot.clone());
             if first {
+                self.resume(&key)?;
                 self.advance(&key)?;
             } else {
                 for running in run.running.values() {
@@ -516,10 +573,32 @@ impl Engine {
                 outcomes: HashMap::new(),
                 attempts: HashMap::new(),
                 running: HashMap::new(),
+                interrupted: BTreeMap::new(),
             },
         );
         self.publish(repo, pr.number)?;
         self.advance(&key)
+    }
+
+    /// Settles the Steps that too many restarts in a row interrupted, once
+    /// the first poll has shown the Run goes on. The rest start again as
+    /// the plan allows.
+    fn resume(&mut self, key: &PrKey) -> Result<(), StoreError> {
+        let run = &self.active[key];
+        let looping: Vec<String> = run
+            .interrupted
+            .iter()
+            .filter(|&(_, &restarts)| restarts >= RESTARTS_BEFORE_ERROR)
+            .map(|(step, _)| step.clone())
+            .collect();
+        for step in looping {
+            let reason = format!(
+                "error(daemon_restart): {RESTARTS_BEFORE_ERROR} daemon restarts in a row \
+                 interrupted it"
+            );
+            self.settle(key, &step, Verdict::Error, Some(reason), Outputs::default())?;
+        }
+        Ok(())
     }
 
     fn block(
@@ -675,10 +754,12 @@ impl Engine {
                 state: StepRowState::Running {
                     pgid: handle.pgid,
                     started_us: handle.started_us,
+                    sid: handle.sid,
                 },
                 attempt,
             },
         )?;
+        run.interrupted.remove(step_id);
         run.state
             .steps
             .insert(step_id.to_owned(), StepState::Running);
@@ -727,6 +808,7 @@ impl Engine {
         if let Some(running) = run.running.get_mut(step) {
             running.reported = true;
         }
+        run.interrupted.remove(step);
         self.store.put_step(
             run.id,
             &StepRow {
@@ -840,14 +922,16 @@ impl Engine {
         self.advance(&key)
     }
 
-    /// Ends `run`. Its running Steps are cancelled: their Verdict is
-    /// cancelled whatever they report afterwards.
+    /// Ends `run`. Its running Steps, and the ones a restart interrupted,
+    /// are cancelled: their Verdict is cancelled whatever they report
+    /// afterwards.
     fn end_run(&mut self, mut run: Active, reason: EndReason) -> Result<(), StoreError> {
         let still_running: Vec<String> = run
             .running
             .iter()
             .filter(|(_, running)| !running.reported)
             .map(|(step, _)| step.clone())
+            .chain(run.interrupted.keys().cloned())
             .collect();
         for running in run.running.values() {
             running.handle.cancel();

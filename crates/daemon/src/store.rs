@@ -78,6 +78,12 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (repo, sha)
     );
 ",
+    // Crash-only restart (ADR 0009): the session a Step's process ran in,
+    // and how many restarts in a row have interrupted the Step.
+    "
+    ALTER TABLE run_steps ADD COLUMN process_sid INTEGER;
+    ALTER TABLE run_steps ADD COLUMN restarts INTEGER NOT NULL DEFAULT 0;
+",
 ];
 
 #[derive(Clone)]
@@ -132,11 +138,19 @@ pub struct StepRow {
 pub enum StepRowState {
     Pending,
     /// The process runs in its own group, so `pgid` is also its pid.
-    /// `started_us` is when the kernel says it started, which tells a
-    /// leftover process from a later one that reused the pid.
+    /// `started_us` is when the kernel says it started and `sid` the
+    /// session it runs in, which tell a leftover process from a later one
+    /// that reused the pid.
     Running {
         pgid: i32,
         started_us: i64,
+        sid: i32,
+    },
+    /// A daemon restart killed the Step's process before it reported. It
+    /// starts again from scratch once the first poll has run, unless too
+    /// many restarts in a row interrupted it. `restarts` counts them.
+    Interrupted {
+        restarts: u32,
     },
     Settled {
         verdict: Verdict,
@@ -306,42 +320,77 @@ impl Store {
     }
 
     pub fn put_step(&self, run: RunId, row: &StepRow) -> Result<(), StoreError> {
-        let (state, verdict, reason, outputs, pgid, started) = match &row.state {
-            StepRowState::Pending => ("pending", None, None, None, None, None),
-            StepRowState::Running { pgid, started_us } => {
-                ("running", None, None, None, Some(*pgid), Some(*started_us))
-            }
+        let columns = match &row.state {
+            StepRowState::Pending => StepColumns::state("pending"),
+            StepRowState::Running {
+                pgid,
+                started_us,
+                sid,
+            } => StepColumns {
+                pgid: Some(*pgid),
+                started_us: Some(*started_us),
+                sid: Some(*sid),
+                // A respawn keeps counting the restarts before it.
+                restarts: None,
+                ..StepColumns::state("running")
+            },
+            StepRowState::Interrupted { restarts } => StepColumns {
+                restarts: Some(*restarts),
+                ..StepColumns::state("interrupted")
+            },
             StepRowState::Settled {
                 verdict,
                 reason,
                 outputs,
-            } => (
-                "settled",
-                Some(verdict.as_str()),
-                reason.clone(),
-                Some(serde_json::to_string(outputs).expect("outputs always serialize")),
-                None,
-                None,
-            ),
+            } => StepColumns {
+                verdict: Some(verdict.as_str()),
+                reason: reason.clone(),
+                outputs: Some(serde_json::to_string(outputs).expect("outputs always serialize")),
+                ..StepColumns::state("settled")
+            },
         };
         self.db().execute(
             "UPDATE run_steps
              SET state = ?3, verdict = ?4, reason = ?5, outputs = ?6, attempt = ?7,
-                 pgid = ?8, process_started_us = ?9
+                 pgid = ?8, process_started_us = ?9, process_sid = ?10,
+                 restarts = COALESCE(?11, restarts)
              WHERE run_id = ?1 AND step = ?2",
             params![
                 run.0 as i64,
                 row.step,
-                state,
-                verdict,
-                reason,
-                outputs,
+                columns.state,
+                columns.verdict,
+                columns.reason,
+                columns.outputs,
                 row.attempt,
-                pgid,
-                started,
+                columns.pgid,
+                columns.started_us,
+                columns.sid,
+                columns.restarts,
             ],
         )?;
         Ok(())
+    }
+
+    /// Records that a restart killed the running Step's process, and
+    /// returns how many restarts in a row have now interrupted it.
+    pub fn interrupt_step(&self, run: RunId, step: &str) -> Result<u32, StoreError> {
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE run_steps
+             SET state = 'interrupted', restarts = restarts + 1,
+                 pgid = NULL, process_started_us = NULL, process_sid = NULL
+             WHERE run_id = ?1 AND step = ?2 AND state = 'running'",
+            params![run.0 as i64, step],
+        )?;
+        let restarts = tx.query_row(
+            "SELECT restarts FROM run_steps WHERE run_id = ?1 AND step = ?2",
+            params![run.0 as i64, step],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(restarts)
     }
 
     pub fn set_gate(&self, run: RunId, gate: GateState) -> Result<(), StoreError> {
@@ -383,7 +432,8 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut steps = db.prepare(
-            "SELECT step, state, verdict, reason, outputs, attempt, pgid, process_started_us
+            "SELECT step, state, verdict, reason, outputs, attempt, pgid, process_started_us,
+                    process_sid, restarts
              FROM run_steps WHERE run_id = ?1",
         )?;
         for run in &mut runs {
@@ -393,6 +443,10 @@ impl Store {
                         "running" => StepRowState::Running {
                             pgid: row.get::<_, Option<i32>>(6)?.unwrap_or_default(),
                             started_us: row.get::<_, Option<i64>>(7)?.unwrap_or_default(),
+                            sid: row.get::<_, Option<i32>>(8)?.unwrap_or_default(),
+                        },
+                        "interrupted" => StepRowState::Interrupted {
+                            restarts: row.get(9)?,
                         },
                         "settled" => StepRowState::Settled {
                             verdict: row
@@ -523,6 +577,35 @@ impl Store {
     }
 }
 
+/// A [`StepRow`]'s state as `run_steps` columns.
+struct StepColumns {
+    state: &'static str,
+    verdict: Option<&'static str>,
+    reason: Option<String>,
+    outputs: Option<String>,
+    pgid: Option<i32>,
+    started_us: Option<i64>,
+    sid: Option<i32>,
+    /// `None` keeps the stored count.
+    restarts: Option<u32>,
+}
+
+impl StepColumns {
+    /// A state with nothing else to store, which ends a row of restarts.
+    fn state(state: &'static str) -> Self {
+        Self {
+            state,
+            verdict: None,
+            reason: None,
+            outputs: None,
+            pgid: None,
+            started_us: None,
+            sid: None,
+            restarts: Some(0),
+        }
+    }
+}
+
 /// Repo names come from [`RepoName`]'s `Display`, so they always parse.
 fn parse_repo(text: &str) -> RepoName {
     text.parse().expect("the store holds owner/name repos")
@@ -634,6 +717,7 @@ mod tests {
                         state: StepRowState::Running {
                             pgid: 42,
                             started_us: 1_000,
+                            sid: 7,
                         },
                         attempt: 1,
                     },
@@ -654,7 +738,8 @@ mod tests {
                 step: "ci".into(),
                 state: StepRowState::Running {
                     pgid: 42,
-                    started_us: 1_000
+                    started_us: 1_000,
+                    sid: 7,
                 },
                 attempt: 1,
             }]
@@ -681,5 +766,67 @@ mod tests {
         assert_eq!(store.append_event(second, "c").unwrap(), 1);
 
         assert_eq!(store.events_after(first, 1).unwrap(), [(2, "b".to_owned())]);
+    }
+
+    fn running(attempt: u32) -> StepRow {
+        StepRow {
+            step: "ci".into(),
+            state: StepRowState::Running {
+                pgid: 42,
+                started_us: 1_000,
+                sid: 7,
+            },
+            attempt,
+        }
+    }
+
+    #[test]
+    fn restarts_count_only_in_a_row_until_the_step_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let repo = RepoName::new("o", "r");
+        let run = {
+            let store = Store::open(&path).unwrap();
+            let run = store.insert_run(&new_run(&repo, "aaa"), 1).unwrap();
+            store.put_step(run, &running(1)).unwrap();
+            assert_eq!(store.interrupt_step(run, "ci").unwrap(), 1);
+            run
+        };
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.active_runs().unwrap()[0].steps[0].state,
+            StepRowState::Interrupted { restarts: 1 },
+            "an interrupt waiting for its respawn survives another restart"
+        );
+        assert_eq!(
+            store.interrupt_step(run, "ci").unwrap(),
+            1,
+            "a Step that wasn't running isn't interrupted again"
+        );
+
+        store.put_step(run, &running(2)).unwrap();
+        assert_eq!(store.interrupt_step(run, "ci").unwrap(), 2);
+
+        store.put_step(run, &running(3)).unwrap();
+        store
+            .put_step(
+                run,
+                &StepRow {
+                    step: "ci".into(),
+                    state: StepRowState::Settled {
+                        verdict: Verdict::Pass,
+                        reason: None,
+                        outputs: Outputs::default(),
+                    },
+                    attempt: 3,
+                },
+            )
+            .unwrap();
+        store.put_step(run, &running(4)).unwrap();
+        assert_eq!(
+            store.interrupt_step(run, "ci").unwrap(),
+            1,
+            "settling breaks the row"
+        );
     }
 }
