@@ -6,6 +6,7 @@ use std::sync::Arc;
 use slopwatch_daemon::auth::GhToken;
 use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::api::Api;
+use slopwatch_daemon::notifications::{self, LaunchPace, OpenApp};
 use slopwatch_daemon::plugins::{self, Plugins};
 use slopwatch_daemon::shell_env;
 use slopwatch_daemon::store::Store;
@@ -104,6 +105,11 @@ async fn serve() -> ExitCode {
         }
     };
     tokio::spawn(Arc::clone(&runs).prune_forever());
+    tokio::spawn(notifications::launch_gui_when_unheard(
+        Arc::clone(runs.notifications()),
+        Arc::new(OpenApp),
+        LaunchPace::DAEMON,
+    ));
     let daemon = Arc::new(Daemon::new(watching, library).with_runs(runs));
     eprintln!(
         "slopwatchd: build {} listening on {}",

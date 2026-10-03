@@ -209,7 +209,7 @@ impl Client {
             TopicUpdate::Run { id, seq, event, .. } => {
                 self.runs.entry(id).or_default().apply(seq, event);
             }
-            TopicUpdate::StepLog { .. } => {}
+            TopicUpdate::StepLog { .. } | TopicUpdate::Notifications { .. } => {}
         }
     }
 

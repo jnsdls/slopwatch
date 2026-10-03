@@ -20,6 +20,7 @@ mod data_dir;
 pub mod github;
 pub mod inbox;
 mod library;
+pub mod notifications;
 mod pace;
 pub mod plugins;
 pub mod runs;

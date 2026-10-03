@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use slopwatch_core::WaiverCategory;
 
 use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
-use crate::{EntryId, RepoName, RunId, Topic, TopicUpdate};
+use crate::{EntryId, NotificationId, RepoName, RunId, Topic, TopicUpdate};
 
 /// A frame a client sends to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,6 +224,12 @@ pub enum Command {
     /// dismissed.
     DismissEntry {
         entry: EntryId,
+    },
+    /// The client posted these notifications, or decided not to, such as
+    /// with notifications turned off. The daemon won't send them again.
+    /// Ids it doesn't hold are ignored, so an ack is safe to repeat.
+    AckNotifications {
+        ids: Vec<NotificationId>,
     },
 }
 

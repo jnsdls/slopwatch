@@ -4,8 +4,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use slopwatch_protocol::{
     Actor, ClientFrame, Command, ErrorBody, ErrorCode, InboxDelta, InboxUpdate, LogKey, LogRecord,
-    Reply, Request, RequestId, Response, ResponseBody, RunId, ServerFrame, Topic, TopicUpdate,
-    Waiver, WatchedPrsDelta, WatchedPrsUpdate,
+    NotificationsDelta, NotificationsUpdate, Reply, Request, RequestId, Response, ResponseBody,
+    RunId, ServerFrame, Topic, TopicUpdate, Waiver, WatchedPrsDelta, WatchedPrsUpdate,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
@@ -13,6 +13,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
 use crate::inbox::InboxSubscription;
+use crate::notifications::NotificationsSubscription;
 use crate::runs::{Journalled, Live, LiveLog, LogError, RunError, Runs, SubscribeError};
 use crate::{Daemon, LibraryError, Peer, Subscription, WatchError};
 
@@ -24,6 +25,7 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 struct Subscriptions {
     watched_prs: Option<broadcast::Receiver<(u64, WatchedPrsDelta)>>,
     inbox: Option<broadcast::Receiver<(u64, InboxDelta)>>,
+    notifications: Option<broadcast::Receiver<(u64, NotificationsDelta)>>,
     /// Each subscribed Run, with the last sequence number sent for it.
     runs: HashMap<RunId, u64>,
     /// Events appended to any Run. Only subscribed Runs' get through.
@@ -42,6 +44,9 @@ enum Next {
     Inbox(u64, InboxDelta),
     /// The subscriber fell behind on `inbox` and lost deltas.
     InboxLagged,
+    Notifications(u64, NotificationsDelta),
+    /// The subscriber fell behind on `notifications` and lost deltas.
+    NotificationsLagged,
     Run(RunId, Journalled),
     /// The subscriber fell behind on Run events. The journal has them.
     RunsLagged,
@@ -98,6 +103,7 @@ impl Daemon {
                             match topic {
                                 Topic::WatchedPrs => subs.watched_prs = None,
                                 Topic::Inbox => subs.inbox = None,
+                                Topic::Notifications => subs.notifications = None,
                                 Topic::Run(run) => {
                                     subs.runs.remove(&run);
                                     if subs.runs.is_empty() {
@@ -154,6 +160,7 @@ impl Daemon {
         match topic {
             Topic::WatchedPrs => Ok(vec![self.subscribe_watched_prs(subs)]),
             Topic::Inbox => Ok(vec![self.subscribe_inbox(subs)]),
+            Topic::Notifications => Ok(vec![self.subscribe_notifications(subs)]),
             Topic::Run(run) => {
                 let Some(runs) = &self.runs else {
                     return Err(run_not_found(run));
@@ -228,6 +235,27 @@ impl Daemon {
         })
     }
 
+    /// The `notifications` snapshot: what no client has acked yet. A daemon
+    /// that doesn't run Pipelines never notifies.
+    fn subscribe_notifications(&self, subs: &mut Subscriptions) -> ServerFrame {
+        let Some(runs) = &self.runs else {
+            return ServerFrame::Topic(TopicUpdate::Notifications {
+                seq: 0,
+                update: NotificationsUpdate::Snapshot(Vec::new()),
+            });
+        };
+        let NotificationsSubscription {
+            seq,
+            snapshot,
+            deltas,
+        } = runs.notifications().subscribe();
+        subs.notifications = Some(deltas);
+        ServerFrame::Topic(TopicUpdate::Notifications {
+            seq,
+            update: NotificationsUpdate::Snapshot(snapshot),
+        })
+    }
+
     /// The frames for `next`. A subscriber that fell too far behind to
     /// catch up starts over: from a fresh snapshot on `watched_prs`, and
     /// from the journal on a Run.
@@ -243,6 +271,13 @@ impl Daemon {
                 update: InboxUpdate::Delta(delta),
             })],
             Next::InboxLagged => vec![self.subscribe_inbox(subs)],
+            Next::Notifications(seq, delta) => {
+                vec![ServerFrame::Topic(TopicUpdate::Notifications {
+                    seq,
+                    update: NotificationsUpdate::Delta(delta),
+                })]
+            }
+            Next::NotificationsLagged => vec![self.subscribe_notifications(subs)],
             Next::Run(run, event) => run_frame(subs, run, event).into_iter().collect(),
             Next::Log(key, record) => log_frame(subs, key, vec![record]).into_iter().collect(),
             Next::LogsLagged => {
@@ -390,6 +425,17 @@ impl Daemon {
                     Err(error) => Err(error),
                 });
             }
+            Command::AckNotifications { ids } => {
+                let Some(runs) = &self.runs else {
+                    return ResponseBody::Ok(Reply::Done);
+                };
+                return respond(
+                    runs.notifications()
+                        .ack(&ids)
+                        .map(|()| Reply::Done)
+                        .map_err(RunError::Store),
+                );
+            }
             Command::DismissEntry { entry } => {
                 return respond(match self.runs_or_refuse() {
                     Ok(runs) => runs.inbox().dismiss(entry, &actor).map(|()| Reply::Done),
@@ -509,6 +555,13 @@ fn try_next(subs: &mut Subscriptions) -> Next {
             Err(_) => {}
         }
     }
+    if let Some(deltas) = &mut subs.notifications {
+        match deltas.try_recv() {
+            Ok((seq, delta)) => return Next::Notifications(seq, delta),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => return Next::NotificationsLagged,
+            Err(_) => {}
+        }
+    }
     if let Some(live) = &mut subs.live {
         match live.try_recv() {
             Ok((run, event)) => return Next::Run(run, event),
@@ -532,6 +585,7 @@ async fn recv(subs: &mut Subscriptions) -> Next {
     let Subscriptions {
         watched_prs,
         inbox,
+        notifications,
         live,
         live_logs,
         ..
@@ -555,6 +609,16 @@ async fn recv(subs: &mut Subscriptions) -> Next {
         } => match received {
             Ok((seq, delta)) => Next::Inbox(seq, delta),
             Err(broadcast::error::RecvError::Lagged(_)) => Next::InboxLagged,
+            Err(broadcast::error::RecvError::Closed) => Next::Nothing,
+        },
+        received = async {
+            match notifications {
+                Some(deltas) => deltas.recv().await,
+                None => std::future::pending().await,
+            }
+        } => match received {
+            Ok((seq, delta)) => Next::Notifications(seq, delta),
+            Err(broadcast::error::RecvError::Lagged(_)) => Next::NotificationsLagged,
             Err(broadcast::error::RecvError::Closed) => Next::Nothing,
         },
         received = async {

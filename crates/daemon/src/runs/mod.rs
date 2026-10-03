@@ -71,6 +71,7 @@ use tokio::sync::mpsc;
 use crate::clones::{Clones, PipelineAt};
 use crate::github::{GitHub, GitHubError, OpenPr};
 use crate::inbox::Inbox;
+use crate::notifications::Notifications;
 use crate::plugins::Plugins;
 use crate::shell_env;
 use crate::store::{ActiveRun, NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
@@ -121,6 +122,7 @@ pub struct Runs {
     data_dir: PathBuf,
     retention: Retention,
     inbox: Arc<Inbox>,
+    notifications: Arc<Notifications>,
 }
 
 /// Where Runs keep their files, and for how long.
@@ -199,9 +201,15 @@ impl Runs {
             config.login_path.as_deref(),
         );
         let logs = log::Hub::default();
-        let inbox = Arc::new(Inbox::load(store.clone(), Arc::clone(&journal))?);
+        let notifications = Arc::new(Notifications::load(store.clone())?);
+        let inbox = Arc::new(Inbox::load(
+            store.clone(),
+            Arc::clone(&journal),
+            Arc::clone(&notifications),
+        )?);
         let mut engine = Engine {
             inbox: Arc::clone(&inbox),
+            notifications: Arc::clone(&notifications),
             data_dir: config.data_dir.clone(),
             plugins: config.plugins,
             step_path,
@@ -238,6 +246,7 @@ impl Runs {
             data_dir: config.data_dir,
             retention: config.retention,
             inbox,
+            notifications,
         });
         let driver = Arc::clone(&runs);
         tokio::spawn(async move {
@@ -364,6 +373,11 @@ impl Runs {
     /// The Inbox, which these Runs raise and close entries in.
     pub fn inbox(&self) -> &Arc<Inbox> {
         &self.inbox
+    }
+
+    /// The notifications these Runs and their Inbox record for the GUI.
+    pub fn notifications(&self) -> &Arc<Notifications> {
+        &self.notifications
     }
 
     /// Waives Step `step`'s settled, non-pass Verdict for the Run's head
@@ -556,6 +570,7 @@ impl Runs {
 struct Engine {
     store: Store,
     inbox: Arc<Inbox>,
+    notifications: Arc<Notifications>,
     plugins: Plugins,
     logs: log::Hub,
     journal: Arc<Journal>,
@@ -1934,6 +1949,20 @@ impl Engine {
             };
             self.inbox
                 .raise_pr(pr_ref(&run.repo, run.number), run.id, title, reasons)?;
+        }
+        if matches!(reason, EndReason::Shippable | EndReason::Merged) {
+            let title = self
+                .watching
+                .prs()
+                .into_iter()
+                .find(|(repo, pr)| *repo == run.repo && pr.number == run.number)
+                .map(|(_, pr)| pr.title);
+            self.notifications.run_ended(
+                run.id,
+                pr_ref(&run.repo, run.number),
+                title.as_deref(),
+                reason,
+            )?;
         }
         self.publish(&run.repo, run.number)
     }

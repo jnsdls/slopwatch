@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::inbox::InboxUpdate;
 use crate::logs::{LogKey, LogRecord, StorageWarning};
+use crate::notifications::NotificationsUpdate;
 use crate::runs::{RunEvent, RunId, RunSummary};
 
-/// A topic, by its name on the wire: `watched_prs`, `inbox`, `run/<id>` or
-/// `log/<run>/<step>/<attempt>`.
+/// A topic, by its name on the wire: `watched_prs`, `inbox`,
+/// `notifications`, `run/<id>` or `log/<run>/<step>/<attempt>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Topic {
@@ -19,6 +20,9 @@ pub enum Topic {
     WatchedPrs,
     /// The open Escalations, oldest first.
     Inbox,
+    /// The notifications no client has acked yet. The GUI subscribes, and
+    /// the daemon launches it when nobody does (ADR 0013).
+    Notifications,
     /// One Run's event journal.
     Run(RunId),
     /// One attempt's Step log, as it's written.
@@ -30,6 +34,7 @@ impl fmt::Display for Topic {
         match self {
             Topic::WatchedPrs => f.write_str("watched_prs"),
             Topic::Inbox => f.write_str("inbox"),
+            Topic::Notifications => f.write_str("notifications"),
             Topic::Run(id) => write!(f, "run/{id}"),
             Topic::StepLog(key) => write!(f, "log/{key}"),
         }
@@ -43,6 +48,7 @@ impl TryFrom<String> for Topic {
         match text.as_str() {
             "watched_prs" => return Ok(Topic::WatchedPrs),
             "inbox" => return Ok(Topic::Inbox),
+            "notifications" => return Ok(Topic::Notifications),
             _ => {}
         }
         if let Some(key) = text.strip_prefix("log/").and_then(LogKey::parse) {
@@ -73,6 +79,11 @@ pub enum TopicUpdate {
     },
     /// Like `watched_prs`: a snapshot, then deltas.
     Inbox { seq: u64, update: InboxUpdate },
+    /// Like `watched_prs`: a snapshot, then deltas.
+    Notifications {
+        seq: u64,
+        update: NotificationsUpdate,
+    },
     /// One event from a Run's journal. A Run topic has no snapshot: its
     /// events from sequence number 1 are the whole Run.
     Run {
@@ -343,6 +354,10 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Topic>(json!("inbox")).unwrap(),
             Topic::Inbox
+        );
+        assert_eq!(
+            serde_json::from_value::<Topic>(json!("notifications")).unwrap(),
+            Topic::Notifications
         );
         assert!(serde_json::from_value::<Topic>(json!("outbox")).is_err());
     }
