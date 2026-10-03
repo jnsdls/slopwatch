@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -5,6 +7,7 @@ use gpui_kit::*;
 use slopwatch_client::agent::Agent;
 use slopwatch_client::link::{self, Pace};
 use slopwatch_client::main_view::MainView;
+use slopwatch_client::notifications;
 use slopwatch_protocol::{Flavor, socket_path};
 
 gpui_kit::actions!(slopwatch, [Quit]);
@@ -30,7 +33,16 @@ fn main() {
         })
         .expect("spawn the daemon link thread");
 
-    gpui_kit::application().run(move |cx| {
+    // The daemon launches the GUI this way to post notifications while no
+    // GUI runs (ADR 0013): no window and no focus until the developer asks.
+    let background = std::env::args().any(|arg| arg == "--background");
+    let main_window: Rc<Cell<Option<AnyWindowHandle>>> = Rc::default();
+    let app = gpui_kit::application();
+    // Clicking the Dock icon with the window hidden shows it.
+    let reopened = Rc::clone(&main_window);
+    app.on_reopen(move |cx| show(reopened.get(), cx));
+
+    app.run(move |cx| {
         gpui_kit::init(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
@@ -42,13 +54,30 @@ fn main() {
                 title: Some(Flavor::CURRENT.app_name().into()),
                 ..Default::default()
             }),
+            show: !background,
+            focus: !background,
             ..Default::default()
         };
-        let (_, view) = gpui_kit::open_window(options, cx, |window, cx| {
+        let (window, view) = gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| MainView::new(commands, agent, reregister, window, cx))
         })
         .expect("open the main window");
-        cx.activate(true);
+        main_window.set(Some(window));
+        if !background {
+            cx.activate(true);
+        }
+
+        // A click on a banner shows the window on the banner's PR.
+        let clicked_view = view.downgrade();
+        cx.on_system_notification_response(move |response, cx| {
+            show(Some(window), cx);
+            if let Some(pr) = notifications::clicked(&response.tag) {
+                let _ = clicked_view.update(cx, |view, cx| {
+                    view.reveal(pr);
+                    cx.notify();
+                });
+            }
+        });
 
         let view = view.downgrade();
         cx.spawn(async move |cx| {
@@ -61,6 +90,14 @@ fn main() {
         })
         .detach();
     });
+}
+
+/// Brings the app forward with its main window shown.
+fn show(window: Option<AnyWindowHandle>, cx: &mut App) {
+    cx.activate(true);
+    if let Some(window) = window {
+        let _ = window.update(cx, |_, window, _| window.activate_window());
+    }
 }
 
 #[cfg(target_os = "macos")]

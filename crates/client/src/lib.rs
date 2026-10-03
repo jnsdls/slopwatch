@@ -8,6 +8,7 @@ pub mod library_view;
 pub mod link;
 pub mod link_view;
 pub mod main_view;
+pub mod notifications;
 pub mod prs;
 pub mod run_graph;
 pub mod run_graph_view;
