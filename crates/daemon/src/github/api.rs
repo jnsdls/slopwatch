@@ -16,8 +16,7 @@ use slopwatch_protocol::step::{
 
 use super::{
     Branch, GitHub, GitHubError, GitRemote, Merged, NewCommit, NewPr, OpenPr, PIPELINE_PATH,
-    ParentPr, Poll, PrLink,
-    PrDetail, PrFate, RateLimit, RepoPoll, StackLink, WATCH_LABEL,
+    ParentPr, Poll, PrDetail, PrFate, PrLink, RateLimit, RepoPoll, StackLink, WATCH_LABEL,
 };
 use crate::auth::Credentials;
 
