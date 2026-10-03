@@ -56,26 +56,32 @@ impl From<io::Error> for LibraryError {
     }
 }
 
+/// `$SLOPWATCH_CONFIG_DIR`, or else `~/.config/slopwatch` for release
+/// builds and `~/.config/slopwatch-dev` for dev builds: where the Library
+/// and the Plugins folder live.
+pub fn config_dir(flavor: Flavor) -> PathBuf {
+    std::env::var_os(CONFIG_DIR_ENV)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let name = match flavor {
+                Flavor::Release => "slopwatch",
+                Flavor::Dev => "slopwatch-dev",
+            };
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".config")
+                .join(name)
+        })
+}
+
 impl Library {
     /// `steps/` under `$SLOPWATCH_CONFIG_DIR`, or else under
     /// `~/.config/slopwatch` for release builds and `~/.config/slopwatch-dev`
     /// for dev builds, so a dev build never edits the real Library.
     pub fn default_dir(flavor: Flavor) -> PathBuf {
-        let config = std::env::var_os(CONFIG_DIR_ENV)
-            .filter(|dir| !dir.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let name = match flavor {
-                    Flavor::Release => "slopwatch",
-                    Flavor::Dev => "slopwatch-dev",
-                };
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_default()
-                    .join(".config")
-                    .join(name)
-            });
-        config.join("steps")
+        config_dir(flavor).join("steps")
     }
 
     /// Opens the Library at `dir`, creating it if needed. Each preset this

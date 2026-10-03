@@ -2,6 +2,7 @@
 //! only writer. A [`Store`] is a handle on one connection, and clones share
 //! it.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -9,7 +10,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use slopwatch_core::{EndReason, GateState, ReuseKey, Verdict};
 use slopwatch_protocol::step::{Effect, EffectKind, EffectResult, LinkedIssue, Outputs};
 use slopwatch_protocol::{
-    EntryId, InboxEntry, Notification, NotificationId, RepoName, RunId, RunSummary, Waiver,
+    EntryId, InboxEntry, Notification, NotificationId, PluginSettings, RepoName, RunId, RunSummary,
+    Waiver,
 };
 
 use crate::approvals::Approval;
@@ -204,6 +206,14 @@ const MIGRATIONS: &[&str] = &[
     // starts, for Step snapshots and `linked_issue:` Conditions.
     "
     ALTER TABLE runs ADD COLUMN linked_issues TEXT NOT NULL DEFAULT '[]';
+",
+    // The developer's per-Plugin settings in the daemon, as JSON: extra
+    // `PATH` dirs and a Step cap.
+    "
+    CREATE TABLE plugin_settings (
+        plugin TEXT PRIMARY KEY,
+        settings_json TEXT NOT NULL
+    );
 ",
 ];
 
@@ -1344,6 +1354,40 @@ impl Store {
         rows.collect()
     }
 
+    /// Keeps the developer's settings for `plugin`. Default settings are
+    /// kept as no row.
+    pub fn put_plugin_settings(
+        &self,
+        plugin: &str,
+        settings: &PluginSettings,
+    ) -> Result<(), StoreError> {
+        if *settings == PluginSettings::default() {
+            self.db().execute(
+                "DELETE FROM plugin_settings WHERE plugin = ?1",
+                params![plugin],
+            )?;
+            return Ok(());
+        }
+        let json = serde_json::to_string(settings).expect("settings always serialize");
+        self.db().execute(
+            "INSERT INTO plugin_settings (plugin, settings_json) VALUES (?1, ?2)
+             ON CONFLICT (plugin) DO UPDATE SET settings_json = excluded.settings_json",
+            params![plugin, json],
+        )?;
+        Ok(())
+    }
+
+    /// Every Plugin's settings that aren't the default, by Plugin name.
+    pub fn plugin_settings(&self) -> Result<HashMap<String, PluginSettings>, StoreError> {
+        let db = self.db();
+        let mut query = db.prepare("SELECT plugin, settings_json FROM plugin_settings")?;
+        let rows = query.query_map([], |row| {
+            let json: String = row.get(1)?;
+            Ok((row.get(0)?, json_column(1, &json)?))
+        })?;
+        rows.collect()
+    }
+
     /// Records a SHA slopwatch pushed.
     pub fn record_push(&self, repo: &RepoName, sha: &str) -> Result<(), StoreError> {
         self.db().execute(
@@ -2149,5 +2193,23 @@ mod tests {
                 .asked_for(current, EffectKind::Rebase)
                 .is_ok_and(|asked| !asked)
         );
+    }
+
+    #[test]
+    fn plugin_settings_are_kept_and_the_default_leaves_no_row() {
+        let store = Store::in_memory();
+        let settings = PluginSettings {
+            path: vec!["/opt/bin".into()],
+            cap: Some(1),
+        };
+        store.put_plugin_settings("lint", &settings).unwrap();
+        assert_eq!(
+            store.plugin_settings().unwrap(),
+            HashMap::from([("lint".to_owned(), settings)])
+        );
+        store
+            .put_plugin_settings("lint", &PluginSettings::default())
+            .unwrap();
+        assert!(store.plugin_settings().unwrap().is_empty());
     }
 }

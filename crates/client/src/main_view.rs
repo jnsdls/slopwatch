@@ -30,6 +30,8 @@ use crate::notifications::{
     NotificationCenter, Permission, Poster, SystemCenter, notice, settings_url,
 };
 use crate::pipeline_editor_view::PipelineEditorView;
+use crate::plugins::unapproved_plugin;
+use crate::plugins_view::PluginsView;
 use crate::prs::{Prs, Source, poll_line, status_line, storage_line};
 use crate::run_graph_view::{run_graph, tone_color};
 use crate::run_pane::{
@@ -49,6 +51,7 @@ enum Pane {
     Secrets,
     /// The Pipeline editor, on the repo it has open.
     Pipeline,
+    Plugins,
 }
 
 pub struct MainView {
@@ -64,6 +67,7 @@ pub struct MainView {
     library: Entity<LibraryView>,
     secrets: Entity<SecretsView>,
     pipeline: Entity<PipelineEditorView>,
+    plugins: Entity<PluginsView>,
     run_pane: RunPane,
     /// Repos the developer can add, while the picker is open.
     picker: Option<Vec<RepoName>>,
@@ -138,6 +142,7 @@ impl MainView {
             library: cx.new(|cx| LibraryView::new(commands.clone(), window, cx)),
             secrets: cx.new(|cx| SecretsView::new(commands.clone(), window, cx)),
             pipeline: cx.new(|cx| PipelineEditorView::new(commands.clone(), window, cx)),
+            plugins: cx.new(|cx| PluginsView::new(commands.clone(), window, cx)),
             run_pane: RunPane::default(),
             picker: None,
             error: None,
@@ -156,6 +161,7 @@ impl MainView {
                         self.library.read(cx).refresh();
                     }
                     self.secrets.read(cx).refresh();
+                    self.plugins.read(cx).refresh();
                 }
                 if connected && !matches!(self.link, LinkState::Connected { .. }) {
                     // The new connection subscribes to its topics itself.
@@ -171,9 +177,10 @@ impl MainView {
             LinkEvent::Topic(update @ TopicUpdate::Inbox { .. }) => {
                 self.inbox.apply(update);
                 dock::set_badge(badge(self.inbox.count()).as_deref());
-                // A missing Secret's entry opening or closing changes the
-                // list's set states.
+                // A missing Secret's or an unapproved Plugin's entry
+                // opening or closing changes those lists.
                 self.secrets.read(cx).refresh();
+                self.plugins.read(cx).refresh();
             }
             LinkEvent::Topic(update @ TopicUpdate::Notifications { .. }) => {
                 let center = SystemCenter::new(cx);
@@ -221,6 +228,9 @@ impl MainView {
                 }
                 ResponseBody::Ok(Reply::Secrets { secrets }) => {
                     self.secrets.update(cx, |view, cx| view.listed(secrets, cx));
+                }
+                ResponseBody::Ok(Reply::Plugins { plugins }) => {
+                    self.plugins.update(cx, |view, cx| view.listed(plugins, cx));
                 }
                 ResponseBody::Ok(Reply::StepLog(page)) => {
                     self.error = None;
@@ -390,6 +400,19 @@ impl MainView {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.pane = Pane::Secrets;
                     this.secrets.read(cx).refresh();
+                    cx.notify();
+                })),
+            )
+            .child(
+                entry(
+                    "source-plugins".into(),
+                    "Plugins".to_owned(),
+                    Some(self.plugins.read(cx).waiting()),
+                    self.pane == Pane::Plugins,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.pane = Pane::Plugins;
+                    this.plugins.read(cx).refresh();
                     cx.notify();
                 })),
             )
@@ -754,6 +777,22 @@ impl MainView {
                     }),
                 ));
             }
+        }
+        if let Some(plugin) = unapproved_plugin(entry).map(str::to_owned) {
+            let id = SharedString::from(format!("{prefix}-review-plugin-{}", entry.id));
+            buttons = buttons.child(
+                Button::new(id)
+                    .label("Review Plugin")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.pane = Pane::Plugins;
+                        this.plugins
+                            .update(cx, |view, cx| view.choose(&plugin, window, cx));
+                        this.plugins.read(cx).refresh();
+                        cx.notify();
+                    })),
+            );
         }
         let mut card = div()
             .id(SharedString::from(format!("{prefix}-entry-{}", entry.id)))
@@ -1515,7 +1554,7 @@ impl MainView {
     /// column away.
     fn sources_shown(&self) -> bool {
         match self.pane {
-            Pane::Library | Pane::Secrets => true,
+            Pane::Library | Pane::Secrets | Pane::Plugins => true,
             Pane::Pipeline => false,
             Pane::Prs | Pane::Inbox => !self.run_pane.graph_shown(),
         }
@@ -1605,6 +1644,7 @@ impl Render for MainView {
                         Pane::Library => this.child(self.library.clone()),
                         Pane::Secrets => this.child(self.secrets.clone()),
                         Pane::Pipeline => this.child(self.pipeline_pane(cx)),
+                        Pane::Plugins => this.child(self.plugins.clone()),
                     }),
             )
             .children(self.footer(cx))

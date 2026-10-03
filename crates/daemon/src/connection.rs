@@ -562,6 +562,34 @@ impl Daemon {
                     Err(error) => Err(error.into()),
                 });
             }
+            Command::ListPlugins => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs
+                        .list_plugins()
+                        .await
+                        .map(|plugins| Reply::Plugins { plugins })
+                        .map_err(RunError::Store),
+                    Err(error) => Err(error),
+                });
+            }
+            Command::ApprovePlugin { plugin, grant } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs
+                        .approve_plugin(&plugin, &grant, &actor)
+                        .await
+                        .map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
+            Command::SetPluginSettings { plugin, settings } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs
+                        .set_plugin_settings(&plugin, settings)
+                        .await
+                        .map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
             Command::ReadStepLog { key, page, filter } => {
                 let Some(runs) = &self.runs else {
                     return ResponseBody::Error(ErrorBody {

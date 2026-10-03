@@ -6,7 +6,8 @@ use slopwatch_core::{Edit, WaiverCategory};
 use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
 use crate::pipeline::NodePosition;
 use crate::{
-    Answer, EntryId, Notification, RepoName, RunId, SecretInfo, SecretValue, Topic, TopicUpdate,
+    Answer, EntryId, Grant, Notification, PluginListing, PluginSettings, RepoName, RunId,
+    SecretInfo, SecretValue, Topic, TopicUpdate,
 };
 
 /// A frame a client sends to the daemon.
@@ -296,6 +297,25 @@ pub enum Command {
     TidyPipeline {
         repo: RepoName,
     },
+    /// Every Plugin the daemon knows of, built-in and third-party, with
+    /// what each asks for and what its Approval covers. The daemon looks
+    /// in its Plugins folder again first, so one just dropped in shows.
+    ListPlugins,
+    /// Approves the third-party Plugin `plugin` for `grant`, the asks the
+    /// developer saw. The daemon refuses a `grant` that doesn't cover what
+    /// the manifest asks for now, as after a rebuild that asks for more,
+    /// so the developer looks again. Approving clears the Plugin's Inbox
+    /// entry and starts the PRs it held back.
+    ApprovePlugin {
+        plugin: String,
+        /// What the manifest asked for when the developer looked.
+        grant: Grant,
+    },
+    /// Replaces the daemon's settings for `plugin`.
+    SetPluginSettings {
+        plugin: String,
+        settings: PluginSettings,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +350,11 @@ pub enum Reply {
     Secrets {
         /// Sorted by name.
         secrets: Vec<SecretInfo>,
+    },
+    /// Every Plugin the daemon knows of.
+    Plugins {
+        /// Sorted by name, a built-in before a file that took its name.
+        plugins: Vec<PluginListing>,
     },
 }
 
@@ -588,6 +613,57 @@ mod tests {
                     { "name": "A", "set_at": 5, "granted_to": ["jev"] },
                     { "name": "B", "granted_to": [] },
                 ],
+            }),
+        );
+        assert_eq!(parse::<Reply>(wire(&listed)), listed);
+    }
+
+    #[test]
+    fn a_plugin_is_approved_for_the_asks_the_developer_saw() {
+        let approve = Command::ApprovePlugin {
+            plugin: "lint".into(),
+            grant: Grant {
+                workspace: slopwatch_core::Workspace::Read,
+                effects: vec![crate::step::EffectKind::Comment],
+                secrets: vec!["LINT_KEY".into()],
+            },
+        };
+        assert_eq!(
+            wire(&approve),
+            json!({
+                "name": "approve_plugin",
+                "plugin": "lint",
+                "grant": { "workspace": "read", "effects": ["comment"], "secrets": ["LINT_KEY"] },
+            }),
+        );
+        assert_eq!(parse::<Command>(wire(&approve)), approve);
+
+        let listed = Reply::Plugins {
+            plugins: vec![PluginListing {
+                name: "lint".into(),
+                builtin: false,
+                path: Some("/plugins/lint".into()),
+                version: None,
+                asks: None,
+                approved: None,
+                approved_at: None,
+                problem: Some("`describe` hung".into()),
+                settings: PluginSettings {
+                    path: vec![],
+                    cap: Some(2),
+                },
+            }],
+        };
+        assert_eq!(
+            wire(&listed),
+            json!({
+                "reply": "plugins",
+                "plugins": [{
+                    "name": "lint",
+                    "path": "/plugins/lint",
+                    "problem": "`describe` hung",
+                    "settings": { "cap": 2 },
+                }],
             }),
         );
         assert_eq!(parse::<Reply>(wire(&listed)), listed);

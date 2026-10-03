@@ -12,6 +12,7 @@ mod inbox;
 pub mod logs;
 mod notifications;
 pub mod pipeline;
+mod plugins;
 pub mod runs;
 mod secrets;
 pub mod step;
@@ -33,6 +34,7 @@ pub use logs::{
 pub use notifications::{
     About, Notification, NotificationId, NotificationsDelta, NotificationsUpdate,
 };
+pub use plugins::{Grant, PluginListing, PluginSettings, workspace_name};
 pub use runs::{
     Cost, EffectView, GateTerm, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus,
     StepView, Waiver,
@@ -85,6 +87,10 @@ pub const DIALECT: u32 = 1;
 ///
 /// `pipeline_editor`: the `pipeline/<owner>/<name>` topics, and the
 /// `edit_pipeline`, `move_pipeline_node` and `tidy_pipeline` commands.
+///
+/// `plugins`: the `list_plugins`, `approve_plugin` and
+/// `set_plugin_settings` commands, and the `unapproved_plugin` Inbox
+/// cause (ADR 0012).
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -98,6 +104,7 @@ pub const FEATURES: &[&str] = &[
     "secrets",
     "human_steps",
     "pipeline_editor",
+    "plugins",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

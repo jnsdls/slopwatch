@@ -11,6 +11,8 @@ pub mod main_view;
 pub mod notifications;
 pub mod pipeline_editor;
 pub mod pipeline_editor_view;
+pub mod plugins;
+pub mod plugins_view;
 pub mod prs;
 pub mod run_graph;
 pub mod run_graph_view;

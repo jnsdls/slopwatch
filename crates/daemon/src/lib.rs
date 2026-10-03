@@ -43,7 +43,7 @@ use slopwatch_protocol::{
     ServerHello,
 };
 
-pub use library::{CONFIG_DIR_ENV, Library, LibraryError};
+pub use library::{CONFIG_DIR_ENV, Library, LibraryError, config_dir};
 pub use runs::{Retention, RunError, Runs, RunsConfig, STEP_CAP};
 pub use watching::{RunInfo, Subscription, WatchError, Watching};
 

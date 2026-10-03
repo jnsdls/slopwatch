@@ -135,6 +135,15 @@ impl Harness {
         };
         let (m, p, a) = script("script", None);
         let (solo_m, solo_p, solo_a) = script("solo", Some(1));
+        for manifest in [&m, &solo_m] {
+            store
+                .put_approval(&slopwatch_daemon::approvals::Approval::granting(
+                    manifest,
+                    slopwatch_protocol::Actor::Developer { via: "test".into() },
+                    0,
+                ))
+                .unwrap();
+        }
         let plugins = Plugins::new(env!("CARGO_BIN_EXE_slopwatchd"), Arc::clone(&library))
             .with_plugin(m, p, a)
             .with_plugin(solo_m, solo_p, solo_a);

@@ -40,8 +40,8 @@ const SECRET_UNGRANTED: &str = "error(secret ungranted)";
 /// How a Step errors when the Keychain wouldn't give up a Secret's value.
 const SECRET_UNREADABLE: &str = "error(secret unreadable)";
 
-/// Whether a Step's error is one a shared cause's entry explains.
-pub fn held_by_cause(reason: &str) -> bool {
+/// Whether a Step's error is one a missing Secret's entry explains.
+pub fn held_by_secret(reason: &str) -> bool {
     reason.starts_with(SECRET_MISSING)
 }
 
@@ -526,7 +526,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(denied.reason, "error(secret missing): `A`, `B` aren't set");
         assert_eq!(denied.unset, ["A", "B"]);
-        assert!(held_by_cause(&denied.reason));
+        assert!(held_by_secret(&denied.reason));
         assert!(missing_secret(&denied.reason, "B"));
         assert!(!missing_secret(&denied.reason, "C"));
 

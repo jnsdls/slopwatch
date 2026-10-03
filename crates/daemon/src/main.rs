@@ -93,11 +93,15 @@ async fn serve() -> ExitCode {
     let login_path = tokio::task::spawn_blocking(shell_env::login_shell_path)
         .await
         .unwrap_or_default();
-    // Drafts resolve their Steps the way a Run does.
-    let draft_resolver = Arc::new(Plugins::new(&exe, Arc::clone(&library)));
+    // Third-party Plugins are found before any Run loads its Pipeline,
+    // and their `describe` gets the PATH Steps get.
+    let step_path = shell_env::merge(std::env::var("PATH").ok().as_deref(), login_path.as_deref());
+    let plugins = Plugins::new(exe, Arc::clone(&library))
+        .in_folder(plugins::default_dir(Flavor::CURRENT), step_path)
+        .await;
     let config = RunsConfig {
         data_dir: data_dir.path().to_owned(),
-        plugins: Plugins::new(exe, Arc::clone(&library)),
+        plugins,
         login_path,
         retention: Retention::default(),
         keychain: Arc::new(SecurityCli::new(SecurityCli::default_service(
@@ -117,9 +121,11 @@ async fn serve() -> ExitCode {
         Arc::new(OpenApp),
         LaunchPace::DAEMON,
     ));
+    // Drafts resolve their Steps the way a Run does, third-party Plugins
+    // included.
     let drafts = Drafts::new(
         store,
-        draft_resolver,
+        Arc::clone(runs.plugins()) as _,
         Arc::clone(&library),
         Arc::clone(&runs) as Arc<dyn PipelineSource>,
     );
