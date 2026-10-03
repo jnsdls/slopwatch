@@ -73,6 +73,7 @@ async fn a_matching_hello_is_answered_with_the_daemons_build_id() {
                 "step_logs".into(),
                 "waivers".into(),
                 "inbox".into(),
+                "notifications".into(),
             ],
             build_id: "0123abcd+dirty.feed".into(),
         })
