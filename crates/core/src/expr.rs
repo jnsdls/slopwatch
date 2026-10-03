@@ -116,6 +116,11 @@ pub(crate) trait Env {
 }
 
 impl Expr {
+    /// Reads one Gate term, as a Pipeline file writes it.
+    pub fn parse_gate_term(value: &Value) -> Result<Expr, String> {
+        Expr::parse(value, Context::Gate)
+    }
+
     pub(crate) fn parse(value: &Value, cx: Context) -> Result<Expr, String> {
         match value {
             Value::String(s) => match s.as_str() {

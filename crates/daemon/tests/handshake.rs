@@ -76,6 +76,7 @@ async fn a_matching_hello_is_answered_with_the_daemons_build_id() {
                 "notifications".into(),
                 "secrets".into(),
                 "human_steps".into(),
+                "pipeline_editor".into(),
             ],
             build_id: "0123abcd+dirty.feed".into(),
         })

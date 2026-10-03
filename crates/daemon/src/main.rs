@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use slopwatch_daemon::auth::GhToken;
+use slopwatch_daemon::drafts::{Drafts, PipelineSource};
 use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::api::Api;
 use slopwatch_daemon::notifications::{self, LaunchPace, OpenApp};
@@ -92,6 +93,8 @@ async fn serve() -> ExitCode {
     let login_path = tokio::task::spawn_blocking(shell_env::login_shell_path)
         .await
         .unwrap_or_default();
+    // Drafts resolve their Steps the way a Run does.
+    let draft_resolver = Arc::new(Plugins::new(&exe, Arc::clone(&library)));
     let config = RunsConfig {
         data_dir: data_dir.path().to_owned(),
         plugins: Plugins::new(exe, Arc::clone(&library)),
@@ -101,7 +104,7 @@ async fn serve() -> ExitCode {
             Flavor::CURRENT,
         ))),
     };
-    let runs = match Runs::start(store, github, Arc::clone(&watching), config) {
+    let runs = match Runs::start(store.clone(), github, Arc::clone(&watching), config) {
         Ok(runs) => runs,
         Err(error) => {
             eprintln!("slopwatchd: can't load Runs from {}: {error}", db.display());
@@ -114,7 +117,17 @@ async fn serve() -> ExitCode {
         Arc::new(OpenApp),
         LaunchPace::DAEMON,
     ));
-    let daemon = Arc::new(Daemon::new(watching, library).with_runs(runs));
+    let drafts = Drafts::new(
+        store,
+        draft_resolver,
+        Arc::clone(&library),
+        Arc::clone(&runs) as Arc<dyn PipelineSource>,
+    );
+    let daemon = Arc::new(
+        Daemon::new(watching, library)
+            .with_runs(runs)
+            .with_drafts(Arc::new(drafts)),
+    );
     eprintln!(
         "slopwatchd: build {} listening on {}",
         daemon.build_id(),

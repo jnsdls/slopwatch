@@ -11,6 +11,7 @@ mod frames;
 mod inbox;
 pub mod logs;
 mod notifications;
+pub mod pipeline;
 pub mod runs;
 mod secrets;
 pub mod step;
@@ -81,6 +82,9 @@ pub const DIALECT: u32 = 1;
 ///
 /// `human_steps`: the `answer_step` command and Human Step entries in the
 /// Inbox.
+///
+/// `pipeline_editor`: the `pipeline/<owner>/<name>` topics, and the
+/// `edit_pipeline`, `move_pipeline_node` and `tidy_pipeline` commands.
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -93,6 +97,7 @@ pub const FEATURES: &[&str] = &[
     "notifications",
     "secrets",
     "human_steps",
+    "pipeline_editor",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

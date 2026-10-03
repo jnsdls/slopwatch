@@ -47,6 +47,7 @@ pub(crate) mod journal;
 pub mod log;
 pub mod process;
 mod retention;
+mod source;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;

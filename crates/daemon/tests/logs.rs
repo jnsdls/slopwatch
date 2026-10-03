@@ -166,6 +166,7 @@ impl Client {
                 self.events.push((id, ts, event.clone()));
                 self.runs.entry(id).or_default().apply(seq, event);
             }
+            TopicUpdate::Pipeline { .. } => {}
             TopicUpdate::StepLog { key, records } => {
                 let log = self.logs.entry(key).or_default();
                 for record in records {

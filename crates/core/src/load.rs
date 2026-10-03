@@ -64,6 +64,51 @@ struct StepEntry {
 /// Graph rules are checked only once every Step resolves, and a cycle stops
 /// the checks that need an acyclic graph.
 pub fn load(text: &str, resolver: &dyn Resolver) -> Result<Pipeline, Vec<LoadError>> {
+    let read = read(text, resolver)?;
+    if !read.errors.is_empty() {
+        return Err(read.errors);
+    }
+    let order = validate::graph(&read.steps, &read.gate)?;
+    Ok(Pipeline {
+        steps: read.steps,
+        gate: read.gate,
+        fix_rounds: read.fix_rounds,
+        order,
+    })
+}
+
+/// Every error a Pipeline file has, for the editor to compare before and
+/// after a gesture. Unlike [`load`], it checks the graph rules while the
+/// Gate is empty or a Step doesn't resolve, as a draft often is: a Step
+/// that doesn't resolve takes part as a stand-in with no workspace.
+pub fn check(text: &str, resolver: &dyn Resolver) -> Vec<LoadError> {
+    let read = match read(text, resolver) {
+        Ok(read) => read,
+        Err(errors) => return errors,
+    };
+    let mut errors = read.errors;
+    let mut steps = read.steps;
+    steps.extend(read.stand_ins);
+    if let Err(mut graph) = validate::graph(&steps, &read.gate) {
+        errors.append(&mut graph);
+    }
+    errors
+}
+
+/// A Pipeline file read and resolved, before the graph rules.
+struct Read {
+    steps: BTreeMap<String, Step>,
+    /// A Step for each one that didn't resolve, with its `needs` and
+    /// Condition, so [`check`] can still walk the graph.
+    stand_ins: BTreeMap<String, Step>,
+    gate: Vec<Expr>,
+    fix_rounds: u32,
+    errors: Vec<LoadError>,
+}
+
+/// Reads and resolves a Pipeline file. Fails outright only when the file
+/// can't be read as a Pipeline at all.
+fn read(text: &str, resolver: &dyn Resolver) -> Result<Read, Vec<LoadError>> {
     let file: PipelineFile =
         serde_saphyr::from_str(text).map_err(|e| vec![LoadError::Syntax(e.to_string())])?;
 
@@ -77,12 +122,19 @@ pub fn load(text: &str, resolver: &dyn Resolver) -> Result<Pipeline, Vec<LoadErr
     }
 
     let mut steps = BTreeMap::new();
+    let mut stand_ins = BTreeMap::new();
     for (id, node) in file.steps {
+        let stand_in = stand_in(&id, &node);
         match resolve_step(&id, node, resolver) {
             Ok(step) => {
                 steps.insert(id, step);
             }
-            Err(mut step_errors) => errors.append(&mut step_errors),
+            Err(mut step_errors) => {
+                errors.append(&mut step_errors);
+                if let Some(stand_in) = stand_in {
+                    stand_ins.insert(id, stand_in);
+                }
+            }
         }
     }
 
@@ -102,15 +154,38 @@ pub fn load(text: &str, resolver: &dyn Resolver) -> Result<Pipeline, Vec<LoadErr
             .collect()
     };
 
-    if !errors.is_empty() {
-        return Err(errors);
-    }
-    let order = validate::graph(&steps, &gate)?;
-    Ok(Pipeline {
+    Ok(Read {
         steps,
+        stand_ins,
         gate,
         fix_rounds,
-        order,
+        errors,
+    })
+}
+
+/// What [`check`] walks the graph with for a Step that may not resolve: its
+/// `needs`, and its Condition if that parses. A reserved id gets none, since
+/// it would read as the Gate.
+fn stand_in(id: &str, node: &StepEntry) -> Option<Step> {
+    if RESERVED_IDS.contains(&id) {
+        return None;
+    }
+    let when = node
+        .when
+        .as_ref()
+        .and_then(|when| Expr::parse(when, Context::Condition).ok());
+    Some(Step {
+        id: id.to_owned(),
+        uses: Uses::Plugin(node.uses.clone()),
+        plugin: node.uses.clone(),
+        workspace: Workspace::None,
+        builtin: false,
+        config: Map::new(),
+        timeout: None,
+        stall_after: None,
+        needs: node.needs.clone(),
+        when,
+        default_condition: Step::default_condition_for(&node.needs, Workspace::None),
     })
 }
 
@@ -184,6 +259,21 @@ fn resolve_step(
         when,
         default_condition,
     })
+}
+
+/// The Plugin a Step's `uses:` runs, through its Library Step if it names
+/// one, and what that Plugin's manifest says. `None` when it names nothing
+/// that resolves.
+pub fn resolve_uses(uses: &str, resolver: &dyn Resolver) -> Option<(String, PluginInfo)> {
+    let plugin = match uses.strip_prefix("lib/") {
+        Some(name) if is_library_step_name(name) => {
+            library::parse(&resolver.library_step(name)?).ok()?.uses
+        }
+        Some(_) => return None,
+        None => uses.to_owned(),
+    };
+    let info = resolver.plugin(&plugin)?;
+    Some((plugin, info))
 }
 
 fn load_library_step(

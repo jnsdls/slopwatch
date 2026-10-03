@@ -1,17 +1,21 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use slopwatch_protocol::pipeline::PipelineDraft;
 use slopwatch_protocol::{
     Actor, ClientFrame, Command, ErrorBody, ErrorCode, InboxDelta, InboxUpdate, LogKey, LogRecord,
-    NotificationsDelta, NotificationsUpdate, Reply, Request, RequestId, Response, ResponseBody,
-    RunId, ServerFrame, Topic, TopicUpdate, Waiver, WatchedPrsDelta, WatchedPrsUpdate,
+    NotificationsDelta, NotificationsUpdate, Reply, RepoName, Request, RequestId, Response,
+    ResponseBody, RunId, ServerFrame, Topic, TopicUpdate, Waiver, WatchedPrsDelta,
+    WatchedPrsUpdate,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
+use crate::drafts::{DraftError, Drafts};
 use crate::inbox::InboxSubscription;
 use crate::notifications::NotificationsSubscription;
 use crate::runs::{Journalled, Live, LiveLog, LogError, RunError, Runs, SubscribeError};
@@ -35,6 +39,10 @@ struct Subscriptions {
     logs: HashMap<LogKey, u64>,
     /// Records written to any Step log. Only subscribed logs' get through.
     live_logs: Option<LiveLog>,
+    /// The repos whose draft Pipeline the connection follows.
+    pipelines: HashSet<RepoName>,
+    /// Every draft as it changes. Only subscribed repos' get through.
+    drafts: Option<broadcast::Receiver<Arc<PipelineDraft>>>,
 }
 
 /// What a subscription has next.
@@ -54,6 +62,9 @@ enum Next {
     Log(LogKey, LogRecord),
     /// The subscriber fell behind on Step logs. The files have them.
     LogsLagged,
+    Pipeline(Arc<PipelineDraft>),
+    /// The subscriber fell behind on drafts, so it gets each one afresh.
+    PipelinesLagged,
     Nothing,
 }
 
@@ -116,6 +127,12 @@ impl Daemon {
                                     subs.logs.remove(&key);
                                     if subs.logs.is_empty() {
                                         subs.live_logs = None;
+                                    }
+                                }
+                                Topic::Pipeline(repo) => {
+                                    subs.pipelines.remove(&repo);
+                                    if subs.pipelines.is_empty() {
+                                        subs.drafts = None;
                                     }
                                 }
                             }
@@ -198,6 +215,15 @@ impl Daemon {
                 subs.live_logs.get_or_insert(live);
                 subs.logs.insert(key.clone(), since);
                 Ok(log_frame(subs, key, records).into_iter().collect())
+            }
+            Topic::Pipeline(repo) => {
+                let drafts = self.drafts_or_refuse().map_err(ErrorBody::from)?;
+                // Listen before reading, so no change slips between.
+                let updates = drafts.updates();
+                let draft = drafts.open(&repo).await.map_err(ErrorBody::from)?;
+                subs.drafts.get_or_insert(updates);
+                subs.pipelines.insert(repo);
+                Ok(vec![pipeline_frame(draft)])
             }
         }
     }
@@ -334,6 +360,28 @@ impl Daemon {
                 }
                 frames
             }
+            Next::Pipeline(draft) if subs.pipelines.contains(&draft.repo) => {
+                vec![pipeline_frame(PipelineDraft::clone(&draft))]
+            }
+            Next::Pipeline(_) => Vec::new(),
+            Next::PipelinesLagged => {
+                let Some(drafts) = &self.drafts else {
+                    return Vec::new();
+                };
+                subs.drafts = Some(drafts.updates());
+                let mut frames = Vec::new();
+                for repo in &subs.pipelines {
+                    match drafts.view(repo) {
+                        Ok(draft) => frames.push(pipeline_frame(draft)),
+                        Err(error) => {
+                            eprintln!(
+                                "slopwatchd: can't catch a client up on the draft of {repo}: {error:?}"
+                            );
+                        }
+                    }
+                }
+                frames
+            }
             Next::Nothing => Vec::new(),
         }
     }
@@ -458,6 +506,36 @@ impl Daemon {
                     Err(error) => Err(error),
                 });
             }
+            Command::EditPipeline {
+                repo,
+                edits_seen,
+                edits,
+                positions,
+            } => {
+                return respond(
+                    self.drafts_or_refuse()
+                        .and_then(|drafts| drafts.edit(&repo, edits_seen, &edits, &positions))
+                        .map(|()| Reply::Done),
+                );
+            }
+            Command::MovePipelineNode {
+                repo,
+                node,
+                position,
+            } => {
+                return respond(
+                    self.drafts_or_refuse()
+                        .and_then(|drafts| drafts.move_node(&repo, &node, position))
+                        .map(|()| Reply::Done),
+                );
+            }
+            Command::TidyPipeline { repo } => {
+                return respond(
+                    self.drafts_or_refuse()
+                        .and_then(|drafts| drafts.tidy(&repo))
+                        .map(|()| Reply::Done),
+                );
+            }
             Command::DismissEntry { entry } => {
                 return respond(match self.runs_or_refuse() {
                     Ok(runs) => runs.inbox().dismiss(entry, &actor).map(|()| Reply::Done),
@@ -540,6 +618,19 @@ impl Daemon {
             .as_deref()
             .ok_or_else(|| RunError::Invalid("This daemon doesn't run Pipelines".to_owned()))
     }
+
+    /// The daemon's drafts. Only some tests build a daemon without them.
+    fn drafts_or_refuse(&self) -> Result<&Drafts, DraftError> {
+        self.drafts.as_deref().ok_or_else(|| {
+            DraftError::Refused("This daemon doesn't keep draft Pipelines".to_owned())
+        })
+    }
+}
+
+fn pipeline_frame(draft: PipelineDraft) -> ServerFrame {
+    ServerFrame::Topic(TopicUpdate::Pipeline {
+        draft: Box::new(draft),
+    })
 }
 
 /// The frame for a Run event, if the connection subscribed to the Run and
@@ -618,6 +709,13 @@ fn try_next(subs: &mut Subscriptions) -> Next {
             Err(_) => {}
         }
     }
+    if let Some(drafts) = &mut subs.drafts {
+        match drafts.try_recv() {
+            Ok(draft) => return Next::Pipeline(draft),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => return Next::PipelinesLagged,
+            Err(_) => {}
+        }
+    }
     Next::Nothing
 }
 
@@ -630,6 +728,7 @@ async fn recv(subs: &mut Subscriptions) -> Next {
         notifications,
         live,
         live_logs,
+        drafts,
         ..
     } = subs;
     tokio::select! {
@@ -681,6 +780,16 @@ async fn recv(subs: &mut Subscriptions) -> Next {
         } => match received {
             Ok((key, record)) => Next::Log(key, record),
             Err(broadcast::error::RecvError::Lagged(_)) => Next::LogsLagged,
+            Err(broadcast::error::RecvError::Closed) => Next::Nothing,
+        },
+        received = async {
+            match drafts {
+                Some(drafts) => drafts.recv().await,
+                None => std::future::pending().await,
+            }
+        } => match received {
+            Ok(draft) => Next::Pipeline(draft),
+            Err(broadcast::error::RecvError::Lagged(_)) => Next::PipelinesLagged,
             Err(broadcast::error::RecvError::Closed) => Next::Nothing,
         },
     }
@@ -775,6 +884,18 @@ impl From<LibraryError> for ErrorBody {
 fn command_name(text: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     Some(value.pointer("/command/name")?.as_str()?.to_owned())
+}
+
+impl From<DraftError> for ErrorBody {
+    fn from(error: DraftError) -> Self {
+        let (code, message) = match error {
+            DraftError::NotFound(message) => (ErrorCode::NotFound, message),
+            DraftError::Refused(message) => (ErrorCode::Invalid, message),
+            DraftError::Source(message) => (ErrorCode::GitHub, message),
+            DraftError::Store(error) => (ErrorCode::Internal, format!("Database error: {error}")),
+        };
+        ErrorBody { code, message }
+    }
 }
 
 fn request_id(text: &str) -> Option<RequestId> {

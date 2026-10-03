@@ -1,0 +1,168 @@
+//! The Pipeline editor's draft, as the daemon keeps it and sends it on the
+//! `pipeline/<owner>/<name>` topic (ADR 0007). Edits collect in the draft,
+//! and publishing replays them onto the file.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use slopwatch_core::Edit;
+
+use crate::{GateTerm, RepoName, StepInfo};
+
+/// A repo's draft Pipeline, whole. Each frame on its topic carries all of
+/// it, so there are no deltas to apply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PipelineDraft {
+    pub repo: RepoName,
+    pub base: DraftBase,
+    /// The file as publishing would write it: the base with every edit
+    /// applied.
+    pub text: String,
+    /// The edits since the base, oldest first. Publishing replays these.
+    pub edits: Vec<Edit>,
+    /// The Steps in file order. Steps that don't resolve still show, with
+    /// what they name in `plugin`.
+    pub steps: Vec<DraftStep>,
+    pub gate_terms: Vec<GateTerm>,
+    /// Why the draft wouldn't load as it stands, one reason each. A new
+    /// Pipeline starts with an empty Gate, so it starts with one.
+    pub problems: Vec<String>,
+    /// Where the developer put nodes, by Step id or `gate`. Nodes without
+    /// one are auto-laid-out. Kept by the daemon, never in the repo.
+    pub positions: BTreeMap<String, NodePosition>,
+    /// What the editor can add: the developer's Library Steps and the
+    /// installed Plugins.
+    pub palette: Vec<PaletteItem>,
+}
+
+impl PipelineDraft {
+    pub fn step(&self, id: &str) -> Option<&DraftStep> {
+        self.steps.iter().find(|step| step.info.id == id)
+    }
+}
+
+/// Where a draft started: the Pipeline file on the repo's default branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftBase {
+    pub branch: String,
+    /// The branch's head commit when the draft started.
+    pub commit: String,
+    /// The Pipeline file's blob SHA at that commit. `None` when the branch
+    /// had no Pipeline file, and the draft started empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+}
+
+/// One Step of a draft. `info.condition` holds the Condition the file
+/// wrote, as flow YAML.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftStep {
+    pub info: StepInfo,
+    /// What the file writes in `uses:`.
+    pub uses: String,
+    /// The Step's own `with:` overrides, as the file writes them.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub with: Map<String, Value>,
+    /// The Step is a Merge Step, so it belongs after the Gate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub merge: bool,
+}
+
+/// A node's place on the canvas, in canvas pixels from its top left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Something the editor's palette can add.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaletteItem {
+    /// What the new Step writes in `uses:`: `lib/<name>` or a Plugin name.
+    pub uses: String,
+    /// The Plugin it runs.
+    pub plugin: String,
+    /// It declares `workspace: write`, so it's terminal and goes after the
+    /// Gate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub write: bool,
+    /// It's a Merge Step, which goes after the Gate.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub merge: bool,
+    /// Its Plugin is installed. A Library Step whose Plugin isn't can't be
+    /// added until it is.
+    pub installed: bool,
+    /// The first sentence of a Library Step's leading comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl PaletteItem {
+    /// A Step that must run after the Gate: a Merge Step, or a write Step,
+    /// which is terminal (ADR 0001).
+    pub fn after_gate(&self) -> bool {
+        self.write || self.merge
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Command, Topic};
+    use serde_json::json;
+
+    #[test]
+    fn a_pipeline_topic_names_its_repo() {
+        let topic: Topic = serde_json::from_value(json!("pipeline/jnsdls/slopwatch")).unwrap();
+
+        assert_eq!(topic, Topic::Pipeline(RepoName::new("jnsdls", "slopwatch")));
+        assert_eq!(topic.to_string(), "pipeline/jnsdls/slopwatch");
+        assert!(serde_json::from_value::<Topic>(json!("pipeline/nope")).is_err());
+    }
+
+    #[test]
+    fn editing_commands_carry_core_edits_and_canvas_positions() {
+        let edit = Command::EditPipeline {
+            repo: RepoName::new("o", "r"),
+            edits_seen: 3,
+            edits: vec![Edit::AddStep {
+                id: "lint".into(),
+                step: serde_json::Map::from_iter([("uses".into(), json!("ci"))]),
+            }],
+            positions: BTreeMap::from([("lint".into(), NodePosition { x: 10, y: 20 })]),
+        };
+        let moved = Command::MovePipelineNode {
+            repo: RepoName::new("o", "r"),
+            node: "gate".into(),
+            position: NodePosition { x: 240, y: 30 },
+        };
+
+        assert_eq!(
+            serde_json::to_value(&edit).unwrap(),
+            json!({
+                "name": "edit_pipeline",
+                "repo": "o/r",
+                "edits_seen": 3,
+                "edits": [{ "add_step": { "id": "lint", "step": { "uses": "ci" } } }],
+                "positions": { "lint": { "x": 10, "y": 20 } },
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&moved).unwrap(),
+            json!({
+                "name": "move_pipeline_node",
+                "repo": "o/r",
+                "node": "gate",
+                "position": { "x": 240, "y": 30 },
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(Command::TidyPipeline {
+                repo: RepoName::new("o", "r")
+            })
+            .unwrap(),
+            json!({ "name": "tidy_pipeline", "repo": "o/r" })
+        );
+    }
+}

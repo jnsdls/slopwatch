@@ -211,7 +211,9 @@ impl Client {
             TopicUpdate::Run { id, seq, event, .. } => {
                 self.runs.entry(id).or_default().apply(seq, event);
             }
-            TopicUpdate::StepLog { .. } | TopicUpdate::Notifications { .. } => {}
+            TopicUpdate::StepLog { .. }
+            | TopicUpdate::Notifications { .. }
+            | TopicUpdate::Pipeline { .. } => {}
         }
     }
 
