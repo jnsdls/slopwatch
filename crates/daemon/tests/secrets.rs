@@ -4,6 +4,8 @@
 //! runs over the in-process transport against a fake GitHub and an
 //! in-memory Keychain, with shell script Plugins.
 
+mod support;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,8 +39,11 @@ const ROTATED: &str = "sk-test-70-rotated-9876543210";
 /// `with: { act: ... }`: `pass` passes, `echo` writes the value everywhere
 /// a Step can write and fails, `junk` writes a non-protocol line holding
 /// it, and `wait` waits for the test to write `<run>-<step>.<attempt>`.
+/// The wait gives up once the control dir is gone or after about two
+/// minutes, so no Step outlives its test.
 const SCRIPT: &str = r#"
-at="$1/$SLOPWATCH_RUN-$SLOPWATCH_STEP"
+dir=$1
+at="$dir/$SLOPWATCH_RUN-$SLOPWATCH_STEP"
 read -r start
 act=$(printf '%s' "$start" | sed -n 's/.*"act":"\([a-z]*\)".*/\1/p')
 n=$(( $(cat "$at.attempts" 2>/dev/null || echo 0) + 1 ))
@@ -58,7 +63,11 @@ case $act in
     ;;
   junk) echo "junk says $TEST_SECRET"; sleep 5 ;;
   *)
-    while [ ! -f "$at.$n" ]; do sleep 0.05; done
+    i=0
+    until [ -f "$at.$n" ]; do
+      [ -d "$dir" ] && [ "$i" -lt 2400 ] || exit 1
+      sleep 0.05; i=$((i + 1))
+    done
     outcome pass ;;
 esac
 "#;
@@ -100,6 +109,8 @@ fn manifest(id: &str, secrets: Vec<SecretSpec>) -> Manifest {
 }
 
 struct Harness {
+    /// First, so the Steps die before their control dir goes.
+    _reaper: support::Reaper,
     github: Arc<FakeGitHub>,
     daemon: Arc<Daemon>,
     keychain: Arc<MemoryKeychain>,
@@ -140,6 +151,7 @@ impl Harness {
         let keychain = Arc::new(MemoryKeychain::default());
         let daemon = daemon(&github, &store, &keychain, data.path(), control.path());
         Harness {
+            _reaper: support::Reaper::new(control.path()),
             github,
             daemon,
             keychain,
