@@ -5,14 +5,25 @@
 //! it streams: [`transport::unix`] from the
 //! Unix socket, and [`transport::in_process`] from an in-memory duplex that
 //! carries the same WebSocket frames, for tests.
+//!
+//! [`Watching`] keeps added repos and their PRs in step with GitHub, which
+//! it reaches only through the [`github::GitHub`] trait.
 
+pub mod auth;
 mod connection;
+pub mod github;
+mod pace;
+pub mod store;
 pub mod transport;
+mod watching;
+
+use std::sync::Arc;
 
 use slopwatch_protocol::{
-    Auth, BUILD_ID, ClientFrame, ClientHello, Command, DIALECT, Refusal, RefusalReason, Reply,
-    ServerHello,
+    Auth, BUILD_ID, ClientFrame, ClientHello, DIALECT, Refusal, RefusalReason, ServerHello,
 };
+
+pub use watching::{Subscription, WatchError, Watching};
 
 /// Who is on the other end of a connection, as the transport reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,19 +34,21 @@ pub struct Peer {
 pub struct Daemon {
     build_id: String,
     uid: u32,
+    watching: Arc<Watching>,
 }
 
 impl Daemon {
     /// A daemon stamped with this binary's build id, serving peers that run
     /// as the current user.
-    pub fn new() -> Self {
-        Self::with_build_id(BUILD_ID)
+    pub fn new(watching: Arc<Watching>) -> Self {
+        Self::with_build_id(BUILD_ID, watching)
     }
 
-    pub fn with_build_id(build_id: impl Into<String>) -> Self {
+    pub fn with_build_id(build_id: impl Into<String>, watching: Arc<Watching>) -> Self {
         Self {
             build_id: build_id.into(),
             uid: current_uid(),
+            watching,
         }
     }
 
@@ -47,6 +60,10 @@ impl Daemon {
     /// same uid.
     pub fn uid(&self) -> u32 {
         self.uid
+    }
+
+    pub fn watching(&self) -> &Arc<Watching> {
+        &self.watching
     }
 
     /// Answers a client's first frame. A stranger learns nothing about the
@@ -93,18 +110,6 @@ impl Daemon {
                 message: "This daemon accepts only local auth.".to_owned(),
             }),
         }
-    }
-
-    fn execute(&self, command: Command) -> Reply {
-        match command {
-            Command::Ping => Reply::Pong,
-        }
-    }
-}
-
-impl Default for Daemon {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
