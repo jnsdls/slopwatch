@@ -11,7 +11,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Command, SecretInfo};
 
-use crate::secrets::{SecretsList, granted_line, state_line};
+use crate::secrets::{SecretsList, granted_line, needed, state_line};
 
 pub struct SecretsView {
     list: SecretsList,
@@ -113,7 +113,7 @@ impl SecretsView {
             let name = secret.name.clone();
             let selected = chosen.as_deref() == Some(name.as_str());
             let state = state_line(secret, now);
-            let missing = !secret.is_set() && !secret.granted_to.is_empty();
+            let missing = needed(secret);
             let delete = name.clone();
             rows = rows.child(
                 div()

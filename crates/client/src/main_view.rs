@@ -32,7 +32,7 @@ use crate::run_pane::{
     GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, end_label, gate_tone,
     run_label, run_tone, step_line, step_tone, waiver_line,
 };
-use crate::secrets::missing;
+use crate::secrets::missing_secret;
 use crate::secrets_view::SecretsView;
 use crate::step_log::{self, LogViewer, Row};
 
@@ -677,7 +677,7 @@ impl MainView {
                 }),
             ));
         }
-        if let Some(name) = missing(entry).map(str::to_owned) {
+        if let Some(name) = missing_secret(entry).map(str::to_owned) {
             let id = SharedString::from(format!("{prefix}-set-secret-{}", entry.id));
             buttons = buttons.child(
                 Button::new(id)

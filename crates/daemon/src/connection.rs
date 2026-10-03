@@ -358,7 +358,7 @@ impl Daemon {
                 if let Some(id) = request_id(text) {
                     // serde can quote what it couldn't read, which in a
                     // `set_secret` may be the value.
-                    let message = if text.contains("set_secret") {
+                    let message = if command_name(text).as_deref() == Some("set_secret") {
                         "Malformed set_secret request".to_owned()
                     } else {
                         error.to_string()
@@ -719,7 +719,7 @@ impl From<LogError> for ErrorBody {
 impl From<RunError> for SecretError {
     fn from(error: RunError) -> Self {
         match error {
-            RunError::NotFound(why) | RunError::Invalid(why) => SecretError::BadValue(why),
+            RunError::NotFound(why) | RunError::Invalid(why) => SecretError::Refused(why),
             RunError::Store(error) => SecretError::Store(error),
         }
     }
@@ -728,9 +728,13 @@ impl From<RunError> for SecretError {
 impl From<SecretError> for ErrorBody {
     fn from(error: SecretError) -> Self {
         let code = match &error {
-            SecretError::BadName(_) | SecretError::BadValue(_) => ErrorCode::Invalid,
+            SecretError::BadName(_) | SecretError::BadValue(_) | SecretError::Refused(_) => {
+                ErrorCode::Invalid
+            }
             SecretError::NotFound(_) => ErrorCode::NotFound,
-            SecretError::Keychain(_) | SecretError::Store(_) => ErrorCode::Internal,
+            SecretError::Keychain(_) | SecretError::Internal(_) | SecretError::Store(_) => {
+                ErrorCode::Internal
+            }
         };
         ErrorBody {
             code,
@@ -751,6 +755,12 @@ impl From<LibraryError> for ErrorBody {
             message: error.to_string(),
         }
     }
+}
+
+/// The command a raw request names, read without parsing the rest.
+fn command_name(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(value.pointer("/command/name")?.as_str()?.to_owned())
 }
 
 fn request_id(text: &str) -> Option<RequestId> {

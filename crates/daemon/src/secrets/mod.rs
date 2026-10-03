@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use slopwatch_protocol::step::Manifest;
 use slopwatch_protocol::{SecretInfo, SecretValue, is_secret_name};
 
 use crate::approvals::Approval;
@@ -29,6 +30,34 @@ pub use mask::{MASKED, Mask, StreamMask};
 /// The shortest value the daemon takes. A shorter one would mask common
 /// words out of every log, and no API key is that short.
 pub const MIN_VALUE_CHARS: usize = 8;
+
+/// How a Step whose required Secret isn't set errors. A shared Inbox entry
+/// per Secret holds its PR back.
+const SECRET_MISSING: &str = "error(secret missing)";
+/// How a Step errors when its Plugin's Approval doesn't cover a Secret
+/// its manifest requires, or the manifest names one no Secret can have.
+const SECRET_UNGRANTED: &str = "error(secret ungranted)";
+/// How a Step errors when the Keychain wouldn't give up a Secret's value.
+const SECRET_UNREADABLE: &str = "error(secret unreadable)";
+
+/// Whether a Step's error is one a shared cause's entry explains.
+pub fn held_by_cause(reason: &str) -> bool {
+    reason.starts_with(SECRET_MISSING)
+}
+
+/// Whether a Step's error came from the missing Secret `name`.
+pub fn missing_secret(reason: &str, name: &str) -> bool {
+    reason.starts_with(SECRET_MISSING) && reason.contains(&format!("`{name}`"))
+}
+
+/// Why a Step can't have the Secrets it requires.
+#[derive(Debug)]
+pub struct Denied {
+    /// The Step's error.
+    pub reason: String,
+    /// Required Secrets that aren't set, each a shared cause.
+    pub unset: Vec<String>,
+}
 
 pub struct Secrets {
     keychain: Arc<dyn Keychain>,
@@ -43,7 +72,11 @@ pub enum SecretError {
     /// The value can't be a Secret. The message never quotes it.
     BadValue(String),
     NotFound(String),
+    /// The daemon can't take the command, such as one without Runs.
+    Refused(String),
     Keychain(KeychainError),
+    /// The daemon failed on its side.
+    Internal(String),
     Store(StoreError),
 }
 
@@ -57,6 +90,7 @@ impl fmt::Display for SecretError {
             ),
             SecretError::BadValue(why) => f.write_str(why),
             SecretError::NotFound(name) => write!(f, "No Secret `{name}` is set"),
+            SecretError::Refused(why) | SecretError::Internal(why) => f.write_str(why),
             SecretError::Keychain(error) => error.fmt(f),
             SecretError::Store(error) => write!(f, "Database error: {error}"),
         }
@@ -163,11 +197,89 @@ impl Secrets {
         if set.is_none() {
             return Ok(None);
         }
-        let value = self.keychain.get(name)?;
-        if let Some(value) = &value {
-            self.cache().insert(name.to_owned(), value.clone());
+        let Some(value) = self.keychain.get(name)? else {
+            return Err(KeychainError(format!(
+                "`{name}` is set, but its Keychain item is gone. Set it again."
+            )));
+        };
+        // A set that landed while this read waited on the Keychain wins.
+        Ok(Some(
+            self.cache().entry(name.to_owned()).or_insert(value).clone(),
+        ))
+    }
+
+    /// The Secrets a Step of `plugin` gets as env vars: those its manifest
+    /// names that its Approval covers and that are set. Fails when a
+    /// required one can't be had. May block on the Keychain.
+    pub fn for_step(
+        &self,
+        plugin: &str,
+        manifest: Option<&Manifest>,
+    ) -> Result<Vec<(String, SecretValue)>, Denied> {
+        let wanted = manifest.map_or(&[][..], |manifest| &manifest.secrets[..]);
+        if wanted.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(value)
+        let approval = self
+            .store
+            .approvals()
+            .map_err(|error| Denied {
+                reason: format!("{SECRET_UNREADABLE}: can't read Approvals: {error}"),
+                unset: Vec::new(),
+            })?
+            .into_iter()
+            .find(|approval| approval.plugin == plugin);
+        let (mut handed, mut unset, mut ungranted, mut unreadable) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for spec in wanted {
+            let granted = is_secret_name(&spec.name)
+                && approval
+                    .as_ref()
+                    .is_some_and(|approval| approval.grant.covers_secret(&spec.name));
+            if !granted {
+                if !spec.optional {
+                    ungranted.push(spec.name.clone());
+                }
+                continue;
+            }
+            match self.value(&spec.name) {
+                Ok(Some(value)) => handed.push((spec.name.clone(), value)),
+                Ok(None) if spec.optional => {}
+                Ok(None) => unset.push(spec.name.clone()),
+                Err(error) if spec.optional => eprintln!("slopwatchd: {error}"),
+                Err(error) => unreadable.push(error.to_string()),
+            }
+        }
+        let names = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if !ungranted.is_empty() {
+            return Err(Denied {
+                reason: format!(
+                    "{SECRET_UNGRANTED}: Plugin `{plugin}` has no Approval for {}",
+                    names(&ungranted)
+                ),
+                unset: Vec::new(),
+            });
+        }
+        if !unreadable.is_empty() {
+            return Err(Denied {
+                reason: format!("{SECRET_UNREADABLE}: {}", unreadable.join("; ")),
+                unset: Vec::new(),
+            });
+        }
+        if !unset.is_empty() {
+            let verb = if unset.len() == 1 { "isn't" } else { "aren't" };
+            return Err(Denied {
+                reason: format!("{SECRET_MISSING}: {} {verb} set", names(&unset)),
+                unset,
+            });
+        }
+        Ok(handed)
     }
 
     /// Reads every set value into the cache, so the first Steps after a
@@ -192,10 +304,11 @@ fn check_value(name: &str, value: SecretValue) -> Result<SecretValue, SecretErro
              set"
         )));
     }
-    if trimmed.chars().any(char::is_control) {
+    // `security -w` prints anything but printable ASCII back as hex.
+    if !trimmed.chars().all(|c| c == ' ' || c.is_ascii_graphic()) {
         return Err(SecretError::BadValue(format!(
-            "The value for `{name}` holds a line break or another control character, so it \
-             isn't set"
+            "The value for `{name}` holds a line break, a control character or a character \
+             outside ASCII, so it isn't set"
         )));
     }
     Ok(SecretValue::new(trimmed))
@@ -206,6 +319,7 @@ mod tests {
     use super::*;
     use crate::approvals::Grant;
     use slopwatch_core::Workspace;
+    use slopwatch_protocol::step::SecretSpec;
 
     const VALUE: &str = "sk-live-0123456789";
 
@@ -320,7 +434,12 @@ mod tests {
             secrets.set("lower", SecretValue::new(VALUE), 1),
             Err(SecretError::BadName(_))
         ));
-        for value in ["abc12", "   ", "line1-abcdef\nline2-abcdef"] {
+        for value in [
+            "abc12",
+            "   ",
+            "line1-abcdef\nline2-abcdef",
+            "not-ascii-ü-value",
+        ] {
             let error = secrets.set("KEY", SecretValue::new(value), 1).unwrap_err();
             assert!(matches!(error, SecretError::BadValue(_)));
             if !value.trim().is_empty() {
@@ -344,5 +463,106 @@ mod tests {
             secrets.delete("KEY"),
             Err(SecretError::NotFound(_))
         ));
+    }
+
+    fn manifest(secrets: Vec<SecretSpec>) -> Manifest {
+        Manifest {
+            id: "jev".into(),
+            version: "1".into(),
+            dialect: slopwatch_protocol::step::STEP_DIALECT,
+            features: vec![],
+            config_schema: serde_json::Value::Null,
+            workspace: Workspace::None,
+            effects: vec![],
+            secrets,
+            timeout: None,
+            stall_after: None,
+            concurrency: None,
+        }
+    }
+
+    #[test]
+    fn a_step_gets_the_set_secrets_its_approval_covers_and_no_others() {
+        let (secrets, _) = secrets();
+        secrets
+            .store
+            .put_approval(&approval("jev", &["KEY", "EXTRA"]))
+            .unwrap();
+        secrets.set("KEY", SecretValue::new(VALUE), 1).unwrap();
+        secrets.set("OTHER", SecretValue::new(VALUE), 1).unwrap();
+        let wants = manifest(vec![
+            SecretSpec::required("KEY"),
+            SecretSpec::optional("EXTRA"),
+            SecretSpec::optional("OTHER"),
+        ]);
+
+        let handed = secrets.for_step("jev", Some(&wants)).unwrap();
+        assert_eq!(handed, vec![("KEY".to_owned(), SecretValue::new(VALUE))]);
+
+        let denied = secrets
+            .for_step(
+                "jev",
+                Some(&manifest(vec![SecretSpec::required("MISSING")])),
+            )
+            .unwrap_err();
+        assert_eq!(
+            denied.reason,
+            "error(secret ungranted): Plugin `jev` has no Approval for `MISSING`"
+        );
+        assert!(denied.unset.is_empty());
+
+        secrets
+            .store
+            .put_approval(&approval("jev", &["A", "B", "path"]))
+            .unwrap();
+        let denied = secrets
+            .for_step(
+                "jev",
+                Some(&manifest(vec![
+                    SecretSpec::required("A"),
+                    SecretSpec::required("B"),
+                ])),
+            )
+            .unwrap_err();
+        assert_eq!(denied.reason, "error(secret missing): `A`, `B` aren't set");
+        assert_eq!(denied.unset, ["A", "B"]);
+        assert!(held_by_cause(&denied.reason));
+        assert!(missing_secret(&denied.reason, "B"));
+        assert!(!missing_secret(&denied.reason, "C"));
+
+        let denied = secrets
+            .for_step("jev", Some(&manifest(vec![SecretSpec::required("path")])))
+            .unwrap_err();
+        assert!(
+            denied.reason.starts_with("error(secret ungranted)"),
+            "a name no Secret can have"
+        );
+    }
+
+    #[test]
+    fn a_set_secret_whose_keychain_item_is_gone_is_an_error_not_a_missing_secret() {
+        let keychain = Arc::new(MemoryKeychain::default());
+        let store = Store::in_memory();
+        Secrets::new(Arc::clone(&keychain) as Arc<dyn Keychain>, store.clone())
+            .set("KEY", SecretValue::new(VALUE), 1)
+            .unwrap();
+        keychain.delete("KEY").unwrap();
+        store.put_approval(&approval("jev", &["KEY"])).unwrap();
+        let restarted = Secrets::new(Arc::clone(&keychain) as Arc<dyn Keychain>, store);
+
+        let error = restarted.value("KEY").unwrap_err();
+        assert!(error.to_string().contains("Set it again"), "{error}");
+        let denied = restarted
+            .for_step("jev", Some(&manifest(vec![SecretSpec::required("KEY")])))
+            .unwrap_err();
+        assert!(
+            denied.reason.starts_with("error(secret unreadable)"),
+            "{}",
+            denied.reason
+        );
+        assert!(
+            denied.unset.is_empty(),
+            "no shared entry that setting can't clear"
+        );
     }
 }

@@ -237,17 +237,17 @@ pub enum Command {
     /// Every Secret the daemon knows of: the ones set, and the ones an
     /// Approval covers. Names and dates only, never a value.
     ListSecrets,
-    /// Sets or rotates the Secret named `secret`. The daemon keeps `value` in the
-    /// Keychain and never sends it back, on any command or topic. The next
-    /// Step spawned gets the new value; running Steps keep the old one.
-    /// Setting a Secret that held PRs back clears its Inbox entry and
-    /// starts them again.
+    /// Sets or rotates the Secret named `secret`. The daemon keeps `value`
+    /// in the Keychain and never sends it back, on any command or topic.
+    /// The next Step spawned gets the new value; running Steps keep the
+    /// old one. Setting a Secret that held PRs back clears its Inbox entry
+    /// and starts them again.
     SetSecret {
         secret: String,
         value: SecretValue,
     },
-    /// Removes the Secret named `secret`. A Step that requires it errors from its
-    /// next spawn on.
+    /// Removes the Secret named `secret`. A Step that requires it errors
+    /// from its next spawn on.
     DeleteSecret {
         secret: String,
     },

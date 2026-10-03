@@ -29,10 +29,7 @@ impl SecretsList {
 
     /// How many Secrets a Plugin is granted that aren't set.
     pub fn unset(&self) -> usize {
-        self.secrets
-            .iter()
-            .filter(|secret| !secret.is_set() && !secret.granted_to.is_empty())
-            .count()
+        self.secrets.iter().filter(|secret| needed(secret)).count()
     }
 
     pub fn choose(&mut self, name: &str) {
@@ -57,6 +54,12 @@ impl SecretsList {
             value: SecretValue::new(value),
         })
     }
+}
+
+/// Whether a Plugin is granted `secret` and it isn't set, so Steps that
+/// require it error.
+pub fn needed(secret: &SecretInfo) -> bool {
+    !secret.is_set() && !secret.granted_to.is_empty()
 }
 
 /// A Secret's state, as its row reads: when it was set, or that it isn't.
@@ -91,7 +94,7 @@ pub fn granted_line(secret: &SecretInfo) -> String {
 }
 
 /// The Secret an Inbox entry asks the developer to set, if it does.
-pub fn missing(entry: &InboxEntry) -> Option<&str> {
+pub fn missing_secret(entry: &InboxEntry) -> Option<&str> {
     match &entry.scope {
         Scope::Cause {
             cause: slopwatch_protocol::Cause::MissingSecret { name },
@@ -186,11 +189,11 @@ mod tests {
             raised_at: 0,
             closed: None,
         };
-        assert_eq!(missing(&entry), Some("JEV_API_KEY"));
+        assert_eq!(missing_secret(&entry), Some("JEV_API_KEY"));
         let pr = InboxEntry {
             scope: Scope::Pr,
             ..entry
         };
-        assert_eq!(missing(&pr), None);
+        assert_eq!(missing_secret(&pr), None);
     }
 }

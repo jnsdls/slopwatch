@@ -28,13 +28,13 @@ use slopwatch_protocol::{
 
 const WAIT: Duration = Duration::from_secs(30);
 
-const NAME: &str = "TEST_TOKEN";
+const NAME: &str = "TEST_SECRET";
 const VALUE: &str = "sk-test-70-abcdef0123456789";
 const ROTATED: &str = "sk-test-70-rotated-9876543210";
 
-/// Both Plugins run this. Each attempt writes the `TEST_TOKEN` it got to
-/// `<run>-<step>.token.<attempt>` in the control dir, then acts on
-/// `with: { act: ... }`: `pass` passes, `echo` writes the token everywhere
+/// Both Plugins run this. Each attempt writes the `TEST_SECRET` it got to
+/// `<run>-<step>.secret.<attempt>` in the control dir, then acts on
+/// `with: { act: ... }`: `pass` passes, `echo` writes the value everywhere
 /// a Step can write and fails, `junk` writes a non-protocol line holding
 /// it, and `wait` waits for the test to write `<run>-<step>.<attempt>`.
 const SCRIPT: &str = r#"
@@ -43,20 +43,20 @@ read -r start
 act=$(printf '%s' "$start" | sed -n 's/.*"act":"\([a-z]*\)".*/\1/p')
 n=$(( $(cat "$at.attempts" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$at.attempts"
-printf '%s' "$TEST_TOKEN" > "$at.token.$n"
+printf '%s' "$TEST_SECRET" > "$at.secret.$n"
 outcome() { printf '{"type":"outcome","verdict":"%s"}\n' "$1"; }
 case $act in
   pass) outcome pass ;;
   echo)
-    echo "stderr says $TEST_TOKEN" >&2
-    # A line past the 64 KB record limit, with the token across the cut.
+    echo "stderr says $TEST_SECRET" >&2
+    # A line past the 64 KB record limit, with the value across the cut.
     head -c 65530 /dev/zero | tr '\0' x >&2
-    printf '%s tail\n' "$TEST_TOKEN" >&2
-    printf '{"type":"log","message":"log says %s"}\n' "$TEST_TOKEN"
-    printf '{"type":"progress","message":"progress says %s"}\n' "$TEST_TOKEN"
-    printf '{"type":"outcome","verdict":"fail","outputs":{"note":"note says %s","findings":[{"severity":"error","message":"finding says %s"}]}}\n' "$TEST_TOKEN" "$TEST_TOKEN"
+    printf '%s tail\n' "$TEST_SECRET" >&2
+    printf '{"type":"log","message":"log says %s"}\n' "$TEST_SECRET"
+    printf '{"type":"progress","message":"progress says %s"}\n' "$TEST_SECRET"
+    printf '{"type":"outcome","verdict":"fail","outputs":{"note":"note says %s","findings":[{"severity":"error","message":"finding says %s"}]}}\n' "$TEST_SECRET" "$TEST_SECRET"
     ;;
-  junk) echo "junk says $TEST_TOKEN"; sleep 5 ;;
+  junk) echo "junk says $TEST_SECRET"; sleep 5 ;;
   *)
     while [ ! -f "$at.$n" ]; do sleep 0.05; done
     outcome pass ;;
@@ -67,8 +67,8 @@ fn pipeline(steps: &str, gate: &str) -> String {
     format!("version: 1\nsteps:\n{steps}gate: [{gate}]\n")
 }
 
-/// One Step that needs the token and passes.
-fn needs_token() -> String {
+/// One Step that needs the Secret and passes.
+fn needs_secret() -> String {
     pipeline("  check: { uses: script, with: { act: pass } }\n", "check")
 }
 
@@ -110,7 +110,7 @@ struct Harness {
 
 impl Harness {
     /// My labelled PRs `prs` in `jnsdls/app`, with `pipeline` on main. The
-    /// `script` Plugin requires `TEST_TOKEN`, approved when `approved`;
+    /// `script` Plugin requires `TEST_SECRET`, approved when `approved`;
     /// `plain` asks for no Secret.
     fn new(pipeline: &str, prs: &[u64], approved: bool) -> Self {
         let github = Arc::new(FakeGitHub::new("me"));
@@ -149,9 +149,10 @@ impl Harness {
         }
     }
 
-    /// What attempt `attempt` of `step` in `run` found in `TEST_TOKEN`.
-    fn token(&self, run: RunId, step: &str, attempt: u32) -> String {
-        std::fs::read_to_string(self.control.join(format!("{run}-{step}.token.{attempt}"))).unwrap()
+    /// What attempt `attempt` of `step` in `run` found in `TEST_SECRET`.
+    fn received(&self, run: RunId, step: &str, attempt: u32) -> String {
+        std::fs::read_to_string(self.control.join(format!("{run}-{step}.secret.{attempt}")))
+            .unwrap()
     }
 
     fn release(&self, run: RunId, step: &str, attempt: u32) {
@@ -395,7 +396,7 @@ fn no_value_on_disk(dir: &Path) {
 
 #[tokio::test]
 async fn a_missing_secret_holds_every_pr_in_one_entry_and_setting_it_starts_them_again() {
-    let harness = Harness::new(&needs_token(), &[1, 2], true);
+    let harness = Harness::new(&needs_secret(), &[1, 2], true);
     let mut client = added(&harness).await;
     let (first1, first2) = (client.history(1)[0], client.history(2)[0]);
     client.subscribe(first1).await;
@@ -408,7 +409,7 @@ async fn a_missing_secret_holds_every_pr_in_one_entry_and_setting_it_starts_them
 
     assert_eq!(client.end(first1), Some(EndReason::NotShippable));
     let reason = client.reason(first1, "check").unwrap();
-    assert_eq!(reason, "error(secret missing): `TEST_TOKEN` isn't set");
+    assert_eq!(reason, "error(secret missing): `TEST_SECRET` isn't set");
     assert_eq!(
         client.inbox.count(),
         1,
@@ -422,7 +423,7 @@ async fn a_missing_secret_holds_every_pr_in_one_entry_and_setting_it_starts_them
             cause: Cause::MissingSecret { name: NAME.into() }
         }
     );
-    assert_eq!(entry.title, "Secret `TEST_TOKEN` isn't set");
+    assert_eq!(entry.title, "Secret `TEST_SECRET` isn't set");
     assert_eq!(entry.prs, [pr(1), pr(2)]);
     assert!(!entry.dismissable());
 
@@ -446,7 +447,7 @@ async fn a_missing_secret_holds_every_pr_in_one_entry_and_setting_it_starts_them
         "the same SHA"
     );
     assert!(
-        harness.token(second1, "check", 1) == VALUE,
+        harness.received(second1, "check", 1) == VALUE,
         "the Step got it"
     );
     let closed = client.runs[&first1]
@@ -516,7 +517,7 @@ async fn a_secret_set_while_the_run_goes_on_reruns_the_step_in_place() {
 
 #[tokio::test]
 async fn rotating_takes_effect_at_the_next_spawn_and_the_list_shows_no_value() {
-    let harness = Harness::new(&needs_token(), &[1], true);
+    let harness = Harness::new(&needs_secret(), &[1], true);
     let mut client = Client::connect(&harness.daemon).await;
     client.set(VALUE).await;
     client.ok(Command::AddRepo { repo: repo() }).await;
@@ -525,7 +526,7 @@ async fn rotating_takes_effect_at_the_next_spawn_and_the_list_shows_no_value() {
     client
         .until("the first Run to end", |c| c.end(first).is_some())
         .await;
-    assert!(harness.token(first, "check", 1) == VALUE);
+    assert!(harness.received(first, "check", 1) == VALUE);
 
     client.set(&format!("  {ROTATED}\n")).await;
     let listed = client.secrets().await;
@@ -543,7 +544,7 @@ async fn rotating_takes_effect_at_the_next_spawn_and_the_list_shows_no_value() {
         .until("the second Run to end", |c| c.end(second).is_some())
         .await;
     assert!(
-        harness.token(second, "check", 1) == ROTATED,
+        harness.received(second, "check", 1) == ROTATED,
         "the next spawn got the rotated value, trimmed"
     );
     assert!(client.clean());
@@ -569,7 +570,7 @@ async fn a_steps_log_and_outcome_never_hold_a_value_it_received_even_when_it_ech
         .until("the Run to end", |c| c.end(run).is_some())
         .await;
     assert!(
-        harness.token(run, "echo", 1) == VALUE,
+        harness.received(run, "echo", 1) == VALUE,
         "the Step got the value"
     );
 
@@ -628,7 +629,7 @@ async fn a_steps_log_and_outcome_never_hold_a_value_it_received_even_when_it_ech
 
 #[tokio::test]
 async fn a_secret_the_plugins_approval_doesnt_cover_errors_the_step_without_a_cause() {
-    let harness = Harness::new(&needs_token(), &[1], false);
+    let harness = Harness::new(&needs_secret(), &[1], false);
     let mut client = Client::connect(&harness.daemon).await;
     client.set(VALUE).await;
     client.ok(Command::AddRepo { repo: repo() }).await;
@@ -640,19 +641,19 @@ async fn a_secret_the_plugins_approval_doesnt_cover_errors_the_step_without_a_ca
 
     assert_eq!(
         client.reason(run, "check").as_deref(),
-        Some("error(secret ungranted): Plugin `script` has no Approval for `TEST_TOKEN`")
+        Some("error(secret ungranted): Plugin `script` has no Approval for `TEST_SECRET`")
     );
     assert_eq!(client.inbox.count(), 1);
     assert_eq!(client.inbox.entries[0].scope, Scope::Pr);
     assert!(
-        !std::fs::exists(harness.control.join(format!("{run}-check.token.1"))).unwrap(),
+        !std::fs::exists(harness.control.join(format!("{run}-check.secret.1"))).unwrap(),
         "the Step never spawned"
     );
 }
 
 #[tokio::test]
 async fn set_and_delete_refuse_bad_input_without_echoing_a_value() {
-    let harness = Harness::new(&needs_token(), &[], true);
+    let harness = Harness::new(&needs_secret(), &[], true);
     let mut client = Client::connect(&harness.daemon).await;
 
     let (code, _) = client

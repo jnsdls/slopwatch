@@ -310,7 +310,8 @@ impl<R: Fn(Report)> Session<R> {
                 Some(message) => message,
                 None => {
                     (self.report)(Report::ProtocolError(
-                        "wrote a message that masking a Secret's value out of broke".to_owned(),
+                        "wrote a message that no longer parsed once its Secret values were masked"
+                            .to_owned(),
                     ));
                     return;
                 }

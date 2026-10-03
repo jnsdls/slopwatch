@@ -74,7 +74,7 @@ use crate::github::{GitHub, GitHubError, OpenPr};
 use crate::inbox::Inbox;
 use crate::notifications::Notifications;
 use crate::plugins::Plugins;
-use crate::secrets::{Keychain, Mask, SecretError, Secrets};
+use crate::secrets::{Keychain, Mask, SecretError, Secrets, held_by_cause, missing_secret};
 use crate::shell_env;
 use crate::store::{ActiveRun, NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
 use crate::watching::{RunInfo, Watching};
@@ -400,15 +400,9 @@ impl Runs {
     /// A missing Secret's Inbox entry clears, and the PRs it held start
     /// again.
     pub async fn set_secret(&self, name: String, value: SecretValue) -> Result<(), SecretError> {
-        let secrets = Arc::clone(&self.secrets);
         let set_name = name.clone();
-        tokio::task::spawn_blocking(move || secrets.set(&set_name, value, now()))
-            .await
-            .unwrap_or_else(|_| {
-                Err(SecretError::BadValue(
-                    "Setting the Secret failed inside the daemon".to_owned(),
-                ))
-            })?;
+        self.on_secrets(move |secrets| secrets.set(&set_name, value, now()))
+            .await?;
         let mut engine = self.engine.lock().await;
         if let Err(error) = engine.secret_set(&name) {
             eprintln!("slopwatchd: can't restart what `{name}` held back: {error}");
@@ -421,13 +415,21 @@ impl Runs {
 
     /// Removes a Secret. Steps that require it error from their next spawn.
     pub async fn delete_secret(&self, name: String) -> Result<(), SecretError> {
+        self.on_secrets(move |secrets| secrets.delete(&name)).await
+    }
+
+    /// Runs `work` on the blocking pool, since it waits on the Keychain.
+    async fn on_secrets(
+        &self,
+        work: impl FnOnce(&Secrets) -> Result<(), SecretError> + Send + 'static,
+    ) -> Result<(), SecretError> {
         let secrets = Arc::clone(&self.secrets);
-        tokio::task::spawn_blocking(move || secrets.delete(&name))
+        tokio::task::spawn_blocking(move || work(&secrets))
             .await
-            .unwrap_or_else(|_| {
-                Err(SecretError::BadValue(
-                    "Removing the Secret failed inside the daemon".to_owned(),
-                ))
+            .unwrap_or_else(|error| {
+                Err(SecretError::Internal(format!(
+                    "Secret work failed: {error}"
+                )))
             })
     }
 
@@ -1623,22 +1625,22 @@ impl Engine {
         };
 
         let manifest = self.plugins.manifest(&step.plugin);
-        let handed = match step_secrets(&self.store, &self.secrets, &step.plugin, manifest.as_ref())
-        {
+        let handed = match self.secrets.for_step(&step.plugin, manifest.as_ref()) {
             Ok(handed) => handed,
             Err(denied) => {
                 let pr = pr_ref(&run.repo, run.number);
-                let (id, plugin) = (run.id, step.plugin.clone());
+                let id = run.id;
                 for name in denied.unset {
                     self.inbox.hold(
                         Cause::MissingSecret { name: name.clone() },
                         pr.clone(),
                         Some(id),
                         &format!("Secret `{name}` isn't set"),
-                        vec![format!(
-                            "Plugin `{plugin}` requires it. Setting it starts the PRs it holds \
-                             back again."
-                        )],
+                        vec![
+                            "Steps whose Plugin requires it error until it's set. Setting it \
+                             starts the PRs it holds back again."
+                                .to_owned(),
+                        ],
                     )?;
                 }
                 return self.settle(
@@ -2129,6 +2131,11 @@ impl Engine {
     /// every PR it held starts again: a Run still going reruns the Steps
     /// that missed it, and an ended latest Run gets a same-SHA Run.
     fn secret_set(&mut self, name: &str) -> Result<(), StoreError> {
+        // Until GitHub has answered since the start, no held PR can start
+        // again, so the entry stays and the first sync clears it.
+        if !self.watching.fresh() {
+            return Ok(());
+        }
         let cause = Cause::MissingSecret {
             name: name.to_owned(),
         };
@@ -2480,106 +2487,6 @@ fn not_shippable(run: &Active) -> Option<Vec<String>> {
         all_held = false;
     }
     (!all_held).then_some(reasons)
-}
-
-/// How a Step whose required Secret isn't set errors. A shared Inbox entry
-/// per Secret holds its PR back.
-const SECRET_MISSING: &str = "error(secret missing)";
-/// How a Step errors when its Plugin's Approval doesn't cover a Secret
-/// its manifest requires.
-const SECRET_UNGRANTED: &str = "error(secret ungranted)";
-/// How a Step errors when the Keychain wouldn't give up a Secret's value.
-const SECRET_UNREADABLE: &str = "error(secret unreadable)";
-
-/// Whether a Step's error is one a shared cause's entry explains.
-fn held_by_cause(reason: &str) -> bool {
-    reason.starts_with(SECRET_MISSING)
-}
-
-/// Whether a Step's error came from the missing Secret `name`.
-fn missing_secret(reason: &str, name: &str) -> bool {
-    reason.starts_with(SECRET_MISSING) && reason.contains(&format!("`{name}`"))
-}
-
-/// Why a Step can't have the Secrets it requires.
-struct Denied {
-    /// The Step's error.
-    reason: String,
-    /// Required Secrets that aren't set, each a shared cause.
-    unset: Vec<String>,
-}
-
-/// The Secrets a Step of `plugin` gets as env vars: those its manifest
-/// names that its Approval covers and that are set. Fails when a required
-/// one can't be had.
-fn step_secrets(
-    store: &Store,
-    secrets: &Secrets,
-    plugin: &str,
-    manifest: Option<&Manifest>,
-) -> Result<Vec<(String, SecretValue)>, Denied> {
-    let wanted = manifest.map_or(&[][..], |manifest| &manifest.secrets[..]);
-    if wanted.is_empty() {
-        return Ok(Vec::new());
-    }
-    let approval = store
-        .approvals()
-        .map_err(|error| Denied {
-            reason: format!("{SECRET_UNREADABLE}: can't read Approvals: {error}"),
-            unset: Vec::new(),
-        })?
-        .into_iter()
-        .find(|approval| approval.plugin == plugin);
-    let (mut handed, mut unset, mut ungranted, mut unreadable) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for spec in wanted {
-        let granted = approval
-            .as_ref()
-            .is_some_and(|approval| approval.grant.covers_secret(&spec.name));
-        if !granted {
-            if !spec.optional {
-                ungranted.push(spec.name.clone());
-            }
-            continue;
-        }
-        match secrets.value(&spec.name) {
-            Ok(Some(value)) => handed.push((spec.name.clone(), value)),
-            Ok(None) if spec.optional => {}
-            Ok(None) => unset.push(spec.name.clone()),
-            Err(error) if spec.optional => eprintln!("slopwatchd: {error}"),
-            Err(error) => unreadable.push(error.to_string()),
-        }
-    }
-    let names = |names: &[String]| {
-        names
-            .iter()
-            .map(|name| format!("`{name}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    if !ungranted.is_empty() {
-        return Err(Denied {
-            reason: format!(
-                "{SECRET_UNGRANTED}: Plugin `{plugin}` has no Approval for {}",
-                names(&ungranted)
-            ),
-            unset: Vec::new(),
-        });
-    }
-    if !unreadable.is_empty() {
-        return Err(Denied {
-            reason: format!("{SECRET_UNREADABLE}: {}", unreadable.join("; ")),
-            unset: Vec::new(),
-        });
-    }
-    if !unset.is_empty() {
-        let verb = if unset.len() == 1 { "isn't" } else { "aren't" };
-        return Err(Denied {
-            reason: format!("{SECRET_MISSING}: {} {verb} set", names(&unset)),
-            unset,
-        });
-    }
-    Ok(handed)
 }
 
 const COULDNT_MERGE: &str = "Couldn't merge";

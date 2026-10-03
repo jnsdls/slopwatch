@@ -299,7 +299,7 @@ mod tests {
         let service = format!("slopwatch-test-70-{}", std::process::id());
         let keychain = SecurityCli::new(&service);
         let name = "SLOPWATCH_TEST_70";
-        let value = SecretValue::new("first value with \"quotes\" and \\ ü");
+        let value = SecretValue::new("first value with \"quotes\", \\ and ;|$(x)");
 
         assert_eq!(keychain.get(name).unwrap(), None);
         keychain.set(name, &value).unwrap();

@@ -4,8 +4,8 @@
 //! Plugin's manifest asked for when it was approved. It is the Secret
 //! grant: a Step gets a Secret only when its Plugin's Approval names it.
 //! Built-in Plugins ship approved through the same record, written again
-//! from their manifests each time the daemon starts. Approving a
-//! third-party Plugin comes with its own ticket.
+//! from their manifests each time the daemon starts. Nothing approves a
+//! third-party Plugin yet, so only built-ins and tests have Approvals.
 
 use serde::{Deserialize, Serialize};
 use slopwatch_core::Workspace;

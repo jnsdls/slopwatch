@@ -11,10 +11,16 @@ use slopwatch_protocol::step::FromStep;
 pub const MASKED: &str = "***";
 
 /// The Secret values one Step received, ready to cut out of text.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Mask {
     /// Longest first, so a value that contains another goes whole.
     patterns: Arc<Vec<String>>,
+}
+
+impl std::fmt::Debug for Mask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Mask({} patterns)", self.patterns.len())
+    }
 }
 
 impl Mask {
@@ -138,7 +144,7 @@ impl Mask {
 /// for one record, where a value can straddle two pieces. It holds back
 /// the end of a piece that could be the start of a value until the next
 /// piece, or the end of the line, shows whether it is.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct StreamMask {
     carry: String,
 }
