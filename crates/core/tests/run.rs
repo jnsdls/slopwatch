@@ -316,3 +316,90 @@ gate: [ci]
         Some(&Decision::Start)
     );
 }
+
+#[test]
+fn a_gate_failing_waivable_steps_the_steps_behind_every_failing_term() {
+    let pipeline = load_ok(
+        r#"
+version: 1
+steps:
+  ci:     { uses: ci }
+  desc:   { uses: jev }
+  review: { uses: claude }
+  lint:   { uses: jev }
+  slow:   { uses: jev }
+gate:
+  - ci
+  - desc
+  - or: [review, lint]
+  - slow
+"#,
+    );
+    let run = state(&[
+        ("ci", FAIL),
+        ("desc", PASS),
+        ("review", settled(Verdict::Error)),
+        ("lint", settled(Verdict::Inconclusive)),
+        ("slow", StepState::Running),
+    ]);
+
+    assert_eq!(
+        pipeline.failing_waivable_steps(&run),
+        ["ci", "lint", "review"]
+    );
+}
+
+#[test]
+fn a_gate_override_leaves_passing_terms_waived_steps_and_negations_alone() {
+    let pipeline = load_ok(
+        r#"
+version: 1
+steps:
+  a: { uses: ci }
+  b: { uses: jev }
+  c: { uses: jev }
+  d: { uses: jev }
+gate:
+  - or: [a, b]
+  - c
+  - not: [d]
+"#,
+    );
+    let mut run = state(&[("a", PASS), ("b", FAIL), ("c", FAIL), ("d", PASS)]);
+    run.waived.insert("c".into());
+
+    assert!(
+        pipeline.failing_waivable_steps(&run).is_empty(),
+        "b's term passes, c is waived, and waiving d would fail `not: [d]`"
+    );
+}
+
+#[test]
+fn a_pass_by_waiver_is_told_apart_from_a_pass_on_its_own() {
+    let pipeline =
+        load_ok("version: 1\nsteps:\n  a: { uses: ci }\n  b: { uses: jev }\ngate: [a]\n");
+    let mut run = state(&[("a", FAIL), ("b", FAIL)]);
+    run.waived.insert("a".into());
+    assert!(pipeline.passes_by_waiver(&run));
+
+    let mut advisory = state(&[("a", PASS), ("b", FAIL)]);
+    advisory.waived.insert("b".into());
+    assert!(
+        !pipeline.passes_by_waiver(&advisory),
+        "the Gate passes without the Waiver on an advisory Step"
+    );
+}
+
+#[test]
+fn waiver_categories_have_snake_case_names_and_readable_labels() {
+    use slopwatch_core::WaiverCategory;
+    assert_eq!(
+        serde_json::to_value(WaiverCategory::DoesntApply).unwrap(),
+        "doesnt_apply"
+    );
+    assert_eq!(
+        WaiverCategory::FixInFollowup.to_string(),
+        "fix in follow-up"
+    );
+    assert_eq!(WaiverCategory::ALL.len(), 4);
+}

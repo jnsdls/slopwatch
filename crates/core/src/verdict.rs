@@ -49,6 +49,36 @@ impl fmt::Display for Verdict {
     }
 }
 
+/// Why the developer waived a Verdict. A Waiver always carries one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaiverCategory {
+    FalsePositive,
+    DoesntApply,
+    AcceptedRisk,
+    FixInFollowup,
+}
+
+impl WaiverCategory {
+    pub const ALL: [WaiverCategory; 4] = [
+        WaiverCategory::FalsePositive,
+        WaiverCategory::DoesntApply,
+        WaiverCategory::AcceptedRisk,
+        WaiverCategory::FixInFollowup,
+    ];
+}
+
+impl fmt::Display for WaiverCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            WaiverCategory::FalsePositive => "false positive",
+            WaiverCategory::DoesntApply => "doesn't apply",
+            WaiverCategory::AcceptedRisk => "accepted risk",
+            WaiverCategory::FixInFollowup => "fix in follow-up",
+        })
+    }
+}
+
 /// Where one Step stands within a Run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StepState {

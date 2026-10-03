@@ -31,6 +31,13 @@
 //! Each attempt of a Step writes its own Step log under `logs/`, which
 //! clients follow live and page through ([`log`]). [`Runs::prune`] drops
 //! the detail of old Runs and keeps their record ([`retention`]).
+//! The developer can also waive a Step's settled, non-pass Verdict, or
+//! override the Gate, which waives every Step that makes a Gate term fail.
+//! A Waiver belongs to the head SHA, so every Run on that SHA counts it and
+//! a push leaves it behind. In a Run that's still going the Gate moves at
+//! once. On an ended Run, a new Run starts on the same SHA with the ended
+//! Run's Pipeline, and a waived Step takes its earlier Outcome whatever its
+//! Verdict, so nothing runs again just to be waived.
 //!
 //! One lock serializes the engine: a sync and the reports from Step
 //! processes take turns. Reading a Pipeline from git happens outside it.
@@ -53,7 +60,7 @@ use slopwatch_core::{
 };
 use slopwatch_protocol::step::{FromStep, Manifest, Outcome, Outputs, PrSnapshot, Start, ToStep};
 use slopwatch_protocol::{
-    LogFilter, LogKey, LogPage, LogRecord, RepoName, RunEvent, RunId, StepInfo, StepLogPage,
+    LogFilter, LogKey, LogPage, LogRecord, RepoName, RunEvent, RunId, StepInfo, StepLogPage, Waiver,
 };
 use tokio::sync::mpsc;
 
@@ -300,6 +307,21 @@ impl Runs {
     /// after it.
     pub async fn retry(&self, run: RunId, step: &str) -> Result<(), RunError> {
         self.command(|engine| engine.retry(run, step)).await
+    }
+
+    /// Waives Step `step`'s settled, non-pass Verdict for the Run's head
+    /// SHA.
+    pub async fn waive(&self, run: RunId, step: &str, waiver: Waiver) -> Result<(), RunError> {
+        check_reason(&waiver)?;
+        self.command(|engine| engine.waive(run, Waive::Step(step), &waiver))
+            .await
+    }
+
+    /// Waives every Step that makes one of the Gate's terms fail.
+    pub async fn override_gate(&self, run: RunId, waiver: Waiver) -> Result<(), RunError> {
+        check_reason(&waiver)?;
+        self.command(|engine| engine.waive(run, Waive::Gate, &waiver))
+            .await
     }
 
     /// Carries out a developer's command on a Run, then starts whatever it
@@ -558,6 +580,77 @@ struct Active {
     interrupted: BTreeMap<String, u32>,
 }
 
+/// What a developer's Waiver covers.
+#[derive(Debug, Clone, Copy)]
+enum Waive<'a> {
+    Step(&'a str),
+    /// Every Step behind a failing Gate term.
+    Gate,
+}
+
+fn check_reason(waiver: &Waiver) -> Result<(), RunError> {
+    if waiver.reason.trim().is_empty() {
+        return Err(RunError::Invalid("A Waiver needs a reason".to_owned()));
+    }
+    Ok(())
+}
+
+/// The Steps `what` waives in a Run in `state`, or why it can't.
+fn waivable(
+    pipeline: &Pipeline,
+    state: &RunState,
+    what: Waive<'_>,
+) -> Result<Vec<String>, RunError> {
+    match what {
+        Waive::Step(step) => {
+            if pipeline.step(step).is_none() {
+                return Err(RunError::NotFound(format!("The Run has no Step `{step}`")));
+            }
+            let verdict = match state.steps.get(step) {
+                Some(StepState::Settled(verdict)) => *verdict,
+                Some(StepState::Running) => {
+                    return Err(RunError::Invalid(format!(
+                        "Step `{step}` is still running, and only a settled Verdict can be \
+                         waived. Cancel the Run first to waive it as cancelled."
+                    )));
+                }
+                _ => {
+                    return Err(RunError::Invalid(format!(
+                        "Step `{step}` hasn't settled, and only a settled Verdict can be waived"
+                    )));
+                }
+            };
+            if verdict == Verdict::Pass {
+                return Err(RunError::Invalid(format!(
+                    "Step `{step}` passed, and only a non-pass Verdict can be waived"
+                )));
+            }
+            if state.waived.contains(step) {
+                return Err(RunError::Invalid(format!(
+                    "Step `{step}` is already waived on this head SHA"
+                )));
+            }
+            Ok(vec![step.to_owned()])
+        }
+        Waive::Gate => {
+            if pipeline.gate(state) != GateState::Fail {
+                return Err(RunError::Invalid(
+                    "The Gate isn't failing, so there's nothing to override".to_owned(),
+                ));
+            }
+            let steps = pipeline.failing_waivable_steps(state);
+            if steps.is_empty() {
+                return Err(RunError::Invalid(
+                    "No Waiver can pass the Gate: its failing terms read no settled, non-pass \
+                     Verdict"
+                        .to_owned(),
+                ));
+            }
+            Ok(steps)
+        }
+    }
+}
+
 /// How many restarts in a row may interrupt a Step before it ends
 /// `error(daemon_restart)` instead of starting again, so a Step that
 /// crashes the daemon can't loop it (ADR 0009).
@@ -640,6 +733,9 @@ impl Engine {
                 interrupted: BTreeMap::new(),
                 rerun: HashSet::new(),
             };
+            active.state.waived =
+                self.store
+                    .waived_steps(&active.repo, active.number, &active.head_sha)?;
             for row in stored.steps {
                 active.attempts.insert(row.step.clone(), row.attempt);
                 match row.state {
@@ -706,8 +802,13 @@ impl Engine {
         }
         let ended = EndReason::NotShippable;
         self.store.end_run(run.id, ended, now())?;
-        self.journal
-            .append(run.id, RunEvent::Ended { reason: ended })?;
+        self.journal.append(
+            run.id,
+            RunEvent::Ended {
+                reason: ended,
+                waived: false,
+            },
+        )?;
         let _ = std::fs::remove_dir_all(run_dir(&self.data_dir, run.id));
         Ok(())
     }
@@ -966,8 +1067,30 @@ impl Engine {
                 rerun: HashSet::new(),
             },
         );
+        for (step, waiver) in self.store.waivers(repo, pr.number, &pr.head_sha)? {
+            if self.active[&key].pipeline.step(&step).is_some() {
+                self.record_waiver(&key, &step, waiver)?;
+            }
+        }
         self.publish(repo, pr.number)?;
         self.advance(&key)
+    }
+
+    /// Counts `step`'s Verdict as pass in the Run from now on.
+    fn record_waiver(&mut self, key: &PrKey, step: &str, waiver: Waiver) -> Result<(), StoreError> {
+        let run = self
+            .active
+            .get_mut(key)
+            .expect("only active Runs take Waivers");
+        run.state.waived.insert(step.to_owned());
+        self.journal.append(
+            run.id,
+            RunEvent::StepWaived {
+                step: step.to_owned(),
+                waiver,
+            },
+        )?;
+        Ok(())
     }
 
     /// Settles the Steps that too many restarts in a row interrupted, once
@@ -1280,9 +1403,12 @@ impl Engine {
             return Ok(false);
         };
         let reuse_key = step.reuse_key(&run.head_sha, &version);
+        // A waived Step keeps the Outcome it was waived on, even an error,
+        // so the Waiver doesn't run it again.
+        let waived = run.state.waived.contains(step_id);
         let Some(reused) = self
             .store
-            .reusable_outcome(&run.repo, run.number, &reuse_key, run.id)?
+            .reusable_outcome(&run.repo, run.number, &reuse_key, run.id, waived)?
         else {
             return Ok(false);
         };
@@ -1527,7 +1653,12 @@ impl Engine {
             )?;
         }
         self.store.end_run(run.id, reason, now())?;
-        self.journal.append(run.id, RunEvent::Ended { reason })?;
+        let waived = reason == EndReason::Shippable && run.pipeline.passes_by_waiver(&run.state);
+        if waived {
+            self.store.mark_waived(run.id)?;
+        }
+        self.journal
+            .append(run.id, RunEvent::Ended { reason, waived })?;
         // A cancelled Step's process may take a moment to go, and its
         // directory with it; the Run's own directory goes now.
         let _ = std::fs::remove_dir_all(run_dir(&self.data_dir, run.id));
@@ -1568,6 +1699,99 @@ impl Engine {
             },
         )?;
         Ok(self.advance(&key)?)
+    }
+
+    /// The developer waives `what` in Run `id`. A Run that's still going
+    /// counts the Waivers at once. The PR's latest Run, once ended, gets a
+    /// new Run on the same SHA that counts them.
+    fn waive(&mut self, id: RunId, what: Waive<'_>, waiver: &Waiver) -> Result<(), RunError> {
+        if self.stopped {
+            return Err(RunError::Invalid("The daemon is restarting".to_owned()));
+        }
+        if let Some(key) = self.key_of(id) {
+            let run = &self.active[&key];
+            for step in waivable(&run.pipeline, &run.state, what)? {
+                self.store.add_waiver(id, &step, waiver, now())?;
+                self.record_waiver(&key, &step, waiver.clone())?;
+            }
+            return Ok(self.advance(&key)?);
+        }
+
+        let stored = self
+            .store
+            .run(id)?
+            .ok_or_else(|| RunError::NotFound(format!("No Run {id}")))?;
+        let key = (stored.repo.clone(), stored.number);
+        let latest = self.store.latest_run_id(&stored.repo, stored.number)?;
+        if latest != Some(id) {
+            return Err(RunError::Invalid(format!(
+                "Run {id} has ended and a later Run judges the PR. Waive from the latest Run."
+            )));
+        }
+        if !self.watching.fresh() {
+            return Err(RunError::Invalid(
+                "The daemon hasn't heard from GitHub since it started. Try again after the \
+                 next poll."
+                    .to_owned(),
+            ));
+        }
+        let pr = self
+            .watching
+            .prs()
+            .into_iter()
+            .find(|(repo, pr)| (repo, pr.number) == (&stored.repo, stored.number))
+            .map(|(_, pr)| pr)
+            .filter(|pr| pr.labeled)
+            .ok_or_else(|| {
+                RunError::Invalid(format!(
+                    "{}#{} isn't a Watched PR any more",
+                    stored.repo, stored.number
+                ))
+            })?;
+        if pr.head_sha != stored.head_sha {
+            return Err(RunError::Invalid(format!(
+                "The PR's head moved on from {}, and a Waiver covers only the SHA it's made on",
+                stored.head_sha
+            )));
+        }
+        if let Some(blocked) = self.blocked.get(&key) {
+            return Err(RunError::Invalid(blocked.message.clone()));
+        }
+        let pipeline = load(&stored.pipeline, &self.plugins).map_err(|errors| {
+            RunError::Invalid(format!(
+                "Run {id}'s Pipeline no longer loads: {}",
+                join(&errors)
+            ))
+        })?;
+        let state = RunState {
+            steps: stored
+                .steps
+                .iter()
+                .filter_map(|row| match row.state {
+                    StepRowState::Settled { verdict, .. } => {
+                        Some((row.step.clone(), StepState::Settled(verdict)))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            waived: self
+                .store
+                .waived_steps(&stored.repo, stored.number, &stored.head_sha)?,
+            ..RunState::default()
+        };
+        for step in waivable(&pipeline, &state, what)? {
+            self.store.add_waiver(id, &step, waiver, now())?;
+        }
+        // The ended Run's Pipeline, so the same Steps settle the same way.
+        // If the base has a newer one, the next sync compares it as usual.
+        let inputs = Inputs {
+            pipeline: PipelineAt {
+                sha: stored.base_sha,
+                text: Some(stored.pipeline),
+            },
+            files: stored.files,
+        };
+        Ok(self.try_start_run(&stored.repo, &pr, StartWhen::Always, Ok(inputs))?)
     }
 
     /// The Run's key, if the Run is still going.

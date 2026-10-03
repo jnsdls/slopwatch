@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use slopwatch_protocol::{
-    ClientFrame, Command, ErrorBody, ErrorCode, LogKey, LogRecord, Reply, Request, RequestId,
-    Response, ResponseBody, RunId, ServerFrame, Topic, TopicUpdate, WatchedPrsDelta,
-    WatchedPrsUpdate,
+    Actor, ClientFrame, Command, ErrorBody, ErrorCode, LogKey, LogRecord, Reply, Request,
+    RequestId, Response, ResponseBody, RunId, ServerFrame, Topic, TopicUpdate, Waiver,
+    WatchedPrsDelta, WatchedPrsUpdate,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
@@ -74,7 +74,7 @@ impl Daemon {
             tokio::select! {
                 text = next_text(&mut ws) => {
                     let Some(text) = text? else { return Ok(()) };
-                    let Some((id, command)) = self.parse(&text, &mut ws).await? else {
+                    let Some((id, actor, command)) = self.parse(&text, &mut ws).await? else {
                         continue;
                     };
                     let result = match command {
@@ -108,7 +108,7 @@ impl Daemon {
                             }
                             ResponseBody::Ok(Reply::Done)
                         }
-                        command => self.execute(command).await,
+                        command => self.execute(command, actor).await,
                     };
                     // A command's updates reach the client before its
                     // response, so a client that waits for the response
@@ -275,16 +275,14 @@ impl Daemon {
         &self,
         text: &str,
         ws: &mut WebSocketStream<S>,
-    ) -> Result<Option<(RequestId, Command)>, Error>
+    ) -> Result<Option<(RequestId, Actor, Command)>, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
         match serde_json::from_str::<ClientFrame>(text) {
-            Ok(ClientFrame::Request(Request {
-                id,
-                actor: _,
-                command,
-            })) => Ok(Some((id, command))),
+            Ok(ClientFrame::Request(Request { id, actor, command })) => {
+                Ok(Some((id, actor, command)))
+            }
             // A connection says hello once. A second one has no id to answer.
             Ok(ClientFrame::Hello(_)) => Ok(None),
             Err(error) => {
@@ -300,7 +298,7 @@ impl Daemon {
         }
     }
 
-    async fn execute(&self, command: Command) -> ResponseBody {
+    async fn execute(&self, command: Command, actor: Actor) -> ResponseBody {
         let watching = &self.watching;
         let changes_prs = matches!(
             command,
@@ -362,6 +360,37 @@ impl Daemon {
                     });
                 };
                 return respond(runs.read_log(key, page, filter).await.map(Reply::StepLog));
+            }
+            Command::WaiveStep {
+                run,
+                step,
+                category,
+                reason,
+            } => {
+                let waiver = Waiver {
+                    category,
+                    reason,
+                    actor,
+                };
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs.waive(run, &step, waiver).await.map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
+            Command::OverrideGate {
+                run,
+                category,
+                reason,
+            } => {
+                let waiver = Waiver {
+                    category,
+                    reason,
+                    actor,
+                };
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs.override_gate(run, waiver).await.map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
             }
         };
         if changes_prs {

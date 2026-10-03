@@ -7,10 +7,10 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use slopwatch_core::{EndReason, GateState, Verdict};
+use slopwatch_core::{EndReason, GateState, Verdict, WaiverCategory};
 
-use crate::RepoName;
 use crate::step::{Effect, EffectResult, Outputs};
+use crate::{Actor, RepoName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -74,6 +74,12 @@ pub enum RunEvent {
         #[serde(default)]
         dependents: Vec<String>,
     },
+    /// A Waiver covers `step` in this Run: the developer waived it here,
+    /// or earlier on the same head SHA. The Gate counts its Verdict as pass.
+    StepWaived {
+        step: String,
+        waiver: Waiver,
+    },
     Gate {
         state: GateState,
     },
@@ -87,6 +93,10 @@ pub enum RunEvent {
     },
     Ended {
         reason: EndReason,
+        /// The Gate passed only because of Waivers: the Run reads
+        /// "shippable (waived)".
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        waived: bool,
     },
     /// The Run's detail is gone: its Step logs, and every journal event
     /// except the ones that rebuild its record. Always the last event.
@@ -98,6 +108,15 @@ pub enum RunEvent {
 
 fn first_attempt() -> u32 {
     1
+}
+
+/// The developer's ruling that one Step's settled, non-pass Verdict counts
+/// as pass for one head SHA.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiver {
+    pub category: WaiverCategory,
+    pub reason: String,
+    pub actor: Actor,
 }
 
 /// A Step as the Run lists it.
@@ -126,6 +145,8 @@ pub struct RunView {
     pub end: Option<EndReason>,
     /// When the Run's detail was pruned, in seconds since the Unix epoch.
     pub pruned_at: Option<i64>,
+    /// The Run ended shippable only because of Waivers.
+    pub waived: bool,
     /// Every Effect the Run's Steps requested, in the order they finished.
     pub effects: Vec<EffectView>,
 }
@@ -145,6 +166,8 @@ pub struct StepView {
     pub attempt: u32,
     /// The latest `progress` line of the running attempt.
     pub progress: Option<String>,
+    /// The Waiver that counts the Step's Verdict as pass, if any.
+    pub waiver: Option<Waiver>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,6 +212,7 @@ impl RunView {
                         status: StepStatus::Pending,
                         attempt: 0,
                         progress: None,
+                        waiver: None,
                     })
                     .collect();
                 self.gate_text = gate;
@@ -229,6 +253,11 @@ impl RunView {
                     }
                 }
             }
+            RunEvent::StepWaived { step, waiver } => {
+                if let Some(view) = self.step_mut(&step) {
+                    view.waiver = Some(waiver);
+                }
+            }
             RunEvent::Gate { state } => self.gate = Some(state),
             RunEvent::Effect {
                 step,
@@ -239,8 +268,11 @@ impl RunView {
                 effect,
                 result,
             }),
-            RunEvent::Ended { reason } => self.end = Some(reason),
             RunEvent::Pruned { at } => self.pruned_at = Some(at),
+            RunEvent::Ended { reason, waived } => {
+                self.end = Some(reason);
+                self.waived = waived;
+            }
         }
     }
 
@@ -261,6 +293,9 @@ pub struct RunSummary {
     pub gate: GateState,
     /// `None` while the Run is going.
     pub end: Option<EndReason>,
+    /// It ended shippable only because of Waivers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waived: bool,
 }
 
 #[cfg(test)]
@@ -320,6 +355,7 @@ mod tests {
             5,
             RunEvent::Ended {
                 reason: EndReason::Shippable,
+                waived: false,
             },
         );
 
@@ -370,6 +406,54 @@ mod tests {
     }
 
     #[test]
+    fn a_waiver_marks_its_step_and_a_waived_pass_marks_the_run() {
+        let mut view = RunView::default();
+        view.apply(1, started());
+        let waiver = Waiver {
+            category: WaiverCategory::FalsePositive,
+            reason: "the check is flaky".into(),
+            actor: Actor::Developer { via: "gui".into() },
+        };
+        let event = RunEvent::StepWaived {
+            step: "ci".into(),
+            waiver: waiver.clone(),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            json!({
+                "kind": "step_waived",
+                "step": "ci",
+                "waiver": {
+                    "category": "false_positive",
+                    "reason": "the check is flaky",
+                    "actor": { "kind": "developer", "via": "gui" },
+                },
+            })
+        );
+
+        view.apply(2, event);
+        view.apply(
+            3,
+            serde_json::from_value(json!({
+                "kind": "ended", "reason": "shippable", "waived": true,
+            }))
+            .unwrap(),
+        );
+
+        assert_eq!(view.step("ci").unwrap().waiver, Some(waiver));
+        assert!(view.waived);
+        let older: RunEvent =
+            serde_json::from_value(json!({ "kind": "ended", "reason": "shippable" })).unwrap();
+        assert_eq!(
+            older,
+            RunEvent::Ended {
+                reason: EndReason::Shippable,
+                waived: false,
+            }
+        );
+    }
+
+    #[test]
     fn an_event_the_view_already_has_is_dropped() {
         let mut view = RunView::default();
         view.apply(1, started());
@@ -408,6 +492,7 @@ mod tests {
     fn events_name_their_kind_on_the_wire() {
         let event = RunEvent::Ended {
             reason: EndReason::NotShippable,
+            waived: false,
         };
 
         assert_eq!(
