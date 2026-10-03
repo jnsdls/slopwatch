@@ -1,6 +1,7 @@
 //! The main window: the sources pane, then either the Watched PR list or
 //! the Inbox, each with the PR pane, or the Library editor, or the Secrets
-//! list, or the link state while the daemon isn't reachable.
+//! list, or a repo's Pipeline editor, or the link state while the daemon
+//! isn't reachable.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use crate::link_view::LinkView;
 use crate::notifications::{
     NotificationCenter, Permission, Poster, SystemCenter, notice, settings_url,
 };
+use crate::pipeline_editor_view::PipelineEditorView;
 use crate::prs::{Prs, Source, poll_line, status_line, storage_line};
 use crate::run_graph_view::{run_graph, tone_color};
 use crate::run_pane::{
@@ -45,6 +47,8 @@ enum Pane {
     Inbox,
     Library,
     Secrets,
+    /// The Pipeline editor, on the repo it has open.
+    Pipeline,
 }
 
 pub struct MainView {
@@ -59,6 +63,7 @@ pub struct MainView {
     pending_reveal: Option<PrRef>,
     library: Entity<LibraryView>,
     secrets: Entity<SecretsView>,
+    pipeline: Entity<PipelineEditorView>,
     run_pane: RunPane,
     /// Repos the developer can add, while the picker is open.
     picker: Option<Vec<RepoName>>,
@@ -132,6 +137,7 @@ impl MainView {
             pending_reveal: None,
             library: cx.new(|cx| LibraryView::new(commands.clone(), window, cx)),
             secrets: cx.new(|cx| SecretsView::new(commands.clone(), window, cx)),
+            pipeline: cx.new(|cx| PipelineEditorView::new(commands.clone(), window, cx)),
             run_pane: RunPane::default(),
             picker: None,
             error: None,
@@ -156,6 +162,7 @@ impl MainView {
                     for command in self.run_pane.reconnected() {
                         self.send(command);
                     }
+                    self.pipeline.read(cx).reconnected();
                 }
                 self.link = state.clone();
                 self.link_view
@@ -175,6 +182,10 @@ impl MainView {
                     // Posting may have asked for permission.
                     center.refresh();
                 }
+            }
+            LinkEvent::Topic(TopicUpdate::Pipeline { draft }) => {
+                self.pipeline
+                    .update(cx, |editor, cx| editor.apply(*draft, cx));
             }
             LinkEvent::Topic(update @ (TopicUpdate::Run { .. } | TopicUpdate::StepLog { .. })) => {
                 for command in self.run_pane.apply(update) {
@@ -216,6 +227,12 @@ impl MainView {
                     self.run_pane.log_page(page);
                 }
                 ResponseBody::Ok(_) => self.error = None,
+                // While the editor is open, its gestures are what get
+                // refused, and it shows why next to the canvas.
+                ResponseBody::Error(error) if self.pane == Pane::Pipeline => {
+                    self.pipeline
+                        .update(cx, |editor, cx| editor.refused(error.message, cx));
+                }
                 ResponseBody::Error(error) => self.error = Some(error.message),
             },
         }
@@ -400,6 +417,25 @@ impl MainView {
                     cx.notify();
                 })),
             );
+            if selected {
+                let chosen = repo.clone();
+                pane = pane.child(
+                    entry(
+                        format!("source-{repo}-pipeline").into(),
+                        "    Pipeline".to_owned(),
+                        None,
+                        false,
+                    )
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            this.pane = Pane::Pipeline;
+                            this.pipeline
+                                .update(cx, |editor, cx| editor.open(&chosen, cx));
+                            cx.notify();
+                        },
+                    )),
+                );
+            }
         }
 
         let warning = self.prs.storage().map(|warning| {
@@ -1475,6 +1511,54 @@ impl MainView {
             .child(lines)
     }
 
+    /// The editor and Graph mode need the width, so they fold the sources
+    /// column away.
+    fn sources_shown(&self) -> bool {
+        match self.pane {
+            Pane::Library | Pane::Secrets => true,
+            Pane::Pipeline => false,
+            Pane::Prs | Pane::Inbox => !self.run_pane.graph_shown(),
+        }
+    }
+
+    /// The Pipeline editor, under a bar that leads back to the repo's PRs.
+    fn pipeline_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let repo = self.pipeline.read(cx).repo().cloned();
+        let title = repo
+            .as_ref()
+            .map_or_else(String::new, |repo| format!("Pipeline · {repo}"));
+        div()
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        Button::new("pipeline-back")
+                            .label("‹ PRs")
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                let source = repo.clone().map_or(Source::All, Source::Repo);
+                                this.show_prs(source);
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().text_sm().font_weight(FontWeight::BOLD).child(title)),
+            )
+            .child(div().flex_1().min_h_0().flex().child(self.pipeline.clone()))
+    }
+
     fn footer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let theme = cx.theme();
         let (text, color) = match (&self.error, poll_line(self.prs.poll())) {
@@ -1514,15 +1598,13 @@ impl Render for MainView {
                     .flex_1()
                     .flex()
                     .overflow_hidden()
-                    .when(
-                        !(self.pane != Pane::Library && self.run_pane.graph_shown()),
-                        |this| this.child(self.sources(cx)),
-                    )
+                    .when(self.sources_shown(), |this| this.child(self.sources(cx)))
                     .map(|this| match self.pane {
                         Pane::Prs => this.child(self.pr_list(cx)).child(self.pr_pane(cx)),
                         Pane::Inbox => this.child(self.inbox_list(cx)).child(self.pr_pane(cx)),
                         Pane::Library => this.child(self.library.clone()),
                         Pane::Secrets => this.child(self.secrets.clone()),
+                        Pane::Pipeline => this.child(self.pipeline_pane(cx)),
                     }),
             )
             .children(self.footer(cx))

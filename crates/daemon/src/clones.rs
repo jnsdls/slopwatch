@@ -102,6 +102,42 @@ impl Clones {
         Ok(PipelineAt { sha, text })
     }
 
+    /// The repo's default branch, the Pipeline file at its tip, and that
+    /// file's blob SHA.
+    pub async fn default_pipeline(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+    ) -> Result<(String, PipelineAt, Option<String>), GitError> {
+        let path = {
+            let _turn = self.turn(repo).await;
+            self.cloned(repo, remote).await?
+        };
+        let head = git(
+            &path,
+            remote,
+            &["ls-remote", "--symref", &remote.url, "HEAD"],
+        )
+        .await?;
+        let branch = head
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("ref: refs/heads/")?
+                    .strip_suffix("\tHEAD")
+            })
+            .ok_or_else(|| GitError(format!("{repo} has no default branch")))?
+            .to_owned();
+        let at = self.pipeline_at(repo, remote, &branch).await?;
+        let blob = match at.text {
+            Some(_) => {
+                let file = format!("{}:{PIPELINE_PATH}", at.sha);
+                Some(git(&path, remote, &["rev-parse", &file]).await?)
+            }
+            None => None,
+        };
+        Ok((branch, at, blob))
+    }
+
     /// The paths PR `number` changes at `head_sha`, against where it
     /// branched from `base_sha`, the way GitHub lists a PR's files. A
     /// rename lists both paths. Fetches the PR's head first; listing names
@@ -276,6 +312,27 @@ mod tests {
 
         assert_eq!(read.sha, sha);
         assert_eq!(read.text.as_deref(), Some(changed));
+    }
+
+    #[tokio::test]
+    async fn reads_the_pipeline_on_the_default_branch_with_its_blob() {
+        let github = FakeGitHub::new("me");
+        github.add_repo(&repo());
+        let remote = github.git_remote(&repo()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let clones = Clones::new(dir.path());
+
+        let (branch, at, blob) = clones.default_pipeline(&repo(), &remote).await.unwrap();
+        assert_eq!(branch, "main");
+        assert_eq!((at.text, blob), (None, None));
+
+        let sha = github.add_pipeline(&repo(), "main");
+        let (_, at, blob) = clones.default_pipeline(&repo(), &remote).await.unwrap();
+        assert_eq!(at.sha, sha);
+        assert_eq!(at.text.as_deref(), Some(CI_PIPELINE));
+        let blob = blob.unwrap();
+        assert_eq!(blob.len(), 40, "a blob SHA: {blob}");
+        assert_ne!(blob, sha);
     }
 
     #[tokio::test]

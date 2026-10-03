@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use crate::inbox::InboxUpdate;
 use crate::logs::{LogKey, LogRecord, StorageWarning};
 use crate::notifications::NotificationsUpdate;
+use crate::pipeline::PipelineDraft;
 use crate::runs::{RunEvent, RunId, RunSummary};
 
 /// A topic, by its name on the wire: `watched_prs`, `inbox`,
-/// `notifications`, `run/<id>` or `log/<run>/<step>/<attempt>`.
+/// `notifications`, `run/<id>`, `log/<run>/<step>/<attempt>` or
+/// `pipeline/<owner>/<name>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Topic {
@@ -27,6 +29,8 @@ pub enum Topic {
     Run(RunId),
     /// One attempt's Step log, as it's written.
     StepLog(LogKey),
+    /// A repo's draft Pipeline: `pipeline/<owner>/<name>`.
+    Pipeline(RepoName),
 }
 
 impl fmt::Display for Topic {
@@ -37,6 +41,7 @@ impl fmt::Display for Topic {
             Topic::Notifications => f.write_str("notifications"),
             Topic::Run(id) => write!(f, "run/{id}"),
             Topic::StepLog(key) => write!(f, "log/{key}"),
+            Topic::Pipeline(repo) => write!(f, "pipeline/{repo}"),
         }
     }
 }
@@ -53,6 +58,9 @@ impl TryFrom<String> for Topic {
         }
         if let Some(key) = text.strip_prefix("log/").and_then(LogKey::parse) {
             return Ok(Topic::StepLog(key));
+        }
+        if let Some(repo) = text.strip_prefix("pipeline/") {
+            return repo.parse().map(Topic::Pipeline);
         }
         text.strip_prefix("run/")
             .and_then(|id| id.parse().ok())
@@ -103,6 +111,8 @@ pub enum TopicUpdate {
         key: LogKey,
         records: Vec<LogRecord>,
     },
+    /// A repo's whole draft Pipeline, on subscribing and after each change.
+    Pipeline { draft: Box<PipelineDraft> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

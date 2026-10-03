@@ -82,18 +82,18 @@ pub fn run_graph(
 }
 
 #[derive(Clone, Copy)]
-struct Colors {
+pub(crate) struct Colors {
     good: Hsla,
     bad: Hsla,
     neutral: Hsla,
     running: Hsla,
-    edge: Hsla,
+    pub(crate) edge: Hsla,
     /// The Gate's edges and its any-of groups.
-    gate: Hsla,
+    pub(crate) gate: Hsla,
 }
 
 impl Colors {
-    fn new(theme: &Theme) -> Self {
+    pub(crate) fn new(theme: &Theme) -> Self {
         Colors {
             good: tone_color(theme, Tone::Good),
             bad: tone_color(theme, Tone::Bad),
@@ -127,48 +127,60 @@ fn edges(layout: &Layout, colors: Colors) -> Canvas<()> {
     canvas(
         |_, _, _| (),
         move |bounds, (), window, _| {
-            let at = |x: f32, y: f32| bounds.origin + point(px(x), px(y));
             for edge in &edges {
-                let (start, end) = (edge.start, edge.end);
                 let (color, dashed) = match edge.kind {
                     EdgeKind::Needs => (colors.edge, false),
                     EdgeKind::GateReads => (colors.gate, true),
                 };
-                // Stop the line at the arrowhead's base.
-                let tip = end.x - 1.;
-                let base = tip - 7.;
-                let pull = ((base - start.x) / 2.).max(16.);
-                let mut line = PathBuilder::stroke(px(1.5));
-                if dashed {
-                    line = line.dash_array(&[px(4.), px(3.)]);
-                }
-                line.move_to(at(start.x, start.y));
-                line.cubic_bezier_to(
-                    at(base, end.y),
-                    at(start.x + pull, start.y),
-                    at(base - pull, end.y),
-                );
-                if let Ok(path) = line.build() {
-                    window.paint_path(path, color);
-                }
-                let mut head = PathBuilder::fill();
-                head.move_to(at(tip, end.y));
-                head.line_to(at(base, end.y - 4.));
-                head.line_to(at(base, end.y + 4.));
-                head.close();
-                if let Ok(path) = head.build() {
-                    window.paint_path(path, color);
-                }
+                paint_edge(window, bounds.origin, edge.start, edge.end, color, dashed);
             }
         },
     )
 }
 
-fn dot(color: Hsla) -> Div {
+/// Paints one edge as a curve from `start` to an arrowhead at `end`, both
+/// relative to `origin`.
+pub(crate) fn paint_edge(
+    window: &mut Window,
+    origin: gpui_kit::Point<Pixels>,
+    start: run_graph::Point,
+    end: run_graph::Point,
+    color: Hsla,
+    dashed: bool,
+) {
+    let at = |x: f32, y: f32| origin + point(px(x), px(y));
+    // Stop the line at the arrowhead's base.
+    let tip = end.x - 1.;
+    let base = tip - 7.;
+    let pull = ((base - start.x).abs() / 2.).max(16.);
+    let mut line = PathBuilder::stroke(px(1.5));
+    if dashed {
+        line = line.dash_array(&[px(4.), px(3.)]);
+    }
+    line.move_to(at(start.x, start.y));
+    line.cubic_bezier_to(
+        at(base, end.y),
+        at(start.x + pull, start.y),
+        at(base - pull, end.y),
+    );
+    if let Ok(path) = line.build() {
+        window.paint_path(path, color);
+    }
+    let mut head = PathBuilder::fill();
+    head.move_to(at(tip, end.y));
+    head.line_to(at(base, end.y - 4.));
+    head.line_to(at(base, end.y + 4.));
+    head.close();
+    if let Ok(path) = head.build() {
+        window.paint_path(path, color);
+    }
+}
+
+pub(crate) fn dot(color: Hsla) -> Div {
     div().flex_none().size(px(8.)).rounded_full().bg(color)
 }
 
-fn chip(text: impl Into<SharedString>, color: Hsla, theme: &Theme) -> Div {
+pub(crate) fn chip(text: impl Into<SharedString>, color: Hsla, theme: &Theme) -> Div {
     // Chips shrink and truncate, so a long Condition leaves room for the
     // chips after it.
     div()

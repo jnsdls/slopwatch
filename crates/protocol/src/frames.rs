@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
-use slopwatch_core::WaiverCategory;
+use slopwatch_core::{Edit, WaiverCategory};
 
 use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
+use crate::pipeline::NodePosition;
 use crate::{
     Answer, EntryId, Notification, RepoName, RunId, SecretInfo, SecretValue, Topic, TopicUpdate,
 };
@@ -263,6 +266,35 @@ pub enum Command {
         answer: Answer,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
+    },
+    /// Applies `edits` to the repo's draft Pipeline, all or none. The
+    /// daemon refuses edits that would give the Pipeline an error it
+    /// doesn't have yet, such as a cycle or the Gate reading a write Step,
+    /// and says why. An empty Gate doesn't count.
+    ///
+    /// `edits_seen` is how many edits the draft held when the client made
+    /// these, since an edit such as removing Gate term 2 means something
+    /// else on a draft that changed since. The daemon refuses edits made on
+    /// an older draft. `positions` places nodes the edits add, such as a
+    /// Step dropped on the canvas, along with them.
+    EditPipeline {
+        repo: RepoName,
+        edits_seen: usize,
+        edits: Vec<Edit>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        positions: BTreeMap<String, NodePosition>,
+    },
+    /// Keeps a node of the repo's Pipeline where the developer dropped it.
+    /// `node` is a Step id or `gate`.
+    MovePipelineNode {
+        repo: RepoName,
+        node: String,
+        position: NodePosition,
+    },
+    /// Forgets every node position of the repo's Pipeline, so the canvas
+    /// lays it out again.
+    TidyPipeline {
+        repo: RepoName,
     },
 }
 

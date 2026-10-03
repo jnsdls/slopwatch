@@ -23,6 +23,7 @@ use std::ops::Range;
 use std::str::FromStr;
 
 use rowan::ast::AstNode;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use yaml_edit::{Lang, Mapping, Sequence, SyntaxKind, YamlFile, YamlNode};
 
@@ -31,7 +32,8 @@ use crate::pipeline::GATE;
 type SyntaxNode = rowan::SyntaxNode<Lang>;
 
 /// One change the editor makes to a Pipeline file.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Edit {
     /// Appends a Step after the last one under `steps:`.
     AddStep {
@@ -136,10 +138,26 @@ fn apply(text: &str, edit: &Edit) -> Result<String, EditError> {
             if steps.contains_key(id.as_str()) {
                 return Err(EditError::StepExists(id.clone()));
             }
-            set(text, &steps, id, &new_step_yaml(step))
+            let line = format!("{}: {}", string(id), new_step_yaml(step));
+            if steps.is_flow_style() && steps.is_empty() {
+                // A new Pipeline's `steps: {}` becomes a block mapping, one
+                // Step per line.
+                replace_with_block(text, &root_entry(&root, "steps"), &line)
+            } else {
+                set(text, &steps, id, &new_step_yaml(step))
+            }
         }
-        Edit::RemoveStep { id } => remove_key(text, &steps(&root)?, id)
-            .ok_or_else(|| EditError::UnknownStep(id.clone()))?,
+        Edit::RemoveStep { id } => {
+            let steps = steps(&root)?;
+            if !steps.contains_key(id.as_str()) {
+                return Err(EditError::UnknownStep(id.clone()));
+            }
+            if steps.len() == 1 && !steps.is_flow_style() {
+                replace_value(text, &root_entry(&root, "steps"), "{}")
+            } else {
+                remove_key(text, &steps, id).expect("the Step is there")
+            }
+        }
         Edit::SetKey { step, key, value } => {
             set(text, &step_mapping(&root, step)?, key, &flow_style(value))
         }
@@ -221,7 +239,13 @@ fn apply(text: &str, edit: &Edit) -> Result<String, EditError> {
             if *index >= entries.len() {
                 return Err(EditError::UnknownGateTerm(*index));
             }
-            remove(text, &entries, *index, gate.is_flow_style())
+            if entries.len() == 1 && !gate.is_flow_style() {
+                // `gate:` with nothing under it wouldn't load, nor take a
+                // new term.
+                replace_value(text, &root_entry(&root, GATE), "[]")
+            } else {
+                remove(text, &entries, *index, gate.is_flow_style())
+            }
         }
         Edit::SetFixRounds(Some(rounds)) => set(text, &root, "fix_rounds", &rounds.to_string()),
         Edit::SetFixRounds(None) => {
@@ -229,6 +253,37 @@ fn apply(text: &str, edit: &Edit) -> Result<String, EditError> {
         }
     };
     Ok(edited)
+}
+
+/// The top-level entry for `key`, which the caller has found already.
+fn root_entry(root: &Mapping, key: &str) -> SyntaxNode {
+    let index = root
+        .entries()
+        .position(|e| e.key_matches(key))
+        .expect("the key is there");
+    mapping_entries(root).swap_remove(index)
+}
+
+/// Replaces the value of a top-level entry written on the key's line, such
+/// as `{}`, with `line` on a line of its own below the key, indented one
+/// level.
+fn replace_with_block(text: &str, entry: &SyntaxNode, line: &str) -> String {
+    let colon = entry
+        .children_with_tokens()
+        .find(|c| c.kind() == SyntaxKind::COLON)
+        .expect("a mapping entry has a colon");
+    let after_colon = usize::from(colon.text_range().end());
+    let old = entry
+        .children()
+        .find(|c| c.kind() == SyntaxKind::VALUE)
+        .map_or(after_colon..after_colon, |v| range(&v));
+    let start = range(entry).start;
+    let indent = start - text[..start].rfind('\n').map_or(0, |i| i + 1);
+    splice(
+        text,
+        after_colon..content_end(text, old),
+        &format!("\n{:indent$}  {line}", ""),
+    )
 }
 
 fn unknown_key(step: &str, key: &str) -> EditError {
@@ -488,8 +543,9 @@ fn flow_style_mapping<'a>(entries: impl IntoIterator<Item = (&'a String, &'a Val
     }
 }
 
-/// `value` as one line of flow YAML.
-fn flow_style(value: &Value) -> String {
+/// `value` as one line of flow YAML, the way the editor writes it into the
+/// file, such as `{ model: opus }` or `[ci, review]`.
+pub fn flow_style(value: &Value) -> String {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) => value.to_string(),
         Value::String(s) => string(s),

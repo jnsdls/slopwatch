@@ -269,6 +269,43 @@ pub fn layout(steps: &[StepInfo], terms: &[GateTerm]) -> Layout {
     layout
 }
 
+/// Moves the nodes `placed` names to where the developer put them, the top
+/// left of each, and redraws the edges and the extent to match. Nodes it
+/// doesn't name keep their auto-layout place.
+pub fn place(mut layout: Layout, placed: &HashMap<NodeId, Point>) -> Layout {
+    if placed.is_empty() {
+        return layout;
+    }
+    for node in &mut layout.nodes {
+        if let Some(point) = placed.get(&node.id) {
+            node.rect.x = point.x;
+            node.rect.y = point.y;
+        }
+    }
+    let nodes = layout.nodes.clone();
+    let rect = |id: &NodeId| {
+        nodes
+            .iter()
+            .find(|node| &node.id == id)
+            .map(|node| node.rect)
+    };
+    for edge in &mut layout.edges {
+        if let (Some(from), Some(to)) = (rect(&edge.from), rect(&edge.to)) {
+            edge.start = from.right_middle();
+            edge.end = to.left_middle();
+        }
+    }
+    layout.width = nodes
+        .iter()
+        .map(|node| node.rect.x + node.rect.width + MARGIN)
+        .fold(0., f32::max);
+    layout.height = nodes
+        .iter()
+        .map(|node| node.rect.y + node.rect.height + MARGIN)
+        .fold(0., f32::max);
+    layout
+}
+
 /// A node before it has a place.
 struct Sized {
     id: NodeId,
@@ -514,6 +551,22 @@ mod tests {
             NODE_HEIGHT,
             "the Gate is never shorter than a Step"
         );
+    }
+
+    #[test]
+    fn placed_nodes_move_and_take_their_edges_with_them() {
+        let steps = vec![step("ci", &[], true), step("review", &["ci"], true)];
+        let auto = layout(&steps, &[term("ci"), term("review")]);
+        let placed = HashMap::from([(id("review"), Point { x: 500., y: 300. })]);
+
+        let moved = place(auto.clone(), &placed);
+
+        assert_eq!(rect(&moved, &id("ci")), rect(&auto, &id("ci")));
+        let review = rect(&moved, &id("review"));
+        assert_eq!((review.x, review.y), (500., 300.));
+        assert_eq!(moved.edges[0].end, review.left_middle());
+        assert_eq!(moved.width, 500. + NODE_WIDTH + MARGIN);
+        assert_eq!(moved.height, 300. + NODE_HEIGHT + MARGIN);
     }
 
     #[test]

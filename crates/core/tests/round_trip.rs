@@ -725,6 +725,72 @@ fn fills_an_empty_flow_gate_that_has_a_comment() {
     assert_eq!(gate(&load_ok(&after)), ["ci"]);
 }
 
+// Empty collections, as a new Pipeline starts.
+
+/// What a repo's draft starts from when it has no Pipeline file yet.
+const EMPTY: &str = "version: 1\nsteps: {}\ngate: []\n";
+
+#[test]
+fn the_first_step_turns_empty_steps_into_a_block_mapping() {
+    let edits = [
+        Edit::AddStep {
+            id: "ci".into(),
+            step: object(json!({ "uses": "ci" })),
+        },
+        Edit::AddStep {
+            id: "review".into(),
+            step: object(json!({ "uses": "claude", "needs": ["ci"] })),
+        },
+        Edit::AddGateTerm { term: json!("ci") },
+    ];
+    let after = edit(EMPTY, &edits);
+    assert_eq!(
+        after,
+        "version: 1\nsteps:\n  ci: { uses: ci }\n  review: { uses: claude, needs: [ci] }\ngate: [ci]\n"
+    );
+    load_ok(&after);
+}
+
+#[test]
+fn removing_the_only_step_and_gate_term_leaves_them_empty() {
+    let file = "version: 1\nsteps:\n  ci: { uses: ci }  # the one Step\n\n# Ship when CI passes.\ngate:\n  - ci\n";
+    let edits = [
+        Edit::RemoveGateTerm { index: 0 },
+        Edit::RemoveStep { id: "ci".into() },
+    ];
+    let after = edit(file, &edits);
+    assert_eq!(
+        after,
+        "version: 1\nsteps: {}\n\n# Ship when CI passes.\ngate: []\n"
+    );
+    // And the editor can fill them again.
+    let edits = [
+        Edit::AddStep {
+            id: "lint".into(),
+            step: object(json!({ "uses": "ci" })),
+        },
+        Edit::AddGateTerm {
+            term: json!("lint"),
+        },
+    ];
+    let refilled = edit(&after, &edits);
+    assert_eq!(
+        refilled,
+        "version: 1\nsteps:\n  lint: { uses: ci }\n\n# Ship when CI passes.\ngate: [lint]\n"
+    );
+    load_ok(&refilled);
+}
+
+#[test]
+fn removing_the_only_flow_gate_term_leaves_an_empty_flow_gate() {
+    let file = "version: 1\nsteps:\n  ci: { uses: ci }\ngate: [ci]  # just CI\n";
+    let after = edit(file, &[Edit::RemoveGateTerm { index: 0 }]);
+    assert_eq!(
+        after,
+        "version: 1\nsteps:\n  ci: { uses: ci }\ngate: []  # just CI\n"
+    );
+}
+
 // Comments.
 
 #[test]

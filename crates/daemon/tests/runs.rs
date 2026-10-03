@@ -168,7 +168,9 @@ impl Client {
                 assert_eq!(seq, view.seq + 1, "Run events arrive in order, once each");
                 view.apply(seq, event);
             }
-            TopicUpdate::StepLog { .. } | TopicUpdate::Notifications { .. } => {}
+            TopicUpdate::StepLog { .. }
+            | TopicUpdate::Notifications { .. }
+            | TopicUpdate::Pipeline { .. } => {}
         }
     }
 

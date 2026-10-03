@@ -182,7 +182,29 @@ const MIGRATIONS: &[&str] = &[
         approved_at INTEGER NOT NULL
     );
 ",
+    // The Pipeline editor (ADR 0007): each repo's draft, as the base it
+    // started from and the edits since, and the sidecar of node positions
+    // the developer dragged, which never goes into the repo.
+    "
+    CREATE TABLE pipeline_drafts (
+        repo TEXT PRIMARY KEY,
+        base TEXT NOT NULL,
+        base_text TEXT,
+        edits TEXT NOT NULL
+    );
+    CREATE TABLE pipeline_positions (
+        repo TEXT NOT NULL,
+        node TEXT NOT NULL,
+        x INTEGER NOT NULL,
+        y INTEGER NOT NULL,
+        PRIMARY KEY (repo, node)
+    );
+",
 ];
+
+mod drafts;
+
+pub use drafts::StoredDraft;
 
 #[derive(Clone)]
 pub struct Store {

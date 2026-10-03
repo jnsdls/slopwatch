@@ -85,6 +85,12 @@ pub fn check_library_step(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The Plugin a Library Step's text uses, if the text reads as a Library
+/// Step, whether or not that Plugin is installed.
+pub fn library_step_plugin(text: &str) -> Option<String> {
+    parse(text).ok().map(|library| library.uses)
+}
+
 /// Whether `name` can name a Library Step: lowercase ASCII letters, digits,
 /// `-` and `_`, starting with a letter or digit. That keeps `lib/<name>` to
 /// one plain file in the Library whatever a Pipeline writes, and two names

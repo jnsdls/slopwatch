@@ -11,13 +11,15 @@
 //! Watched PR through its Pipeline, following what each poll saw.
 //!
 //! [`Library`] holds the developer's Library Steps, which clients list and
-//! edit, and which a Pipeline's resolver reads live.
+//! edit, and which a Pipeline's resolver reads live. [`drafts::Drafts`]
+//! keeps each repo's draft Pipeline for the editor.
 
 pub mod approvals;
 pub mod auth;
 pub mod clones;
 mod connection;
 mod data_dir;
+pub mod drafts;
 pub mod github;
 pub mod inbox;
 mod library;
@@ -34,6 +36,7 @@ mod watching;
 use std::sync::Arc;
 
 pub use data_dir::DataDir;
+use drafts::Drafts;
 
 use slopwatch_protocol::{
     Auth, BUILD_ID, ClientFrame, ClientHello, DIALECT, FEATURES, Refusal, RefusalReason,
@@ -58,6 +61,8 @@ pub struct Daemon {
     runs: Option<Arc<Runs>>,
     restart: tokio::sync::watch::Sender<bool>,
     library: Arc<Library>,
+    /// `None` for a daemon without the Pipeline editor, as some tests build.
+    drafts: Option<Arc<Drafts>>,
 }
 
 impl Daemon {
@@ -79,7 +84,14 @@ impl Daemon {
             runs: None,
             restart: tokio::sync::watch::Sender::new(false),
             library,
+            drafts: None,
         }
+    }
+
+    /// Gives the daemon draft Pipelines to keep and serve.
+    pub fn with_drafts(mut self, drafts: Arc<Drafts>) -> Self {
+        self.drafts = Some(drafts);
+        self
     }
 
     /// Gives the daemon Runs to drive and serve.

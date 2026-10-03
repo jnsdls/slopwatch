@@ -6,6 +6,7 @@
 //! answer, for a [`RunState`], what the Gate says and what each pending Step
 //! does next.
 
+mod draft;
 mod edit;
 mod error;
 mod expr;
@@ -17,11 +18,14 @@ mod run;
 mod validate;
 mod verdict;
 
-pub use edit::{Edit, EditError, apply_edits};
+pub use draft::{
+    EMPTY_PIPELINE, EditRefusal, GateRole, Outline, OutlineStep, Target, parse_yaml, try_edits,
+};
+pub use edit::{Edit, EditError, apply_edits, flow_style};
 pub use error::{LoadError, Referrer};
 pub use expr::{Expr, Fact, Glob, StepTerm};
-pub use library::{PRESETS, Preset, check_library_step, is_library_step_name};
-pub use load::{PluginInfo, Resolver, load, parse_duration};
+pub use library::{PRESETS, Preset, check_library_step, is_library_step_name, library_step_plugin};
+pub use load::{PluginInfo, Resolver, check, load, parse_duration, resolve_uses};
 pub use pipeline::{
     BUILTIN_PLUGINS, FIX_ROUNDS_CEILING, FIX_ROUNDS_DEFAULT, GATE, Pipeline, Step, Uses, Workspace,
 };
