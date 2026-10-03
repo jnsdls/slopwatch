@@ -288,6 +288,59 @@ impl Clones {
         Ok(listed.split_whitespace().map(str::to_owned).collect())
     }
 
+    /// Checks out PR `number` at `head_sha` into `dir` as a detached
+    /// worktree of the repo's clone, for a Step that declares a workspace.
+    /// Whatever was at `dir` goes first, and so does the bookkeeping of
+    /// worktrees whose directories are gone. The checkout fetches the
+    /// blobs it needs from the remote.
+    pub async fn add_worktree(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        number: u64,
+        head_sha: &str,
+        dir: &Path,
+    ) -> Result<(), GitError> {
+        if head_sha.is_empty() || !head_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(GitError(format!("`{head_sha}` isn't a commit SHA")));
+        }
+        let _turn = self.turn(repo).await;
+        let clone = self.cloned(repo, remote).await?;
+        let commit = format!("{head_sha}^{{commit}}");
+        if git(&clone, remote, &["cat-file", "-e", &commit])
+            .await
+            .is_err()
+        {
+            git(
+                &clone,
+                remote,
+                &[
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--filter=blob:none",
+                    &remote.url,
+                    &format!("+refs/pull/{number}/head:refs/slopwatch/pull/{number}"),
+                ],
+            )
+            .await?;
+        }
+        git(&clone, remote, &["worktree", "prune"]).await?;
+        let _ = tokio::fs::remove_dir_all(dir).await;
+        let target = dir
+            .to_str()
+            .ok_or_else(|| GitError(format!("{} isn't UTF-8", dir.display())))?;
+        git(
+            &clone,
+            remote,
+            &[
+                "worktree", "add", "--quiet", "--detach", "--force", target, head_sha,
+            ],
+        )
+        .await
+        .map(drop)
+    }
+
     /// Waits for the repo's turn: one git operation per repo at a time.
     async fn turn(&self, repo: &RepoName) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = self
@@ -376,6 +429,10 @@ async fn git_output(dir: &Path, remote: &GitRemote, args: &[&str]) -> Result<Vec
         .args(args)
         .envs(remote.env.iter().map(|(k, v)| (k, v)))
         .env("GIT_TERMINAL_PROMPT", "0")
+        // A checkout fetches the blobs it needs from the remote, but not
+        // Git LFS objects, which a review doesn't need and which would
+        // need credentials of their own.
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
         .stdin(Stdio::null())
         .output()
         .await
@@ -524,6 +581,40 @@ mod tests {
             "main moving on isn't part of the PR: {diff}"
         );
         assert!(diff.ends_with('\n'), "kept whole");
+    }
+
+    #[tokio::test]
+    async fn checks_a_prs_head_out_into_a_worktree_over_whatever_was_there() {
+        let github = FakeGitHub::new("me");
+        github.add_repo(&repo());
+        github.open_pr(&repo(), 3, "me", "Docs");
+        github.push_file(&repo(), 3, "docs/guide.md", "Read me.\n");
+        let head = github.head_sha(&repo(), 3);
+        let remote = github.git_remote(&repo()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let clones = Clones::new(dir.path().join("repos"));
+        let tree = dir.path().join("worktrees/1/review.1");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("leftover"), "from a crash").unwrap();
+
+        clones
+            .add_worktree(&repo(), &remote, 3, &head, &tree)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tree.join("docs/guide.md")).unwrap(),
+            "Read me.\n"
+        );
+        assert!(!tree.join("leftover").exists());
+        // A Step's exit only deletes its directory. The next checkout of
+        // the same head still works.
+        std::fs::remove_dir_all(&tree).unwrap();
+        clones
+            .add_worktree(&repo(), &remote, 3, &head, &tree)
+            .await
+            .unwrap();
+        assert!(tree.join("docs/guide.md").exists());
     }
 
     #[tokio::test]

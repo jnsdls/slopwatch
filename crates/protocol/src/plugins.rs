@@ -141,6 +141,12 @@ pub struct PluginSettings {
     /// the manifest's `concurrency`. At least 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<u32>,
+    /// An absolute config directory for the CLI the Plugin runs, which its
+    /// Steps get as `SLOPWATCH_CONFIG_DIR`. The `claude` Plugin runs Claude
+    /// Code on a subscription with it as `CLAUDE_CONFIG_DIR`, for a login
+    /// kept outside `~/.claude`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_dir: Option<String>,
 }
 
 impl PluginSettings {
@@ -154,6 +160,15 @@ impl PluginSettings {
         }
         if self.cap == Some(0) {
             return Some("A cap of 0 would hold the Plugin's Steps forever".to_owned());
+        }
+        if let Some(dir) = self
+            .config_dir
+            .as_deref()
+            .filter(|dir| !dir.starts_with('/'))
+        {
+            return Some(format!(
+                "The config directory `{dir}` isn't an absolute path"
+            ));
         }
         None
     }
@@ -220,20 +235,28 @@ mod tests {
         let ok = PluginSettings {
             path: vec!["/opt/tools/bin".into()],
             cap: Some(2),
+            config_dir: Some("/Users/me/.claude-work".into()),
         };
         assert_eq!(ok.problem(), None);
         for bad in [
             PluginSettings {
                 path: vec!["bin".into()],
                 cap: None,
+                config_dir: None,
             },
             PluginSettings {
                 path: vec!["/a:/b".into()],
                 cap: None,
+                config_dir: None,
             },
             PluginSettings {
                 path: vec![],
                 cap: Some(0),
+                ..PluginSettings::default()
+            },
+            PluginSettings {
+                config_dir: Some("~/.claude".into()),
+                ..PluginSettings::default()
             },
         ] {
             assert!(bad.problem().is_some(), "{bad:?}");

@@ -107,25 +107,37 @@ pub fn state_line(plugin: &PluginListing) -> String {
     "Approved".to_owned()
 }
 
-/// The command that saves `plugin`'s settings from what the fields hold:
-/// `PATH` dirs separated by `:`, and a cap that's blank for none. `Err`
-/// says what's wrong with them.
-pub fn save_settings(plugin: &str, path: &str, cap: &str) -> Result<Command, String> {
-    let cap = match cap.trim() {
+/// A Plugin's settings as the fields hold them: `PATH` dirs separated by
+/// `:`, a cap that's blank for none, and a config directory that's blank
+/// for none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fields {
+    pub path: String,
+    pub cap: String,
+    pub config_dir: String,
+}
+
+/// The command that saves `plugin`'s settings from what the fields hold.
+/// `Err` says what's wrong with them.
+pub fn save_settings(plugin: &str, fields: &Fields) -> Result<Command, String> {
+    let cap = match fields.cap.trim() {
         "" => None,
         cap => Some(
             cap.parse::<u32>()
                 .map_err(|_| format!("`{cap}` isn't a whole number"))?,
         ),
     };
+    let config_dir = fields.config_dir.trim();
     let settings = PluginSettings {
-        path: path
+        path: fields
+            .path
             .split(':')
             .map(str::trim)
             .filter(|dir| !dir.is_empty())
             .map(str::to_owned)
             .collect(),
         cap,
+        config_dir: (!config_dir.is_empty()).then(|| config_dir.to_owned()),
     };
     if let Some(problem) = settings.problem() {
         return Err(problem);
@@ -137,11 +149,12 @@ pub fn save_settings(plugin: &str, path: &str, cap: &str) -> Result<Command, Str
 }
 
 /// The settings as the fields show them.
-pub fn settings_fields(settings: &PluginSettings) -> (String, String) {
-    (
-        settings.path.join(":"),
-        settings.cap.map(|cap| cap.to_string()).unwrap_or_default(),
-    )
+pub fn settings_fields(settings: &PluginSettings) -> Fields {
+    Fields {
+        path: settings.path.join(":"),
+        cap: settings.cap.map(|cap| cap.to_string()).unwrap_or_default(),
+        config_dir: settings.config_dir.clone().unwrap_or_default(),
+    }
 }
 
 /// The Plugin an Inbox entry asks the developer to approve, if it does.
@@ -261,34 +274,42 @@ mod tests {
 
     #[test]
     fn settings_fields_parse_into_a_command_or_say_why_not() {
+        let fields = |path: &str, cap: &str, config_dir: &str| Fields {
+            path: path.into(),
+            cap: cap.into(),
+            config_dir: config_dir.into(),
+        };
         assert_eq!(
-            save_settings("lint", " /opt/a/bin : /opt/b ", "2"),
+            save_settings(
+                "claude",
+                &fields(" /opt/a/bin : /opt/b ", "2", " /Users/me/.claude-work ")
+            ),
             Ok(Command::SetPluginSettings {
-                plugin: "lint".into(),
+                plugin: "claude".into(),
                 settings: PluginSettings {
                     path: vec!["/opt/a/bin".into(), "/opt/b".into()],
                     cap: Some(2),
+                    config_dir: Some("/Users/me/.claude-work".into()),
                 },
             })
         );
         assert_eq!(
-            save_settings("lint", "", ""),
+            save_settings("lint", &fields("", "", "")),
             Ok(Command::SetPluginSettings {
                 plugin: "lint".into(),
                 settings: PluginSettings::default(),
             })
         );
-        assert!(save_settings("lint", "bin", "").is_err());
-        assert!(save_settings("lint", "", "two").is_err());
-        assert!(save_settings("lint", "", "0").is_err());
+        assert!(save_settings("lint", &fields("bin", "", "")).is_err());
+        assert!(save_settings("lint", &fields("", "two", "")).is_err());
+        assert!(save_settings("lint", &fields("", "0", "")).is_err());
+        assert!(save_settings("claude", &fields("", "", "~/.claude")).is_err());
         let settings = PluginSettings {
             path: vec!["/a".into(), "/b".into()],
             cap: Some(3),
+            config_dir: Some("/c".into()),
         };
-        assert_eq!(
-            settings_fields(&settings),
-            ("/a:/b".to_owned(), "3".to_owned())
-        );
+        assert_eq!(settings_fields(&settings), fields("/a:/b", "3", "/c"));
     }
 
     #[test]

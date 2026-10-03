@@ -1,12 +1,15 @@
-# Shipped preset. Runs `claude -p` in a read-only worktree as a reviewer.
-# It reports Findings by severity and fails on any high one. Uses your own
-# Claude login unless `auth` names an API key Secret.
+# Shipped preset. Runs `claude -p` as a reviewer in a checkout of the PR's
+# head, with read-only tools.
+# It reports Findings by severity and fails on any `error` one. It runs on
+# your own Claude login. `auth: api_key` runs it on the ANTHROPIC_API_KEY
+# Secret instead. The PR's own hooks and MCP servers stay off unless you
+# add `repo_config: true`.
 uses: claude
 with:
   model: opus
   auth: subscription
-  fail_on: high
+  fail_on: error
   prompt: >-
-    Review this pull request. Report each problem you find as a Finding with
-    a severity (high, medium or low), and a file and line where one applies.
-    High means the change is wrong or unsafe to merge.
+    Look for bugs, security problems, data loss, broken error handling and
+    changes that don't do what the description says. Skip style nits a
+    formatter or linter would catch.

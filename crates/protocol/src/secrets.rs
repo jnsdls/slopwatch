@@ -41,6 +41,10 @@ pub struct SecretInfo {
     /// The Plugins whose Approval covers it, sorted.
     #[serde(default)]
     pub granted_to: Vec<String>,
+    /// Every Plugin granted it runs without it, as a review Step on a
+    /// subscription login does. An unset optional Secret isn't missing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
 }
 
 impl SecretInfo {
@@ -51,7 +55,7 @@ impl SecretInfo {
 
 /// Whether `name` can name a Secret: an env var name in upper case,
 /// letters, digits and `_`, not starting with a digit, and not one the
-/// daemon sets for every Step (`PATH`, `HOME`, `SLOPWATCH_*`).
+/// daemon sets for every Step (`PATH`, `HOME`, `USER`, `LOGNAME`, `SLOPWATCH_*`).
 pub fn is_secret_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
@@ -59,7 +63,9 @@ pub fn is_secret_name(name: &str) -> bool {
     };
     let shaped = (first.is_ascii_uppercase() || first == '_')
         && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    shaped && !matches!(name, "PATH" | "HOME") && !name.starts_with("SLOPWATCH_")
+    shaped
+        && !matches!(name, "PATH" | "HOME" | "USER" | "LOGNAME")
+        && !name.starts_with("SLOPWATCH_")
 }
 
 #[cfg(test)]
@@ -85,6 +91,8 @@ mod tests {
             "WITH-DASH",
             "PATH",
             "HOME",
+            "USER",
+            "LOGNAME",
             "SLOPWATCH_RUN",
             "A B",
         ] {

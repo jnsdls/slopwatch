@@ -145,6 +145,11 @@ pub struct Start {
     pub snapshot: PrSnapshot,
     /// The Outcomes of every Step upstream of this one, by Step id.
     pub upstream: BTreeMap<String, Outcome>,
+    /// The most the Step may spend, in list-price USD. A Step that can
+    /// cap its own spend, as `claude --max-budget-usd` does, should. `None`
+    /// sets no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
 }
 
 /// A message from a Step to the daemon.
@@ -177,21 +182,35 @@ pub enum FromStep {
     /// entry that's already open. Only the built-in `human` Plugin may ask,
     /// and any other Step that does gets `error(protocol)`.
     Ask { prompt: String },
+    /// The Step couldn't judge the PR, as when the CLI it drives isn't
+    /// logged in. The daemon settles it `error` with `reason`. It takes
+    /// the place of an Outcome, and the Step exits after sending it.
+    Error { reason: String },
     /// The Step's one Outcome. It exits after sending it.
     Outcome(Outcome),
 }
 
 /// What one model call used. `usd` is the list price when the provider
-/// reports it. Without it the cost is unknown, never zero.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// reports it. Without it the daemon prices the tokens from its own table,
+/// and a model the table doesn't know leaves the cost unknown, never zero.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub model: String,
+    /// Every input token, those read from a prompt cache included.
     #[serde(default)]
     pub input_tokens: u64,
+    /// The share of `input_tokens` read from a prompt cache, which costs
+    /// less.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cached_input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usd: Option<f64>,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 /// A change on GitHub that a Step asks for and the daemon carries out with
@@ -354,12 +373,23 @@ pub struct Finding {
     pub line: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// How bad a Finding is, least first, so `>=` reads "at least as bad".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Info,
     Warning,
     Error,
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Severity::Info => "info",
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        })
+    }
 }
 
 /// The PR as the daemon last polled it, pinned to the Run's head SHA. A
@@ -405,6 +435,10 @@ pub const MERGE_STATE: &str = "merge_state";
 
 /// The manifest feature that asks for [`PrSnapshot::diff`].
 pub const PR_DIFF: &str = "pr_diff";
+
+/// The env var a Step gets the config directory the developer set for its
+/// Plugin in, when they set one. The Plugin hands it to the CLI it runs.
+pub const CONFIG_DIR_ENV: &str = "SLOPWATCH_CONFIG_DIR";
 
 /// An issue the PR closes when it merges.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -542,11 +576,13 @@ mod tests {
                 stacked_on: None,
             },
             upstream: BTreeMap::new(),
+            budget_usd: None,
         });
 
         let wire = serde_json::to_value(&start).unwrap();
 
         assert_eq!(wire["type"], "start");
+        assert!(wire.get("budget_usd").is_none(), "no budget, no key");
         assert_eq!(wire["run"], 4);
         assert_eq!(wire["snapshot"]["head_sha"], "abc");
         assert_eq!(wire["snapshot"]["checks"]["state"], "none");
@@ -586,6 +622,22 @@ mod tests {
         assert_eq!(priced.output_tokens, 0);
         assert_eq!(unpriced.usd, None);
         assert_eq!(unpriced.output_tokens, 4);
+        assert_eq!(unpriced.cached_input_tokens, 0);
+    }
+
+    #[test]
+    fn a_step_reports_its_own_error_with_a_reason() {
+        let error: FromStep =
+            serde_json::from_str(r#"{"type":"error","reason":"Not logged in"}"#).unwrap();
+
+        assert_eq!(
+            error,
+            FromStep::Error {
+                reason: "Not logged in".into()
+            }
+        );
+        assert!(Severity::Error > Severity::Warning);
+        assert_eq!(Severity::Warning.to_string(), "warning");
     }
 
     #[test]

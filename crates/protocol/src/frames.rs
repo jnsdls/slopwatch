@@ -621,11 +621,13 @@ mod tests {
                     name: "A".into(),
                     set_at: Some(5),
                     granted_to: vec!["jev".into()],
+                    optional: false,
                 },
                 SecretInfo {
                     name: "B".into(),
                     set_at: None,
                     granted_to: vec![],
+                    optional: false,
                 },
             ],
         };
@@ -675,6 +677,7 @@ mod tests {
                 settings: PluginSettings {
                     path: vec![],
                     cap: Some(2),
+                    config_dir: None,
                 },
             }],
         };

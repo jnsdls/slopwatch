@@ -2525,6 +2525,7 @@ mod tests {
         let settings = PluginSettings {
             path: vec!["/opt/bin".into()],
             cap: Some(1),
+            config_dir: None,
         };
         store.put_plugin_settings("lint", &settings).unwrap();
         assert_eq!(

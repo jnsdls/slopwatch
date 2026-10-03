@@ -12,6 +12,7 @@
 //! reason is typed into the view's input and comes in on submit.
 
 use slopwatch_core::{EndReason, GateState, Verdict, WaiverCategory};
+use slopwatch_protocol::step::Finding;
 use slopwatch_protocol::{
     Command, LogKey, LogRecord, PullRequest, RepoName, RunId, RunSummary, RunView, StepLogPage,
     StepStatus, StepView, Topic, TopicUpdate,
@@ -531,6 +532,16 @@ fn status_line(step: &StepView) -> String {
     }
 }
 
+/// One Finding under its Step row: severity, then where, then what.
+pub fn finding_line(finding: &Finding) -> String {
+    let severity = finding.severity;
+    match (&finding.file, finding.line) {
+        (Some(file), Some(line)) => format!("• {severity} {file}:{line}: {}", finding.message),
+        (Some(file), None) => format!("• {severity} {file}: {}", finding.message),
+        _ => format!("• {severity}: {}", finding.message),
+    }
+}
+
 /// A Step's status in one word, as its node in the graph says it.
 pub fn step_state(step: &StepView) -> String {
     if let StepStatus::Settled { verdict, .. } = &step.status
@@ -586,7 +597,7 @@ fn capitalized(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slopwatch_protocol::step::Outputs;
+    use slopwatch_protocol::step::{Outputs, Severity};
     use slopwatch_protocol::{Cost, PrStatus, RunEvent, StepInfo};
 
     fn summary(id: u64, end: Option<EndReason>) -> RunSummary {
@@ -885,6 +896,28 @@ mod tests {
         pane.pr_changed(None);
         assert!(!pane.graph_shown(), "the PR went away");
         assert_eq!(pane.mode(), RunMode::Graph, "the next PR opens as a graph");
+    }
+
+    #[test]
+    fn a_finding_reads_with_its_severity_and_place() {
+        let finding = |file: Option<&str>, line: Option<u32>| Finding {
+            severity: Severity::Warning,
+            message: "Unwrap can panic.".into(),
+            file: file.map(str::to_owned),
+            line,
+        };
+        assert_eq!(
+            finding_line(&finding(Some("src/a.rs"), Some(4))),
+            "• warning src/a.rs:4: Unwrap can panic."
+        );
+        assert_eq!(
+            finding_line(&finding(Some("src/a.rs"), None)),
+            "• warning src/a.rs: Unwrap can panic."
+        );
+        assert_eq!(
+            finding_line(&finding(None, None)),
+            "• warning: Unwrap can panic."
+        );
     }
 
     #[test]

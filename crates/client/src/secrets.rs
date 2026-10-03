@@ -56,10 +56,10 @@ impl SecretsList {
     }
 }
 
-/// Whether a Plugin is granted `secret` and it isn't set, so Steps that
-/// require it error.
+/// Whether a Plugin is granted `secret`, needs it, and it isn't set, so
+/// Steps that require it error.
 pub fn needed(secret: &SecretInfo) -> bool {
-    !secret.is_set() && !secret.granted_to.is_empty()
+    !secret.is_set() && !secret.granted_to.is_empty() && !secret.optional
 }
 
 /// A Secret's state, as its row reads: when it was set, or that it isn't.
@@ -113,6 +113,7 @@ mod tests {
             name: name.into(),
             set_at,
             granted_to: granted.iter().map(|&p| p.to_owned()).collect(),
+            optional: false,
         }
     }
 
@@ -146,8 +147,12 @@ mod tests {
             info("A", None, &["jev"]),
             info("B", Some(1), &["jev"]),
             info("C", None, &[]),
+            SecretInfo {
+                optional: true,
+                ..info("ANTHROPIC_API_KEY", None, &["claude"])
+            },
         ]);
-        assert_eq!(list.unset(), 1);
+        assert_eq!(list.unset(), 1, "an optional Secret isn't missing");
     }
 
     #[test]

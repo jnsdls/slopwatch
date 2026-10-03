@@ -218,7 +218,9 @@ async fn a_repos_draft_starts_from_its_default_branch_with_the_palette() {
     );
     assert_eq!(
         draft.palette[1].summary.as_deref(),
-        Some("Runs `claude -p` in a read-only worktree as a reviewer.")
+        Some(
+            "Runs `claude -p` as a reviewer in a checkout of the PR's head, with read-only tools."
+        )
     );
 }
 

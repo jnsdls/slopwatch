@@ -3,8 +3,8 @@
 //! Built-in Plugins run from the daemon's own executable, as
 //! `slopwatchd plugin <name> describe` and `slopwatchd plugin <name> run`,
 //! so they ship and update with the app and speak the Step contract like
-//! any third-party Plugin. `ci`, `human`, `jev` and `merge` are built so
-//! far.
+//! any third-party Plugin. `ci`, `claude`, `codex`, `human`, `jev` and
+//! `merge` are built so far.
 //!
 //! A third-party Plugin is an executable, or a symlink to one, in the
 //! Plugins folder: `plugins/<name>` under the config dir (ADR 0012). The
@@ -15,10 +15,13 @@
 //! this module's.
 
 pub mod ci;
+pub mod claude;
+pub mod codex;
 pub mod describe;
 pub mod human;
 pub mod jev;
 pub mod merge;
+pub mod review;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -361,6 +364,11 @@ impl Plugins {
         with_settings_path(self.state().settings.get(plugin), base)
     }
 
+    /// The config directory the developer set for the Plugin's CLI, if any.
+    pub fn config_dir(&self, plugin: &str) -> Option<String> {
+        self.state().settings.get(plugin)?.config_dir.clone()
+    }
+
     /// Replaces the developer's settings for `plugin`. A third-party
     /// Plugin is described again on the next scan, since its `PATH` may
     /// be what it lacked.
@@ -504,6 +512,8 @@ fn file_hash(path: &Path) -> Option<String> {
 fn builtins() -> Vec<Manifest> {
     vec![
         ci::manifest(),
+        claude::manifest(),
+        codex::manifest(),
         jev::manifest(),
         merge::manifest(),
         human::manifest(),
@@ -549,6 +559,8 @@ pub fn main(args: &[String]) -> ExitCode {
             "ci" => ci::run(std::io::stdin().lock(), std::io::stdout().lock()),
             "merge" => merge::run(std::io::stdin().lock(), std::io::stdout().lock()),
             "human" => human::run(std::io::stdin().lock(), std::io::stdout().lock()),
+            "claude" => claude::run(),
+            "codex" => codex::run(),
             "jev" => jev::run(
                 std::io::BufReader::new(std::io::stdin()),
                 std::io::stdout().lock(),
@@ -748,6 +760,7 @@ mod tests {
             PluginSettings {
                 path: vec![tools.clone()],
                 cap: Some(2),
+                config_dir: None,
             },
         );
         assert!(plugins.scan().await);

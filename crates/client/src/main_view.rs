@@ -35,8 +35,8 @@ use crate::plugins_view::PluginsView;
 use crate::prs::{Prs, Row as PrRow, Source, poll_line, status_line, storage_line};
 use crate::run_graph_view::{run_graph, tone_color};
 use crate::run_pane::{
-    GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, end_label, gate_tone,
-    run_label, run_tone, step_line, step_tone, waiver_line,
+    GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, end_label, finding_line,
+    gate_tone, run_label, run_tone, step_line, step_tone, waiver_line,
 };
 use crate::secrets::missing_secret;
 use crate::secrets_view::SecretsView;
@@ -1103,6 +1103,14 @@ impl MainView {
         if self.run_pane.waiver_form().is_some() {
             pane = pane.child(self.waiver_form(cx));
         }
+        if let Some(cost) = view.cost() {
+            pane = pane.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("Run cost: {cost}")),
+            );
+        }
         if let Some(end) = view.end {
             pane = pane.child(
                 div()
@@ -1331,7 +1339,7 @@ impl MainView {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(format!("• {}", finding.message)),
+                        .child(finding_line(finding)),
                 );
             }
         }

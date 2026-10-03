@@ -45,6 +45,7 @@
 mod effects;
 pub(crate) mod journal;
 pub mod log;
+mod prices;
 pub mod process;
 mod retention;
 mod source;
@@ -58,11 +59,11 @@ use std::time::{Duration, SystemTime};
 
 use slopwatch_core::{
     Decision, EndReason, GATE, GateState, Pipeline, PrFacts, RunState, Step, StepState, Verdict,
-    load, parse_duration,
+    Workspace, load, parse_duration,
 };
 use slopwatch_protocol::step::{
-    EffectKind, FromStep, LinkedIssue, MERGE_STATE, Manifest, MergeState, Outcome, Outputs,
-    PR_DIFF, PrSnapshot, Start, ToStep,
+    CONFIG_DIR_ENV, EffectKind, FromStep, LinkedIssue, MERGE_STATE, Manifest, MergeState, Outcome,
+    Outputs, PR_DIFF, PrSnapshot, Start, ToStep,
 };
 use slopwatch_protocol::{
     Actor, Answer, Cause, Closing, GateTerm, LogFilter, LogKey, LogPage, LogRecord, PluginListing,
@@ -121,7 +122,7 @@ pub struct Runs {
     engine: tokio::sync::Mutex<Engine>,
     journal: Arc<Journal>,
     github: Arc<dyn GitHub>,
-    clones: Clones,
+    clones: Arc<Clones>,
     live: AtomicBool,
     store: Store,
     watching: Arc<Watching>,
@@ -132,6 +133,8 @@ pub struct Runs {
     notifications: Arc<Notifications>,
     secrets: Arc<Secrets>,
     plugins: Arc<Plugins>,
+    /// The Secrets each built-in Plugin runs without, by Plugin.
+    optional_secrets: HashMap<String, HashSet<String>>,
 }
 
 /// Where Runs keep their files, and for how long.
@@ -209,7 +212,7 @@ impl Runs {
     ) -> Result<Arc<Self>, StoreError> {
         let journal = Arc::new(Journal::new(store.clone()));
         let (reports, mut received) = mpsc::unbounded_channel();
-        let clones = Clones::new(config.data_dir.join("repos"));
+        let clones = Arc::new(Clones::new(config.data_dir.join("repos")));
         let step_path = shell_env::merge(
             std::env::var("PATH").ok().as_deref(),
             config.login_path.as_deref(),
@@ -224,8 +227,18 @@ impl Runs {
         // Built-in Plugins ship approved for what their manifests ask
         // (ADR 0012), written again on every start so an update's new
         // manifest is the one approved.
+        let mut optional_secrets = HashMap::new();
         for manifest in config.plugins.builtin_manifests() {
             store.put_approval(&Approval::builtin(&manifest, now()))?;
+            optional_secrets.insert(
+                manifest.id.clone(),
+                manifest
+                    .secrets
+                    .iter()
+                    .filter(|spec| spec.optional)
+                    .map(|spec| spec.name.clone())
+                    .collect::<HashSet<_>>(),
+            );
         }
         let plugins = Arc::new(config.plugins.with_settings(store.plugin_settings()?));
         let secrets = Arc::new(Secrets::new(config.keychain, store.clone()));
@@ -234,6 +247,7 @@ impl Runs {
             tokio::task::spawn_blocking(move || secrets.warm());
         }
         let mut engine = Engine {
+            clones: Arc::clone(&clones),
             secrets: Arc::clone(&secrets),
             inbox: Arc::clone(&inbox),
             notifications: Arc::clone(&notifications),
@@ -279,6 +293,7 @@ impl Runs {
             notifications,
             secrets,
             plugins,
+            optional_secrets,
         });
         let driver = Arc::clone(&runs);
         tokio::spawn(async move {
@@ -288,6 +303,7 @@ impl Runs {
                     Input::Step(report) => engine.on_report(report),
                     Input::Effect(finished) => engine.on_effect_finished(finished),
                     Input::Stack(finished) => engine.on_stack_update(finished),
+                    Input::Prepared(prepared) => engine.on_prepared(prepared),
                 }
                 engine.schedule();
                 driver
@@ -470,7 +486,16 @@ impl Runs {
     /// only.
     pub fn list_secrets(&self) -> Result<Vec<SecretInfo>, SecretError> {
         let approvals = self.store.approvals()?;
-        Ok(self.secrets.list(&approvals)?)
+        let mut listed = self.secrets.list(&approvals)?;
+        for info in &mut listed {
+            info.optional = !info.granted_to.is_empty()
+                && info.granted_to.iter().all(|plugin| {
+                    self.optional_secrets
+                        .get(plugin)
+                        .is_some_and(|names| names.contains(&info.name))
+                });
+        }
+        Ok(listed)
     }
 
     /// Sets or rotates a Secret. The next Step spawned gets the new value.
@@ -807,6 +832,8 @@ impl Runs {
 
 struct Engine {
     store: Store,
+    /// Makes Steps' worktrees.
+    clones: Arc<Clones>,
     secrets: Arc<Secrets>,
     inbox: Arc<Inbox>,
     notifications: Arc<Notifications>,
@@ -925,6 +952,9 @@ struct Active {
     /// cause, for the Inbox.
     reasons: HashMap<String, String>,
     attempts: HashMap<String, u32>,
+    /// Steps whose worktree is being made before they start, with the
+    /// attempt it's for (see [`Engine::prepare`]).
+    preparing: HashMap<String, u32>,
     running: HashMap<String, Running>,
     /// Steps a restart killed before they reported, with how many restarts
     /// in a row did. Each starts again or settles once the first poll has
@@ -1051,6 +1081,40 @@ enum Input {
     Step(StepReport),
     Effect(effects::Finished),
     Stack(stacks::Finished),
+    Prepared(Prepared),
+}
+
+/// A Step attempt's worktree, made or not.
+struct Prepared {
+    run: RunId,
+    step: String,
+    attempt: u32,
+    /// Why the worktree couldn't be made.
+    result: Result<(), String>,
+}
+
+/// The git work that gives a Step whose manifest declares a `read` or
+/// `write` workspace its worktree at the head SHA. It runs outside the
+/// engine lock, since a checkout fetches blobs from GitHub.
+struct Preparation {
+    repo: RepoName,
+    number: u64,
+    head_sha: String,
+    /// The Step attempt's working directory, which becomes the worktree.
+    dir: PathBuf,
+}
+
+impl Preparation {
+    async fn run(self, clones: &Clones, github: &dyn GitHub) -> Result<(), String> {
+        let remote = github
+            .git_remote(&self.repo)
+            .await
+            .map_err(|error| format!("can't reach the repo: {error}"))?;
+        clones
+            .add_worktree(&self.repo, &remote, self.number, &self.head_sha, &self.dir)
+            .await
+            .map_err(|error| format!("can't check out the PR's head: {error}"))
+    }
 }
 
 struct StepReport {
@@ -1123,6 +1187,7 @@ impl Engine {
                 outcomes: HashMap::new(),
                 reasons: HashMap::new(),
                 attempts: HashMap::new(),
+                preparing: HashMap::new(),
                 running: HashMap::new(),
                 interrupted: BTreeMap::new(),
                 rerun: HashSet::new(),
@@ -1633,6 +1698,7 @@ impl Engine {
                 outcomes: HashMap::new(),
                 reasons: HashMap::new(),
                 attempts: HashMap::new(),
+                preparing: HashMap::new(),
                 running: HashMap::new(),
                 interrupted: BTreeMap::new(),
                 rerun: HashSet::new(),
@@ -1766,7 +1832,11 @@ impl Engine {
                             continue;
                         }
                         let entry = (id, step.clone());
-                        if !self.ready.contains(&entry) {
+                        // A Step being prepared has left the queue and
+                        // starts once its worktree is there.
+                        if !self.ready.contains(&entry)
+                            && !self.active[key].preparing.contains_key(&step)
+                        {
                             self.ready.push_back(entry);
                         }
                         starts.insert(step);
@@ -1856,7 +1926,11 @@ impl Engine {
             let Some(key) = self.key_of(run) else {
                 continue;
             };
-            self.start_step(&key, &step)?;
+            if self.needs_worktree(&key, &step) {
+                self.prepare(&key, &step);
+                continue;
+            }
+            self.start_step(&key, &step, None)?;
             if !self.active[&key].running.contains_key(&step) {
                 // It settled without a process, so its Run moves on.
                 self.advance(&key)?;
@@ -1893,13 +1967,133 @@ impl Engine {
         self.active.values().find(|active| active.id == run)
     }
 
-    fn start_step(&mut self, key: &PrKey, step_id: &str) -> Result<(), StoreError> {
+    /// Whether `step`'s manifest declares a `read` or `write` workspace,
+    /// so it starts in a worktree of the head.
+    fn needs_worktree(&self, key: &PrKey, step: &str) -> bool {
+        self.active[key]
+            .pipeline
+            .step(step)
+            .and_then(|step| self.plugins.manifest(&step.plugin))
+            .is_some_and(|manifest| manifest.workspace != Workspace::None)
+    }
+
+    /// Makes the worktree of `step`'s next attempt on a task of its own,
+    /// and starts the Step once it's there ([`Engine::on_prepared`]). The
+    /// preparation holds one of the [`STEP_CAP`] slots, since the process
+    /// follows straight after.
+    fn prepare(&mut self, key: &PrKey, step_id: &str) {
+        let run = self.active.get_mut(key).expect("only active Runs advance");
+        let plugin = run
+            .pipeline
+            .step(step_id)
+            .expect("the plan names Pipeline Steps")
+            .plugin
+            .clone();
+        let attempt = run.attempts.get(step_id).copied().unwrap_or(0) + 1;
+        run.preparing.insert(step_id.to_owned(), attempt);
+        self.processes
+            .insert((run.id, step_id.to_owned(), attempt), plugin);
+        let preparation = Preparation {
+            repo: run.repo.clone(),
+            number: run.number,
+            head_sha: run.head_sha.clone(),
+            dir: step_dir(&self.data_dir, run.id, step_id, attempt),
+        };
+        let (clones, github) = (Arc::clone(&self.clones), Arc::clone(&self.github));
+        let reports = self.reports.clone();
+        let (id, step) = (run.id, step_id.to_owned());
+        tokio::spawn(async move {
+            // The Step holds a slot until it hears back, so even a panic
+            // has to answer.
+            let work = tokio::spawn(async move { preparation.run(&clones, github.as_ref()).await });
+            let result = work
+                .await
+                .unwrap_or_else(|error| Err(format!("preparing it failed: {error}")));
+            let _ = reports.send(Input::Prepared(Prepared {
+                run: id,
+                step,
+                attempt,
+                result,
+            }));
+        });
+    }
+
+    /// Starts a Step whose worktree is ready, or settles it `error` when
+    /// it couldn't be made. A Step whose Run ended, or that settled some
+    /// other way meanwhile, has its directory thrown away instead.
+    fn on_prepared(&mut self, prepared: Prepared) {
+        if self.stopped {
+            return;
+        }
+        if let Err(error) = self.try_on_prepared(prepared) {
+            eprintln!("slopwatchd: can't start a prepared Step: {error}");
+        }
+    }
+
+    fn try_on_prepared(&mut self, prepared: Prepared) -> Result<(), StoreError> {
+        let Prepared {
+            run,
+            step,
+            attempt,
+            result,
+        } = prepared;
+        self.processes.remove(&(run, step.clone(), attempt));
+        let dir = step_dir(&self.data_dir, run, &step, attempt);
+        let wanted = self.key_of(run).filter(|key| {
+            let active = &self.active[key];
+            active.preparing.get(&step) == Some(&attempt)
+                && matches!(
+                    active.state.steps.get(&step),
+                    None | Some(StepState::Pending)
+                )
+        });
+        if let Some(key) = self.key_of(run) {
+            let active = self.active.get_mut(&key).expect("found above");
+            if active.preparing.get(&step) == Some(&attempt) {
+                active.preparing.remove(&step);
+            }
+        }
+        let Some(key) = wanted else {
+            let _ = std::fs::remove_dir_all(dir);
+            return Ok(());
+        };
+        match result {
+            Ok(()) => self.start_step(&key, &step, Some(attempt))?,
+            Err(error) => self.settle(
+                &key,
+                &step,
+                Verdict::Error,
+                Some(format!("error(workspace): {error}")),
+                Outputs::default(),
+            )?,
+        }
+        if !self
+            .active
+            .get(&key)
+            .is_some_and(|run| run.running.contains_key(&step))
+        {
+            // It never got a process, such as on a missing Secret.
+            let _ = std::fs::remove_dir_all(dir);
+            self.advance(&key)?;
+        }
+        Ok(())
+    }
+
+    /// Spawns `step_id`'s process. `prepared` is the attempt
+    /// [`Engine::prepare`] made a worktree for.
+    fn start_step(
+        &mut self,
+        key: &PrKey,
+        step_id: &str,
+        prepared: Option<u32>,
+    ) -> Result<(), StoreError> {
         let run = self.active.get_mut(key).expect("only active Runs advance");
         let step = run
             .pipeline
             .step(step_id)
             .expect("the plan names Pipeline Steps");
-        let attempt = run.attempts.get(step_id).copied().unwrap_or(0) + 1;
+        let attempt =
+            prepared.unwrap_or_else(|| run.attempts.get(step_id).copied().unwrap_or(0) + 1);
         run.attempts.insert(step_id.to_owned(), attempt);
         let Some((program, args)) = self.plugins.command(&step.plugin) else {
             let reason = format!("Plugin `{}` isn't installed", step.plugin);
@@ -1973,9 +2167,14 @@ impl Engine {
                 .into_iter()
                 .filter_map(|id| Some((id.clone(), run.outcomes.get(&id)?.clone())))
                 .collect(),
+            // Budgets (#73) set it.
+            budget_usd: None,
         });
         let path = self.plugins.path(&step.plugin, &self.step_path);
         let mut env = step_env(run.id, step_id, &path);
+        if let Some(dir) = self.plugins.config_dir(&step.plugin) {
+            env.push((CONFIG_DIR_ENV.to_owned(), dir));
+        }
         env.extend(
             handed
                 .iter()
@@ -2231,6 +2430,20 @@ impl Engine {
                     )?;
                 }
             }
+            Report::Message(FromStep::Error { reason }) if !reported => {
+                let plugin = self.active[&key]
+                    .pipeline
+                    .step(&step)
+                    .map_or("step", |step| step.plugin.as_str());
+                let reason = format!("error({plugin}): {reason}");
+                self.settle(
+                    &key,
+                    &step,
+                    Verdict::Error,
+                    Some(reason),
+                    Outputs::default(),
+                )?;
+            }
             Report::ProtocolError(message) if !reported => {
                 self.protocol_error(&key, &step, &message)?;
             }
@@ -2274,7 +2487,8 @@ impl Engine {
                 self.on_ask(&key, &step, &prompt)?;
             }
             // Usage counts even after a cancel: the call was made.
-            Report::Message(FromStep::Usage(usage)) => {
+            Report::Message(FromStep::Usage(mut usage)) => {
+                usage.usd = prices::usd(&usage);
                 self.journal
                     .append(report.run, RunEvent::StepUsage { step, usage })?;
                 return Ok(());
@@ -3252,7 +3466,8 @@ fn facts(snapshot: &PrSnapshot, files: &[String]) -> PrFacts {
 }
 
 /// A Step's whole environment: `PATH` with the login shell's merged in,
-/// the daemon's `HOME`, and which Run and Step it is. Secrets come later.
+/// the daemon's `HOME`, `USER` and `LOGNAME`, and which Run and Step it
+/// is. Secrets come later.
 fn step_env(run: RunId, step: &str, path: &str) -> Vec<(String, String)> {
     let mut env = vec![("PATH".to_owned(), path.to_owned())];
     env.extend(
@@ -3260,6 +3475,15 @@ fn step_env(run: RunId, step: &str, path: &str) -> Vec<(String, String)> {
             .ok()
             .map(|home| ("HOME".to_owned(), home)),
     );
+    // Who the developer is. Claude Code looks its Keychain login up
+    // under `$USER`, and finds nothing without it.
+    for name in ["USER", "LOGNAME"] {
+        env.extend(
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_owned(), value)),
+        );
+    }
     env.push(("SLOPWATCH_RUN".into(), run.to_string()));
     env.push(("SLOPWATCH_STEP".into(), step.to_owned()));
     env

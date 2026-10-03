@@ -393,6 +393,17 @@ impl RunView {
         self.steps.iter().find(|view| view.info.id == id)
     }
 
+    /// What the Run's Steps spent, `None` when none reported usage.
+    pub fn cost(&self) -> Option<Cost> {
+        self.steps
+            .iter()
+            .filter_map(|step| step.cost)
+            .reduce(|total, cost| Cost {
+                usd: total.usd + cost.usd,
+                unknown: total.unknown || cost.unknown,
+            })
+    }
+
     fn step_mut(&mut self, id: &str) -> Option<&mut StepView> {
         self.steps.iter_mut().find(|view| view.info.id == id)
     }
@@ -446,6 +457,7 @@ mod tests {
                 input_tokens: 300,
                 output_tokens: 0,
                 usd,
+                ..Usage::default()
             },
         };
         let mut view = RunView::default();
@@ -462,6 +474,11 @@ mod tests {
         assert_eq!(
             view.step("ci").unwrap().cost.unwrap().to_string(),
             "$0.0013 +?"
+        );
+        assert_eq!(
+            view.cost().unwrap().to_string(),
+            "$0.0013 +?",
+            "the Run's total"
         );
         assert_eq!(
             Cost {
