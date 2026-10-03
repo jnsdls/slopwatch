@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use slopwatch_daemon::auth::GhToken;
 use slopwatch_daemon::clones::Clones;
-use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::api::Api;
+use slopwatch_daemon::github::{GitHub, WATCH_LABEL};
 use slopwatch_protocol::RepoName;
 
 fn fixture() -> (RepoName, u64, u64) {
@@ -53,9 +53,15 @@ async fn the_api_lists_labels_and_polls_a_real_repo() {
 
     api.create_label(&repo).await.unwrap();
     api.create_label(&repo).await.unwrap();
-    api.set_label(&repo, on_pipeline, true).await.unwrap();
-    api.set_label(&repo, on_bare, false).await.unwrap();
-    api.set_label(&repo, on_bare, false).await.unwrap();
+    api.set_label(&repo, on_pipeline, WATCH_LABEL, true)
+        .await
+        .unwrap();
+    api.set_label(&repo, on_bare, WATCH_LABEL, false)
+        .await
+        .unwrap();
+    api.set_label(&repo, on_bare, WATCH_LABEL, false)
+        .await
+        .unwrap();
 
     let poll = api.poll(std::slice::from_ref(&repo)).await.unwrap();
     let prs = poll.repos[0].prs.clone().unwrap();
@@ -63,7 +69,9 @@ async fn the_api_lists_labels_and_polls_a_real_repo() {
     assert!(labeled(on_pipeline));
     assert!(!labeled(on_bare));
 
-    api.set_label(&repo, on_pipeline, false).await.unwrap();
+    api.set_label(&repo, on_pipeline, WATCH_LABEL, false)
+        .await
+        .unwrap();
     let missing = RepoName::new(repo.owner.clone(), "slopwatch-no-such-repo");
     let poll = api.poll(&[repo.clone(), missing]).await.unwrap();
     assert!(

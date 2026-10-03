@@ -13,7 +13,7 @@ use slopwatch_protocol::{
 };
 use tokio::sync::broadcast;
 
-use crate::github::{GitHub, GitHubError, OpenPr, Poll, RepoPoll};
+use crate::github::{GitHub, GitHubError, OpenPr, Poll, RepoPoll, WATCH_LABEL};
 use crate::pace::Pace;
 use crate::store::{Store, StoreError};
 
@@ -183,7 +183,9 @@ impl Watching {
             self.github.create_label(&repo).await?;
             self.state().store.mark_label_created(&repo)?;
         }
-        self.github.set_label(&repo, number, watched).await?;
+        self.github
+            .set_label(&repo, number, WATCH_LABEL, watched)
+            .await?;
 
         let mut state = self.state();
         if let Some(mut pr) = state.prs.get(&(repo.clone(), number)).cloned() {

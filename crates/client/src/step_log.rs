@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 
+use slopwatch_protocol::step::{Effect, EffectResult};
 use slopwatch_protocol::{
     Command, LogFilter, LogKey, LogLevel, LogPage, LogRecord, LogSource, RunEvent, StepLogPage,
     Truncation,
@@ -403,6 +404,27 @@ fn event_text(event: &RunEvent, key: &LogKey) -> Option<String> {
             Some(reason) => format!("Verdict {verdict}: {reason}"),
             None => format!("Verdict {verdict}"),
         }),
+        RunEvent::Effect {
+            step,
+            effect,
+            result,
+        } if *step == key.step => {
+            let effect = match effect {
+                Effect::Comment { .. } => "comment".to_owned(),
+                Effect::Label {
+                    name,
+                    remove: false,
+                } => format!("label `{name}`"),
+                Effect::Label { name, remove: true } => format!("removing label `{name}`"),
+                Effect::Rerun { check, .. } => format!("rerun of `{check}`"),
+            };
+            Some(match result {
+                EffectResult::Done => format!("{effect}: done"),
+                EffectResult::Dropped { reason } => format!("{effect}: dropped, {reason}"),
+                EffectResult::Refused { reason } => format!("{effect}: refused, {reason}"),
+                EffectResult::Failed { reason } => format!("{effect}: failed, {reason}"),
+            })
+        }
         _ => None,
     }
 }
@@ -684,6 +706,37 @@ mod tests {
         assert_eq!(
             rows,
             ["first", "— progress: halfway", "second", "— Verdict pass"]
+        );
+    }
+
+    #[test]
+    fn an_effect_reads_as_what_it_asked_and_what_became_of_it() {
+        let effect = |effect, result| RunEvent::Effect {
+            step: "ci".into(),
+            effect,
+            result,
+        };
+        let rerun = Effect::Rerun {
+            check: "test".into(),
+            job: 7,
+        };
+
+        assert_eq!(
+            event_text(&effect(rerun.clone(), EffectResult::Done), &key()).as_deref(),
+            Some("rerun of `test`: done")
+        );
+        assert_eq!(
+            event_text(
+                &effect(
+                    Effect::Comment { body: "hi".into() },
+                    EffectResult::Dropped {
+                        reason: "the Run had ended".into()
+                    }
+                ),
+                &key()
+            )
+            .as_deref(),
+            Some("comment: dropped, the Run had ended")
         );
     }
 

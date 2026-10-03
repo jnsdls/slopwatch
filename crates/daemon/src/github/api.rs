@@ -25,6 +25,8 @@ const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 const PAGE: usize = 100;
 /// Pages of repos to list in the add-repo picker.
 const MAX_REPO_PAGES: usize = 10;
+/// Pages of a PR's comments to search for an Effect's marker.
+const MAX_COMMENT_PAGES: usize = 30;
 const LABEL_COLOR: &str = "6f42c1";
 const LABEL_DESCRIPTION: &str = "Watched by slopwatch";
 
@@ -145,20 +147,70 @@ impl GitHub for Api {
         }
     }
 
-    async fn set_label(&self, repo: &RepoName, number: u64, on: bool) -> Result<(), GitHubError> {
+    async fn set_label(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        label: &str,
+        on: bool,
+    ) -> Result<(), GitHubError> {
         let labels = format!("/repos/{repo}/issues/{number}/labels");
         if on {
-            let body = json!({ "labels": [WATCH_LABEL] });
+            let body = json!({ "labels": [label] });
             return self.rest(Method::POST, &labels, Some(body)).await;
         }
-        match self
-            .rest(Method::DELETE, &format!("{labels}/{WATCH_LABEL}"), None)
-            .await
-        {
+        let path = format!("{labels}/{}", encode_segment(label));
+        match self.rest(Method::DELETE, &path, None).await {
             // The label was already off.
             Err(GitHubError::NotFound(_)) => Ok(()),
             other => other,
         }
+    }
+
+    async fn comment(&self, repo: &RepoName, number: u64, body: &str) -> Result<(), GitHubError> {
+        let path = format!("/repos/{repo}/issues/{number}/comments");
+        self.rest(Method::POST, &path, Some(json!({ "body": body })))
+            .await
+    }
+
+    async fn has_comment(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        marker: &str,
+    ) -> Result<bool, GitHubError> {
+        #[derive(Deserialize)]
+        struct Comment {
+            #[serde(default)]
+            body: Option<String>,
+        }
+        for page in 1..=MAX_COMMENT_PAGES {
+            let path =
+                format!("/repos/{repo}/issues/{number}/comments?per_page={PAGE}&page={page}");
+            let comments: Vec<Comment> = self
+                .send(|http| http.get(format!("{API}{path}")))
+                .await?
+                .json()
+                .await
+                .map_err(|error| GitHubError::Other(format!("unreadable comments: {error}")))?;
+            if comments
+                .iter()
+                .any(|comment| comment.body.as_deref().is_some_and(|b| b.contains(marker)))
+            {
+                return Ok(true);
+            }
+            if comments.len() < PAGE {
+                return Ok(false);
+            }
+        }
+        Err(GitHubError::Other(format!(
+            "{repo}#{number} has more comments than the daemon reads"
+        )))
+    }
+
+    async fn rerun_job(&self, repo: &RepoName, job: u64) -> Result<(), GitHubError> {
+        let path = format!("/repos/{repo}/actions/jobs/{job}/rerun");
+        self.rest(Method::POST, &path, None).await
     }
 
     async fn git_remote(&self, repo: &RepoName) -> Result<GitRemote, GitHubError> {
@@ -343,7 +395,7 @@ fn poll_query(repos: &[RepoName]) -> (String, Value) {
           state
           contexts(first: {PAGE}) {{ nodes {{
             __typename
-            ... on CheckRun {{ name status conclusion detailsUrl }}
+            ... on CheckRun {{ name status conclusion detailsUrl databaseId checkSuite {{ app {{ slug }} }} }}
             ... on StatusContext {{ context state targetUrl }}
           }} }}
         }} }} }} }}
@@ -526,6 +578,8 @@ enum Context {
         status: String,
         conclusion: Option<String>,
         details_url: Option<String>,
+        database_id: Option<u64>,
+        check_suite: Option<CheckSuite>,
     },
     #[serde(rename_all = "camelCase")]
     StatusContext {
@@ -536,6 +590,20 @@ enum Context {
     #[serde(other)]
     Other,
 }
+
+#[derive(Deserialize)]
+struct CheckSuite {
+    app: Option<App>,
+}
+
+#[derive(Deserialize)]
+struct App {
+    slug: String,
+}
+
+/// The app behind GitHub Actions check runs. An Actions check run's
+/// database id is its job's id.
+const ACTIONS_APP: &str = "github-actions";
 
 impl Rollup {
     fn checks(&self) -> Checks {
@@ -555,6 +623,8 @@ impl Rollup {
                         status,
                         conclusion,
                         details_url,
+                        database_id,
+                        check_suite,
                     } => Some(Check {
                         name: name.clone(),
                         state: match (status.as_str(), conclusion.as_deref()) {
@@ -565,6 +635,12 @@ impl Rollup {
                             _ => CheckState::Pending,
                         },
                         url: details_url.clone(),
+                        actions_job: database_id.filter(|_| {
+                            check_suite
+                                .as_ref()
+                                .and_then(|suite| suite.app.as_ref())
+                                .is_some_and(|app| app.slug == ACTIONS_APP)
+                        }),
                     }),
                     Context::StatusContext {
                         context,
@@ -578,12 +654,26 @@ impl Rollup {
                             _ => CheckState::Pending,
                         },
                         url: target_url.clone(),
+                        actions_job: None,
                     }),
                     Context::Other => None,
                 })
                 .collect(),
         }
     }
+}
+
+/// `text` as one URL path segment, such as a label name with a space or a
+/// slash in it.
+fn encode_segment(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 /// `Authorization` for git over HTTPS with a GitHub token.
@@ -737,6 +827,45 @@ mod tests {
             [RepoName::new("o", "admin"), RepoName::new("o", "write")]
         );
         assert_eq!(page.next.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn only_actions_check_runs_carry_a_job_to_rerun() {
+        let rollup: Rollup = serde_json::from_value(json!({
+            "state": "FAILURE",
+            "contexts": { "nodes": [
+                { "__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                  "conclusion": "FAILURE", "detailsUrl": null, "databaseId": 42,
+                  "checkSuite": { "app": { "slug": "github-actions" } } },
+                { "__typename": "CheckRun", "name": "vercel", "status": "COMPLETED",
+                  "conclusion": "FAILURE", "detailsUrl": null, "databaseId": 43,
+                  "checkSuite": { "app": { "slug": "vercel" } } },
+                { "__typename": "StatusContext", "context": "ci/legacy", "state": "FAILURE",
+                  "targetUrl": null },
+            ] },
+        }))
+        .unwrap();
+
+        let jobs: Vec<_> = rollup
+            .checks()
+            .runs
+            .iter()
+            .map(|check| (check.name.clone(), check.actions_job))
+            .collect();
+
+        assert_eq!(
+            jobs,
+            [
+                ("test".to_owned(), Some(42)),
+                ("vercel".to_owned(), None),
+                ("ci/legacy".to_owned(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_label_name_is_one_path_segment() {
+        assert_eq!(encode_segment("ticket-63/a b"), "ticket-63%2Fa%20b");
     }
 
     #[test]

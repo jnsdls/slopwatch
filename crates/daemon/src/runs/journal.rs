@@ -5,12 +5,13 @@
 
 use std::sync::Mutex;
 
+use slopwatch_protocol::step::EffectResult;
 use slopwatch_protocol::{RunEvent, RunId};
 use tokio::sync::broadcast;
 
 use super::now_ms;
 
-use crate::store::{Store, StoreError};
+use crate::store::{EffectRow, Store, StoreError};
 
 /// Live events a slow subscriber may fall behind by. One that falls
 /// further replays the rest from the stored journal.
@@ -51,9 +52,32 @@ impl Journal {
         Ok(seq)
     }
 
+    /// Closes an Effect intent with its result and appends the
+    /// [`RunEvent::Effect`] that says so, in one store transaction, so a
+    /// crash can't leave a closed intent missing from the Run's events.
+    pub fn close_effect(
+        &self,
+        intent: &EffectRow,
+        result: EffectResult,
+    ) -> Result<u64, StoreError> {
+        let live = self.live.lock().expect("no panics while appending");
+        let event = RunEvent::Effect {
+            step: intent.step.clone(),
+            effect: intent.effect.clone(),
+            result: result.clone(),
+        };
+        let text = serde_json::to_string(&event).expect("Run events always serialize");
+        let ts = now_ms();
+        let seq = self
+            .store
+            .finish_effect(intent.id, &result, intent.run, ts, &text)?;
+        let _ = live.send((intent.run, Journalled { seq, ts, event }));
+        Ok(seq)
+    }
+
     /// Prunes an ended Run's journal down to the events that rebuild its
-    /// record: the start, each Step's last settle, the last Gate and the
-    /// end. Then appends [`RunEvent::Pruned`], so a client that already
+    /// record: the start, each Step's last settle, the last Gate, the
+    /// Effects and the end. Then appends [`RunEvent::Pruned`], so a client that already
     /// had the Run learns its detail is gone. Folding what's left still
     /// gives the Run's final state, for a client starting from scratch or
     /// from any sequence number it had.
@@ -64,7 +88,10 @@ impl Journal {
         let mut gate = None;
         for Journalled { seq, event, .. } in self.replay(run, 0)? {
             match event {
-                RunEvent::Started { .. } | RunEvent::Ended { .. } => keep.push(seq),
+                // What a Step did on GitHub stays on record.
+                RunEvent::Started { .. } | RunEvent::Ended { .. } | RunEvent::Effect { .. } => {
+                    keep.push(seq)
+                }
                 RunEvent::StepSettled { step, .. } => {
                     settled.insert(step, seq);
                 }

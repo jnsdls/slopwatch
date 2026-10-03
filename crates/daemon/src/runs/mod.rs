@@ -35,6 +35,7 @@
 //! One lock serializes the engine: a sync and the reports from Step
 //! processes take turns. Reading a Pipeline from git happens outside it.
 
+mod effects;
 mod journal;
 pub mod log;
 pub mod process;
@@ -182,6 +183,7 @@ impl Runs {
             store: store.clone(),
             journal: Arc::clone(&journal),
             watching: Arc::clone(&watching),
+            github: Arc::clone(&github),
             reports,
             active: BTreeMap::new(),
             watched: watching
@@ -192,6 +194,7 @@ impl Runs {
                 .collect(),
             blocked: HashMap::new(),
             checked_base: HashMap::new(),
+            reconciled: false,
             stopped: false,
         };
         engine.load()?;
@@ -209,9 +212,12 @@ impl Runs {
         });
         let driver = Arc::clone(&runs);
         tokio::spawn(async move {
-            while let Some(report) = received.recv().await {
+            while let Some(input) = received.recv().await {
                 let mut engine = driver.engine.lock().await;
-                engine.on_report(report);
+                match input {
+                    Input::Step(report) => engine.on_report(report),
+                    Input::Effect(finished) => engine.on_effect_finished(finished),
+                }
                 engine.schedule();
                 driver
                     .live
@@ -477,7 +483,8 @@ struct Engine {
     data_dir: PathBuf,
     /// The `PATH` every Step gets.
     step_path: String,
-    reports: mpsc::UnboundedSender<StepReport>,
+    github: Arc<dyn GitHub>,
+    reports: mpsc::UnboundedSender<Input>,
     /// The Run going on each PR. A PR has at most one.
     active: BTreeMap<PrKey, Active>,
     /// Steps the plan starts that wait for a free slot, oldest first.
@@ -493,6 +500,9 @@ struct Engine {
     /// The base SHA whose Pipeline each PR's latest Run was last compared
     /// with, so a base commit that leaves the Pipeline alone is read once.
     checked_base: HashMap<PrKey, String>,
+    /// The Effect intents a crash left open have been settled, which waits
+    /// for the first sync (ADR 0009).
+    reconciled: bool,
     /// The daemon is about to exit: nothing more changes.
     stopped: bool,
 }
@@ -558,6 +568,14 @@ struct Running {
     handle: StepHandle,
     /// The Step reported its Outcome, and only its exit is still to come.
     reported: bool,
+    /// The request ids of Effects it asked for that haven't finished.
+    awaiting: HashSet<String>,
+}
+
+/// What the engine hears from the tasks around it.
+enum Input {
+    Step(StepReport),
+    Effect(effects::Finished),
 }
 
 struct StepReport {
@@ -754,6 +772,10 @@ impl Engine {
             }
             // New PR facts, such as a label, can turn a Condition.
             self.advance(&key)?;
+        }
+        if !self.reconciled {
+            self.reconcile_effects()?;
+            self.reconciled = true;
         }
 
         let mut starts = Vec::new();
@@ -1179,12 +1201,12 @@ impl Engine {
                     limits,
                 },
                 move |report| {
-                    let _ = reports.send(StepReport {
+                    let _ = reports.send(Input::Step(StepReport {
                         run: id,
                         step: name.clone(),
                         attempt,
                         report,
-                    });
+                    }));
                 },
             )
         });
@@ -1229,6 +1251,7 @@ impl Engine {
                 attempt,
                 handle,
                 reported: false,
+                awaiting: HashSet::new(),
             },
         );
         self.journal.append(
@@ -1353,6 +1376,9 @@ impl Engine {
     }
 
     fn try_on_report(&mut self, report: StepReport) -> Result<(), StoreError> {
+        if let Report::Message(FromStep::Effect { id, effect }) = report.report {
+            return self.on_effect(report.run, &report.step, report.attempt, id, effect);
+        }
         if matches!(report.report, Report::Exited(_)) {
             self.processes
                 .remove(&(report.run, report.step.clone(), report.attempt));
@@ -1394,17 +1420,7 @@ impl Engine {
                 }
             }
             Report::ProtocolError(message) if !reported => {
-                let reason = format!("error(protocol): {message}");
-                self.settle(
-                    &key,
-                    &step,
-                    Verdict::Error,
-                    Some(reason),
-                    Outputs::default(),
-                )?;
-                if let Some(running) = self.active[&key].running.get(&step) {
-                    running.handle.cancel();
-                }
+                self.protocol_error(&key, &step, &message)?;
             }
             Report::Tripped(tripped) if !reported => {
                 let reason = match tripped {
@@ -1454,6 +1470,17 @@ impl Engine {
             Report::Message(_) | Report::ProtocolError(_) | Report::Tripped(_) => return Ok(()),
         }
         self.advance(&key)
+    }
+
+    /// Settles a Step that broke the Step protocol as `error(protocol)` and
+    /// cancels its process.
+    fn protocol_error(&mut self, key: &PrKey, step: &str, message: &str) -> Result<(), StoreError> {
+        let reason = format!("error(protocol): {message}");
+        self.settle(key, step, Verdict::Error, Some(reason), Outputs::default())?;
+        if let Some(running) = self.active[key].running.get(step) {
+            running.handle.cancel();
+        }
+        Ok(())
     }
 
     /// Ends `run`. Its running Steps, and the ones a restart interrupted,

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use slopwatch_core::{EndReason, GateState, ReuseKey, Verdict};
-use slopwatch_protocol::step::Outputs;
+use slopwatch_protocol::step::{Effect, EffectResult, Outputs};
 use slopwatch_protocol::{RepoName, RunId, RunSummary};
 
 use crate::github::OpenPr;
@@ -101,6 +101,24 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE run_events ADD COLUMN ts INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE runs ADD COLUMN pruned_at INTEGER;
 ",
+    // The Effect intent journal (ADR 0009): a row before the daemon calls
+    // GitHub, its result after. `request` is the Step's own id for it, and
+    // `head_sha` the head the Run expected.
+    "
+    CREATE TABLE effects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        step TEXT NOT NULL,
+        request TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        head_sha TEXT NOT NULL,
+        effect TEXT NOT NULL,
+        result TEXT,
+        UNIQUE (run_id, step, request)
+    );
+    CREATE INDEX effects_by_head ON effects (repo, head_sha);
+",
 ];
 
 #[derive(Clone)]
@@ -173,6 +191,34 @@ pub struct UnprunedRun {
     pub journal_bytes: u64,
     /// A Run whose detail is kept reuses one of this Run's Outcomes.
     pub reused: bool,
+}
+
+/// One row of the Effect intent journal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectRow {
+    pub id: i64,
+    pub run: RunId,
+    pub step: String,
+    /// The Step's own id for the request.
+    pub request: String,
+    pub repo: RepoName,
+    pub number: u64,
+    /// The head the Run expected when the daemon took the request.
+    pub head_sha: String,
+    pub effect: Effect,
+    /// `None` while the intent is open.
+    pub result: Option<EffectResult>,
+}
+
+/// An Effect intent as the daemon records it, before calling GitHub.
+pub struct NewEffect<'a> {
+    pub run: RunId,
+    pub step: &'a str,
+    pub request: &'a str,
+    pub repo: &'a RepoName,
+    pub number: u64,
+    pub head_sha: &'a str,
+    pub effect: &'a Effect,
 }
 
 /// A Run that hasn't ended, as the store keeps it.
@@ -850,6 +896,135 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Records an open Effect intent.
+    pub fn insert_effect(&self, effect: &NewEffect<'_>) -> Result<EffectRow, StoreError> {
+        let db = self.db();
+        db.execute(
+            "INSERT INTO effects (run_id, step, request, repo, number, head_sha, effect)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                effect.run.0 as i64,
+                effect.step,
+                effect.request,
+                effect.repo.to_string(),
+                effect.number as i64,
+                effect.head_sha,
+                to_json(effect.effect),
+            ],
+        )?;
+        Ok(EffectRow {
+            id: db.last_insert_rowid(),
+            run: effect.run,
+            step: effect.step.to_owned(),
+            request: effect.request.to_owned(),
+            repo: effect.repo.clone(),
+            number: effect.number,
+            head_sha: effect.head_sha.to_owned(),
+            effect: effect.effect.clone(),
+            result: None,
+        })
+    }
+
+    /// Closes an intent with what became of it and appends `event`, which
+    /// says so, to its Run's journal, both or neither. Returns the event's
+    /// sequence number.
+    pub fn finish_effect(
+        &self,
+        id: i64,
+        result: &EffectResult,
+        run: RunId,
+        ts: i64,
+        event: &str,
+    ) -> Result<u64, StoreError> {
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE effects SET result = ?2 WHERE id = ?1",
+            params![id, to_json(result)],
+        )?;
+        let seq = append_event(&tx, run, ts, event)?;
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// The intent a Step recorded under its own `request` id in a Run.
+    pub fn effect_by_request(
+        &self,
+        run: RunId,
+        step: &str,
+        request: &str,
+    ) -> Result<Option<EffectRow>, StoreError> {
+        self.db()
+            .query_row(
+                &format!("{SELECT_EFFECT} WHERE run_id = ?1 AND step = ?2 AND request = ?3"),
+                params![run.0 as i64, step, request],
+                effect_row,
+            )
+            .optional()
+    }
+
+    /// Intents the daemon recorded but never closed, oldest first.
+    pub fn open_effects(&self) -> Result<Vec<EffectRow>, StoreError> {
+        let db = self.db();
+        let mut query = db.prepare(&format!("{SELECT_EFFECT} WHERE result IS NULL ORDER BY id"))?;
+        let rows = query.query_map([], effect_row)?;
+        rows.collect()
+    }
+
+    /// Whether any Run asked GitHub to rerun the check named `check` on
+    /// `head_sha` in `repo`. A rerun GitHub refused counts too: after a
+    /// crash the daemon redoes a rerun, and GitHub refuses one already
+    /// under way, so a refusal can't tell that the check never reran.
+    pub fn reran(&self, repo: &RepoName, head_sha: &str, check: &str) -> Result<bool, StoreError> {
+        self.db()
+            .query_row(
+                "SELECT 1 FROM effects
+                 WHERE repo = ?1 AND head_sha = ?2
+                   AND json_extract(effect, '$.kind') = 'rerun'
+                   AND json_extract(effect, '$.check') = ?3
+                   AND (result IS NULL
+                        OR json_extract(result, '$.status') IN ('done', 'failed'))
+                 LIMIT 1",
+                params![repo.to_string(), head_sha, check],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+    }
+}
+
+const SELECT_EFFECT: &str =
+    "SELECT id, run_id, step, request, repo, number, head_sha, effect, result FROM effects";
+
+fn effect_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EffectRow> {
+    fn json<T: serde::de::DeserializeOwned>(index: usize, text: String) -> rusqlite::Result<T> {
+        serde_json::from_str(&text).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+    }
+    Ok(EffectRow {
+        id: row.get(0)?,
+        run: RunId(row.get::<_, i64>(1)? as u64),
+        step: row.get(2)?,
+        request: row.get(3)?,
+        repo: parse_repo(&row.get::<_, String>(4)?),
+        number: row.get::<_, i64>(5)? as u64,
+        head_sha: row.get(6)?,
+        effect: json(7, row.get(7)?)?,
+        result: row
+            .get::<_, Option<String>>(8)?
+            .map(|text| json(8, text))
+            .transpose()?,
+    })
+}
+
+fn to_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("Effects and their results always serialize")
 }
 
 fn append_event(db: &Connection, run: RunId, ts: i64, event: &str) -> Result<u64, StoreError> {
@@ -1246,5 +1421,93 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    fn intent<'a>(
+        run: RunId,
+        repo: &'a RepoName,
+        request: &'a str,
+        effect: &'a Effect,
+    ) -> NewEffect<'a> {
+        NewEffect {
+            run,
+            step: "ci",
+            request,
+            repo,
+            number: 7,
+            head_sha: "aaa",
+            effect,
+        }
+    }
+
+    fn finish(store: &Store, row: &EffectRow, result: EffectResult) {
+        store
+            .finish_effect(row.id, &result, row.run, 1, "{}")
+            .unwrap();
+    }
+
+    #[test]
+    fn an_effect_intent_stays_open_across_a_restart_until_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let repo = RepoName::new("o", "r");
+        let comment = Effect::Comment { body: "hi".into() };
+        let (run, row) = {
+            let store = Store::open(&path).unwrap();
+            let run = store.insert_run(&new_run(&repo, "aaa"), 1).unwrap();
+            let row = store
+                .insert_effect(&intent(run, &repo, "hello", &comment))
+                .unwrap();
+            (run, row)
+        };
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.open_effects().unwrap(), std::slice::from_ref(&row));
+        assert_eq!(row.effect, comment);
+
+        finish(&store, &row, EffectResult::Done);
+        assert!(store.open_effects().unwrap().is_empty());
+        let found = store.effect_by_request(run, "ci", "hello").unwrap();
+        assert_eq!(found.unwrap().result, Some(EffectResult::Done));
+        assert_eq!(store.effect_by_request(run, "ci", "other").unwrap(), None);
+        assert_eq!(
+            store.events_after(run, 0).unwrap().len(),
+            1,
+            "closing the intent journals its event"
+        );
+    }
+
+    #[test]
+    fn a_check_counts_as_rerun_on_a_sha_once_github_was_asked() {
+        let store = Store::in_memory();
+        let repo = RepoName::new("o", "r");
+        let run = store.insert_run(&new_run(&repo, "aaa"), 1).unwrap();
+        let rerun = |request: &str, check: &str| {
+            let effect = Effect::Rerun {
+                check: check.into(),
+                job: 1,
+            };
+            store
+                .insert_effect(&intent(run, &repo, request, &effect))
+                .unwrap()
+        };
+
+        let test = rerun("a", "test");
+        let lint = rerun("b", "lint");
+        let build = rerun("c", "build");
+        let reason = "403".to_owned();
+        finish(&store, &lint, EffectResult::Failed { reason });
+        let reason = "the Run ended while the daemon was down".to_owned();
+        finish(&store, &build, EffectResult::Dropped { reason });
+
+        assert!(store.reran(&repo, "aaa", "test").unwrap(), "while open");
+        finish(&store, &test, EffectResult::Done);
+        assert!(store.reran(&repo, "aaa", "test").unwrap());
+        assert!(!store.reran(&repo, "bbb", "test").unwrap(), "another SHA");
+        assert!(
+            store.reran(&repo, "aaa", "lint").unwrap(),
+            "GitHub refused it"
+        );
+        assert!(!store.reran(&repo, "aaa", "build").unwrap(), "never asked");
     }
 }

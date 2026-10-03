@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use slopwatch_protocol::RepoName;
-use slopwatch_protocol::step::Checks;
+use slopwatch_protocol::step::{CheckState, Checks, ChecksState};
 
 use super::{
     GitHub, GitHubError, GitRemote, OpenPr, PIPELINE_PATH, Poll, PrDetail, RateLimit, RepoPoll,
@@ -38,6 +38,21 @@ struct State {
     polls: usize,
     fail_polls: Option<GitHubError>,
     commits: u64,
+    hold_comments: Option<Hold>,
+    /// Comment calls so far, held ones included.
+    comment_calls: usize,
+    /// Every Actions job rerun, in order.
+    reruns: Vec<u64>,
+    /// The id the next Actions job gets.
+    next_job: u64,
+}
+
+/// Where a comment call stops and never returns, the way a daemon killed
+/// mid-call leaves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    BeforePosting,
+    AfterPosting,
 }
 
 struct Repo {
@@ -56,6 +71,7 @@ struct Pr {
     open: bool,
     labels: BTreeSet<String>,
     checks: Checks,
+    comments: Vec<String>,
 }
 
 const LIMIT: u32 = 5000;
@@ -72,6 +88,10 @@ impl FakeGitHub {
                 polls: 0,
                 fail_polls: None,
                 commits: 0,
+                hold_comments: None,
+                comment_calls: 0,
+                reruns: Vec::new(),
+                next_job: 1_000,
             }),
             origins: tempfile::tempdir().expect("create a directory for the fake's git repos"),
         }
@@ -147,6 +167,7 @@ impl FakeGitHub {
                     open: true,
                     labels: BTreeSet::new(),
                     checks: Checks::default(),
+                    comments: Vec::new(),
                 },
             );
         });
@@ -254,6 +275,32 @@ impl FakeGitHub {
 
     pub fn polls(&self) -> usize {
         self.with(|state| state.polls)
+    }
+
+    /// The comments on the PR, oldest first.
+    pub fn comments(&self, repo: &RepoName, number: u64) -> Vec<String> {
+        self.with(|state| state.pr(repo, number).comments.clone())
+    }
+
+    /// The labels on the PR.
+    pub fn labels(&self, repo: &RepoName, number: u64) -> BTreeSet<String> {
+        self.with(|state| state.pr(repo, number).labels.clone())
+    }
+
+    /// Makes comment calls hang at `hold` until cleared with `None`. A
+    /// call already held stays held.
+    pub fn hold_comments(&self, hold: Option<Hold>) {
+        self.with(|state| state.hold_comments = hold);
+    }
+
+    /// Comment calls so far, held ones included.
+    pub fn comment_calls(&self) -> usize {
+        self.with(|state| state.comment_calls)
+    }
+
+    /// Every Actions job rerun so far, in order.
+    pub fn reruns(&self) -> Vec<u64> {
+        self.with(|state| state.reruns.clone())
     }
 }
 
@@ -477,21 +524,91 @@ impl GitHub for FakeGitHub {
         })
     }
 
-    async fn set_label(&self, repo: &RepoName, number: u64, on: bool) -> Result<(), GitHubError> {
+    async fn set_label(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        label: &str,
+        on: bool,
+    ) -> Result<(), GitHubError> {
         self.with(|state| {
             let not_found = || GitHubError::NotFound(format!("{repo}#{number}"));
             let fake = state.repos.get_mut(repo).ok_or_else(not_found)?;
-            if on && !fake.label_exists {
+            if on && label == WATCH_LABEL && !fake.label_exists {
                 // The REST API would create a bare label here. The daemon
                 // should have created it first, so fail loudly instead.
                 return Err(GitHubError::Other(format!("{repo} has no slopwatch label")));
             }
             let pr = fake.prs.get_mut(&number).ok_or_else(not_found)?;
             if on {
-                pr.labels.insert(WATCH_LABEL.to_owned());
+                pr.labels.insert(label.to_owned());
             } else {
-                pr.labels.remove(WATCH_LABEL);
+                pr.labels.remove(label);
             }
+            Ok(())
+        })
+    }
+
+    async fn comment(&self, repo: &RepoName, number: u64, body: &str) -> Result<(), GitHubError> {
+        let hold = self.with(|state| {
+            state.comment_calls += 1;
+            let hold = state.hold_comments;
+            if hold != Some(Hold::BeforePosting) {
+                let pr = state
+                    .repos
+                    .get_mut(repo)
+                    .and_then(|fake| fake.prs.get_mut(&number))
+                    .ok_or_else(|| GitHubError::NotFound(format!("{repo}#{number}")))?;
+                pr.comments.push(body.to_owned());
+            }
+            Ok(hold)
+        })?;
+        if hold.is_some() {
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
+    async fn has_comment(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        marker: &str,
+    ) -> Result<bool, GitHubError> {
+        self.with(|state| {
+            let pr = state
+                .repos
+                .get(repo)
+                .and_then(|fake| fake.prs.get(&number))
+                .ok_or_else(|| GitHubError::NotFound(format!("{repo}#{number}")))?;
+            Ok(pr.comments.iter().any(|comment| comment.contains(marker)))
+        })
+    }
+
+    /// Like GitHub, replaces the job's check with a pending one on a new
+    /// job.
+    async fn rerun_job(&self, repo: &RepoName, job: u64) -> Result<(), GitHubError> {
+        self.with(|state| {
+            let next = state.next_job;
+            let check = state
+                .repos
+                .get_mut(repo)
+                .into_iter()
+                .flat_map(|fake| fake.prs.values_mut())
+                .find_map(|pr| {
+                    let found = pr
+                        .checks
+                        .runs
+                        .iter_mut()
+                        .find(|check| check.actions_job == Some(job))?;
+                    found.state = CheckState::Pending;
+                    found.actions_job = Some(next);
+                    pr.checks.state = ChecksState::Pending;
+                    Some(())
+                });
+            check.ok_or_else(|| GitHubError::NotFound(format!("job {job} in {repo}")))?;
+            state.next_job += 1;
+            state.reruns.push(job);
             Ok(())
         })
     }

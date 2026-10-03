@@ -22,7 +22,7 @@ pub use logs::{
     LogFilter, LogKey, LogLevel, LogPage, LogRecord, LogSource, MAX_PAGE, StepLogPage,
     StorageWarning, Truncation,
 };
-pub use runs::{RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView};
+pub use runs::{EffectView, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView};
 pub use topics::{
     PollState, PrStatus, PullRequest, RepoName, Topic, TopicUpdate, WatchedPrs, WatchedPrsDelta,
     WatchedPrsUpdate,

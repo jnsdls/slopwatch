@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use slopwatch_core::{EndReason, GateState, Verdict};
 
 use crate::RepoName;
-use crate::step::Outputs;
+use crate::step::{Effect, EffectResult, Outputs};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -77,6 +77,14 @@ pub enum RunEvent {
     Gate {
         state: GateState,
     },
+    /// What became of an Effect a Step requested. An Effect still in
+    /// flight when the Run ends, or one a Step requests after it ended,
+    /// lands after `ended`.
+    Effect {
+        step: String,
+        effect: Effect,
+        result: EffectResult,
+    },
     Ended {
         reason: EndReason,
     },
@@ -118,6 +126,15 @@ pub struct RunView {
     pub end: Option<EndReason>,
     /// When the Run's detail was pruned, in seconds since the Unix epoch.
     pub pruned_at: Option<i64>,
+    /// Every Effect the Run's Steps requested, in the order they finished.
+    pub effects: Vec<EffectView>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectView {
+    pub step: String,
+    pub effect: Effect,
+    pub result: EffectResult,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,6 +230,15 @@ impl RunView {
                 }
             }
             RunEvent::Gate { state } => self.gate = Some(state),
+            RunEvent::Effect {
+                step,
+                effect,
+                result,
+            } => self.effects.push(EffectView {
+                step,
+                effect,
+                result,
+            }),
             RunEvent::Ended { reason } => self.end = Some(reason),
             RunEvent::Pruned { at } => self.pruned_at = Some(at),
         }

@@ -6,6 +6,8 @@
 //! line both ways over stdio. The daemon sends [`ToStep::Start`] first, then
 //! [`ToStep::PrUpdated`] and [`ToStep::Cancel`] as they happen. The Step
 //! sends [`FromStep`] messages, exactly one of them an outcome, then exits.
+//! A Step changes GitHub only by sending [`FromStep::Effect`], and the
+//! daemon answers each with [`ToStep::EffectResult`].
 //! Stdout carries protocol messages only. Stderr is free-form and goes to
 //! the Step log.
 
@@ -36,9 +38,10 @@ pub struct Manifest {
     #[serde(default)]
     pub config_schema: Value,
     pub workspace: Workspace,
-    /// Effects the Step may request.
+    /// Effects the Step may request. Requesting any other is a protocol
+    /// error.
     #[serde(default)]
-    pub effects: Vec<String>,
+    pub effects: Vec<EffectKind>,
     /// Env var names of the Secrets the Step needs.
     #[serde(default)]
     pub secrets: Vec<String>,
@@ -66,6 +69,11 @@ pub enum ToStep {
     /// Stop now. Whatever the Step reports afterwards, its Verdict is
     /// cancelled.
     Cancel,
+    /// What became of the Effect the Step requested under `id`.
+    EffectResult {
+        id: String,
+        result: EffectResult,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,8 +103,79 @@ pub enum FromStep {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         level: Option<LogLevel>,
     },
+    /// Asks the daemon to change something on GitHub. `id` is the Step's
+    /// own name for the request, unique within the Step. Sending the same
+    /// `id` and Effect again, as a Step respawned after a daemon restart
+    /// does, doesn't repeat the change: the answer is the first request's
+    /// result. The same `id` with a different Effect is refused.
+    Effect { id: String, effect: Effect },
     /// The Step's one Outcome. It exits after sending it.
     Outcome(Outcome),
+}
+
+/// A change on GitHub that a Step asks for and the daemon carries out with
+/// the developer's token, only while the Step's Run is still current
+/// (ADR 0003). The list is closed: anything else is a protocol error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Effect {
+    /// Posts a comment on the PR.
+    Comment { body: String },
+    /// Adds a label to the PR, or removes it.
+    Label {
+        name: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        remove: bool,
+    },
+    /// Reruns the failed GitHub Actions job `job` behind the check named
+    /// `check` on the Run's head commit (see [`Check::actions_job`]). Each
+    /// check gets one rerun per head SHA (ADR 0008).
+    Rerun { check: String, job: u64 },
+}
+
+impl Effect {
+    pub fn kind(&self) -> EffectKind {
+        match self {
+            Effect::Comment { .. } => EffectKind::Comment,
+            Effect::Label { .. } => EffectKind::Label,
+            Effect::Rerun { .. } => EffectKind::Rerun,
+        }
+    }
+}
+
+/// An [`Effect`] by name, as a manifest declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectKind {
+    Comment,
+    Label,
+    Rerun,
+}
+
+impl std::fmt::Display for EffectKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EffectKind::Comment => "comment",
+            EffectKind::Label => "label",
+            EffectKind::Rerun => "rerun",
+        })
+    }
+}
+
+/// What became of a requested Effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum EffectResult {
+    /// GitHub has it.
+    Done,
+    /// The Step's Run had ended, or the Step had settled, so the daemon
+    /// didn't carry it out.
+    Dropped { reason: String },
+    /// The daemon won't carry it out, such as a second rerun of one check
+    /// on one SHA.
+    Refused { reason: String },
+    /// GitHub refused it or couldn't be reached. The daemon doesn't retry.
+    Failed { reason: String },
 }
 
 /// What one Step reports for one Run.
@@ -196,6 +275,11 @@ pub struct Check {
     pub state: CheckState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The GitHub Actions job behind a check run, which the `rerun` Effect
+    /// reruns. `None` for other apps' check runs and for commit statuses,
+    /// which the developer's token can't rerun.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actions_job: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,5 +354,51 @@ mod tests {
         assert_eq!(manifest.workspace, Workspace::None);
         assert!(manifest.effects.is_empty());
         assert_eq!(manifest.timeout, None);
+    }
+
+    #[test]
+    fn an_effect_request_names_its_kind_and_the_result_its_status() {
+        let line = r#"{"type":"effect","id":"rerun:test","effect":{"kind":"rerun","check":"test","job":42}}"#;
+
+        let request: FromStep = serde_json::from_str(line).unwrap();
+
+        assert_eq!(
+            request,
+            FromStep::Effect {
+                id: "rerun:test".into(),
+                effect: Effect::Rerun {
+                    check: "test".into(),
+                    job: 42,
+                },
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(ToStep::EffectResult {
+                id: "c".into(),
+                result: EffectResult::Refused {
+                    reason: "no".into()
+                },
+            })
+            .unwrap(),
+            json!({
+                "type": "effect_result",
+                "id": "c",
+                "result": { "status": "refused", "reason": "no" },
+            })
+        );
+    }
+
+    #[test]
+    fn an_effect_outside_the_closed_list_doesnt_read() {
+        let line = r#"{"type":"effect","id":"x","effect":{"kind":"deploy"}}"#;
+
+        assert!(serde_json::from_str::<FromStep>(line).is_err());
+        assert!(
+            serde_json::from_value::<Manifest>(json!({
+                "id": "x", "version": "1", "dialect": 1, "workspace": "none",
+                "effects": ["deploy"],
+            }))
+            .is_err()
+        );
     }
 }

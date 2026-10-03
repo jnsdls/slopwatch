@@ -92,6 +92,7 @@ fn checks(state: ChecksState, check: CheckState) -> Checks {
             name: "test".into(),
             state: check,
             url: None,
+            actions_job: None,
         }],
     }
 }
