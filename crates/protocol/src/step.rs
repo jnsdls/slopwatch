@@ -7,7 +7,9 @@
 //! [`ToStep::PrUpdated`] and [`ToStep::Cancel`] as they happen. The Step
 //! sends [`FromStep`] messages, exactly one of them an outcome, then exits.
 //! A Step changes GitHub only by sending [`FromStep::Effect`], and the
-//! daemon answers each with [`ToStep::EffectResult`].
+//! daemon answers each with [`ToStep::EffectResult`]. The built-in `human`
+//! Plugin sends [`FromStep::Ask`] to put a question to the developer, and
+//! the daemon passes their [`ToStep::Answer`] on.
 //! Stdout carries protocol messages only. Stderr is free-form and goes to
 //! the Step log.
 
@@ -17,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use slopwatch_core::{Verdict, Workspace};
 
-use crate::RepoName;
 use crate::logs::LogLevel;
 use crate::runs::RunId;
+use crate::{Actor, Answer, RepoName};
 
 /// The Step protocol dialect. A Plugin's manifest must name exactly this
 /// one. Additions an older peer can ignore are feature strings instead.
@@ -122,6 +124,14 @@ pub enum ToStep {
         id: String,
         result: EffectResult,
     },
+    /// The developer's answer to the Step's [`FromStep::Ask`], with the
+    /// note they wrote, if any, and who answered.
+    Answer {
+        answer: Answer,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        actor: Actor,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -157,6 +167,12 @@ pub enum FromStep {
     /// does, doesn't repeat the change: the answer is the first request's
     /// result. The same `id` with a different Effect is refused.
     Effect { id: String, effect: Effect },
+    /// Puts `prompt` to the developer as a Human Step in the Inbox. The
+    /// daemon sends [`ToStep::Answer`] once they approve or reject. Asking
+    /// again, as a Step respawned after a daemon restart does, keeps the
+    /// entry that's already open. Only the built-in `human` Plugin may ask,
+    /// and any other Step that does gets `error(protocol)`.
+    Ask { prompt: String },
     /// The Step's one Outcome. It exits after sending it.
     Outcome(Outcome),
 }
@@ -627,6 +643,41 @@ mod tests {
             serde_json::from_value(json!({ "status": "blocked", "behind_by": 2 })).unwrap();
         assert_eq!(state.status, MergeStatus::Blocked);
         assert_eq!(state.behind_by, Some(2));
+    }
+
+    #[test]
+    fn a_step_asks_with_a_prompt_and_hears_the_answer_with_its_note_and_actor() {
+        let ask: FromStep = serde_json::from_str(r#"{"type":"ask","prompt":"Ship it?"}"#).unwrap();
+        assert_eq!(
+            ask,
+            FromStep::Ask {
+                prompt: "Ship it?".into()
+            }
+        );
+
+        let answer = ToStep::Answer {
+            answer: Answer::Approve,
+            note: Some("rename the flag".into()),
+            actor: Actor::Developer { via: "gui".into() },
+        };
+        assert_eq!(
+            serde_json::to_value(&answer).unwrap(),
+            json!({
+                "type": "answer",
+                "answer": "approve",
+                "note": "rename the flag",
+                "actor": { "kind": "developer", "via": "gui" },
+            })
+        );
+        let bare = ToStep::Answer {
+            answer: Answer::Reject,
+            note: None,
+            actor: Actor::Developer { via: "gui".into() },
+        };
+        assert!(
+            serde_json::to_value(bare).unwrap().get("note").is_none(),
+            "no note, no key"
+        );
     }
 
     #[test]

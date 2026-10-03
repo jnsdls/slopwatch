@@ -22,7 +22,8 @@ pub use frames::{
     RefusalReason, Reply, Request, RequestId, Response, ResponseBody, ServerFrame, ServerHello,
 };
 pub use inbox::{
-    Cause, Closed, Closing, EntryId, Inbox, InboxDelta, InboxEntry, InboxUpdate, PrRef, Scope,
+    Answer, Cause, Closed, Closing, EntryId, Inbox, InboxDelta, InboxEntry, InboxUpdate, PrRef,
+    Scope,
 };
 pub use logs::{
     LogFilter, LogKey, LogLevel, LogPage, LogRecord, LogSource, MAX_PAGE, StepLogPage,
@@ -77,6 +78,9 @@ pub const DIALECT: u32 = 1;
 ///
 /// `secrets`: the `list_secrets`, `set_secret` and `delete_secret`
 /// commands, and the `missing_secret` Inbox cause.
+///
+/// `human_steps`: the `answer_step` command and Human Step entries in the
+/// Inbox.
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -88,6 +92,7 @@ pub const FEATURES: &[&str] = &[
     "inbox",
     "notifications",
     "secrets",
+    "human_steps",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

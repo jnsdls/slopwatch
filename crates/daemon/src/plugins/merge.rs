@@ -323,6 +323,8 @@ pub fn run(input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
                 }
             }
             Ok(ToStep::Cancel) => return Ok(()),
+            // `merge` never asks, so no answer comes.
+            Ok(ToStep::Answer { .. }) => continue,
             Err(error) => {
                 eprintln!("merge: can't read a message from the daemon: {error}");
                 return Ok(());

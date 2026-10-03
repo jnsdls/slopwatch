@@ -1,7 +1,8 @@
-//! The Inbox: every open Escalation across repos, oldest first, on the
-//! `inbox` topic as a snapshot, then deltas with sequence numbers. Each
-//! Escalation belongs to a Run, a Watched PR or a cause shared across PRs,
-//! and that scope decides what closes it. A closed entry leaves the Inbox
+//! The Inbox: every open Human Step and Escalation across repos, oldest
+//! first, on the `inbox` topic as a snapshot, then deltas with sequence
+//! numbers. A Human Step belongs to its Run. Each Escalation belongs to a
+//! Run, a Watched PR or a cause shared across PRs, and that scope decides
+//! what closes it. A closed entry leaves the Inbox
 //! and stays in the record of every Run it touched, through the Run's
 //! `inbox` events.
 
@@ -21,13 +22,13 @@ impl fmt::Display for EntryId {
     }
 }
 
-/// One Escalation, open or closed.
+/// One Human Step or Escalation, open or closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxEntry {
     /// Ids grow in the order entries open, so they sort oldest first.
     pub id: EntryId,
     pub scope: Scope,
-    /// One line, such as "Not shippable".
+    /// One line, such as "Not shippable", or a Human Step's prompt.
     pub title: String,
     /// What the developer needs to know, one line each.
     pub reasons: Vec<String>,
@@ -46,6 +47,14 @@ impl InboxEntry {
         matches!(self.scope, Scope::Pr)
     }
 
+    /// The Run it belongs to, for a Run entry or a Human Step.
+    pub fn run(&self) -> Option<RunId> {
+        match self.scope {
+            Scope::Run { run, .. } | Scope::Human { run, .. } => Some(run),
+            Scope::Pr | Scope::Cause { .. } => None,
+        }
+    }
+
     pub fn holds(&self, repo: &RepoName, number: u64) -> bool {
         self.prs
             .iter()
@@ -53,7 +62,7 @@ impl InboxEntry {
     }
 }
 
-/// What an Escalation belongs to.
+/// What an entry is and what it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Scope {
@@ -72,6 +81,30 @@ pub enum Scope {
     /// A cause that holds back every PR it lists. It closes when the daemon
     /// sees it cleared, which starts a Run for every PR it held back.
     Cause { cause: Cause },
+    /// A Human Step waiting for the developer to approve or reject. It
+    /// closes when they answer, when the Step settles some other way, or
+    /// when the Run ends. It isn't an Escalation, and it can't be
+    /// dismissed.
+    Human { run: RunId, step: String },
+}
+
+/// The developer's answer to a Human Step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Answer {
+    /// The Step passes.
+    Approve,
+    /// The Step fails, and the Run ends without raising an Escalation.
+    Reject,
+}
+
+impl fmt::Display for Answer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Answer::Approve => "approve",
+            Answer::Reject => "reject",
+        })
+    }
 }
 
 /// A cause shared across PRs.
@@ -109,9 +142,10 @@ pub struct Closed {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "how", rename_all = "snake_case")]
 pub enum Closing {
-    /// The developer acted on it, such as retrying the errored Step.
+    /// The developer acted on it, such as retrying the errored Step or
+    /// approving a Human Step.
     Answered {
-        /// What they did, such as "retry `ci`".
+        /// What they did, such as "retry `ci`" or "approve".
         action: String,
         actor: Actor,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +154,9 @@ pub enum Closing {
     Dismissed {
         actor: Actor,
     },
+    /// A Human Step settled without an answer, such as one that crashed or
+    /// one a retry upstream turned into a skip.
+    StepSettled,
     RunEnded,
     NextRunStarted,
     /// The PR was unwatched or closed. A cause closes this way once every
@@ -134,8 +171,14 @@ pub enum Closing {
 impl fmt::Display for Closing {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Closing::Answered {
+                action,
+                note: Some(note),
+                ..
+            } => write!(f, "answered: {action}, \"{note}\""),
             Closing::Answered { action, .. } => write!(f, "answered: {action}"),
             Closing::Dismissed { .. } => f.write_str("dismissed"),
+            Closing::StepSettled => f.write_str("the Step settled without an answer"),
             Closing::RunEnded => f.write_str("the Run ended"),
             Closing::NextRunStarted => f.write_str("the next Run started"),
             Closing::LeftWatched => f.write_str("the PR left Watched"),
@@ -304,6 +347,44 @@ mod tests {
         assert_eq!(inbox.count(), 1);
         assert_eq!(inbox.for_pr(&RepoName::new("o", "r"), 7).count(), 1);
         assert_eq!(inbox.for_pr(&RepoName::new("o", "r"), 8).count(), 0);
+    }
+
+    #[test]
+    fn a_human_step_belongs_to_its_run_and_its_answer_reads_with_the_note() {
+        let human = entry(
+            4,
+            Scope::Human {
+                run: RunId(9),
+                step: "sign-off".into(),
+            },
+        );
+
+        assert_eq!(
+            serde_json::to_value(&human.scope).unwrap(),
+            json!({ "kind": "human", "run": 9, "step": "sign-off" })
+        );
+        assert_eq!(human.run(), Some(RunId(9)));
+        assert_eq!(entry(1, Scope::Pr).run(), None);
+        assert!(!human.dismissable());
+        let actor = Actor::Developer { via: "gui".into() };
+        assert_eq!(
+            Closing::Answered {
+                action: Answer::Approve.to_string(),
+                actor: actor.clone(),
+                note: Some("ship it".into()),
+            }
+            .to_string(),
+            "answered: approve, \"ship it\""
+        );
+        assert_eq!(
+            Closing::Answered {
+                action: Answer::Reject.to_string(),
+                actor,
+                note: None,
+            }
+            .to_string(),
+            "answered: reject"
+        );
     }
 
     #[test]

@@ -201,6 +201,8 @@ pub fn run(input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
             Ok(ToStep::PrUpdated { snapshot }) => checks = Some(snapshot.checks),
             Ok(ToStep::EffectResult { id, result }) => ci.effect_result(&id, &result),
             Ok(ToStep::Cancel) => return Ok(()),
+            // `ci` never asks, so no answer comes.
+            Ok(ToStep::Answer { .. }) => continue,
             Err(error) => {
                 eprintln!("ci: can't read a message from the daemon: {error}");
                 return Ok(());

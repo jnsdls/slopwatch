@@ -1,12 +1,15 @@
-//! The Inbox: every open Escalation across repos, oldest first.
+//! The Inbox: every open Human Step and Escalation across repos, oldest
+//! first.
 //!
-//! Each entry belongs to a Run, a Watched PR or a cause shared across PRs,
-//! and the scope decides what closes it. [`Runs`](crate::Runs) raises and
-//! closes entries as Runs start and end; the developer answers a Run entry
-//! by retrying its Step and may dismiss a PR entry. Every entry is kept in
-//! the store for good, linked to the Runs it touched, and each change also
-//! goes to those Runs' event journals, so a Run's record shows its Inbox
-//! history. Clients follow the open entries on the `inbox` topic.
+//! A Human Step belongs to its Run. Each Escalation belongs to a Run, a
+//! Watched PR or a cause shared across PRs, and the scope decides what
+//! closes it. [`Runs`](crate::Runs) raises and closes entries as Runs start
+//! and end; the developer answers a Run entry by retrying its Step, answers
+//! a Human Step by approving or rejecting it, and may dismiss a PR entry.
+//! Every entry is kept in the store for good, linked to the Runs it
+//! touched, and each change also goes to those Runs' event journals, so a
+//! Run's record shows its Inbox history. Clients follow the open entries on
+//! the `inbox` topic.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -167,22 +170,59 @@ impl Inbox {
         Ok(())
     }
 
-    /// Closes the Run entries of every Run but `going`, for a daemon that
-    /// stopped between ending a Run and closing its entries.
+    /// Opens a Human Step entry for `step` in `run`, asking `prompt`. One
+    /// already open for it, as after a daemon restart, stays as it is, so
+    /// it keeps its place in the Inbox.
+    pub(crate) fn ask(
+        &self,
+        run: RunId,
+        pr: PrRef,
+        step: &str,
+        prompt: &str,
+    ) -> Result<(), StoreError> {
+        let scope = human(run, step);
+        let mut state = self.state();
+        if state.find(|entry| entry.scope == scope).is_some() {
+            return Ok(());
+        }
+        let reasons = vec![format!("`{step}` waits for you to approve or reject")];
+        state.raise(scope, prompt.to_owned(), reasons, pr, vec![run])
+    }
+
+    /// Closes the open Human Step entry for `step` in `run` as `how`: the
+    /// developer's answer once the Step reported, or `StepSettled` for a
+    /// Step that settled some other way.
+    pub(crate) fn close_human(
+        &self,
+        run: RunId,
+        step: &str,
+        how: Closing,
+    ) -> Result<(), StoreError> {
+        let scope = human(run, step);
+        let mut state = self.state();
+        let ids = state.ids(|entry| entry.scope == scope);
+        for id in ids {
+            state.close(id, how.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Closes the Run entries and Human Steps of every Run but `going`,
+    /// for a daemon that stopped between ending a Run and closing its
+    /// entries.
     pub(crate) fn keep_runs(&self, going: &HashSet<RunId>) -> Result<(), StoreError> {
         let mut state = self.state();
-        let ids = state
-            .ids(|entry| matches!(entry.scope, Scope::Run { run, .. } if !going.contains(&run)));
+        let ids = state.ids(|entry| entry.run().is_some_and(|run| !going.contains(&run)));
         for id in ids {
             state.close(id, Closing::RunEnded)?;
         }
         Ok(())
     }
 
-    /// Closes every Run entry of a Run that ended.
+    /// Closes every Run entry and Human Step of a Run that ended.
     pub(crate) fn run_ended(&self, run: RunId) -> Result<(), StoreError> {
         let mut state = self.state();
-        let ids = state.ids(|entry| matches!(entry.scope, Scope::Run { run: of, .. } if of == run));
+        let ids = state.ids(|entry| entry.run() == Some(run));
         for id in ids {
             state.close(id, Closing::RunEnded)?;
         }
@@ -314,7 +354,7 @@ impl Inbox {
         let left: Vec<(EntryId, Vec<PrRef>)> = state
             .open
             .values()
-            .filter(|open| !matches!(open.entry.scope, Scope::Run { .. }))
+            .filter(|open| open.entry.run().is_none())
             .filter_map(|open| {
                 let gone: Vec<PrRef> = open
                     .entry
@@ -442,5 +482,13 @@ impl State {
             },
         ));
         Ok(())
+    }
+}
+
+/// The scope of the Human Step `step` in `run`.
+fn human(run: RunId, step: &str) -> Scope {
+    Scope::Human {
+        run,
+        step: step.to_owned(),
     }
 }

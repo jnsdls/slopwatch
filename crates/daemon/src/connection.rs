@@ -444,6 +444,20 @@ impl Daemon {
                         .map_err(RunError::Store),
                 );
             }
+            Command::AnswerStep {
+                run,
+                step,
+                answer,
+                note,
+            } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs
+                        .answer(run, &step, answer, note, &actor)
+                        .await
+                        .map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
             Command::DismissEntry { entry } => {
                 return respond(match self.runs_or_refuse() {
                     Ok(runs) => runs.inbox().dismiss(entry, &actor).map(|()| Reply::Done),
