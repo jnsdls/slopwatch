@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use slopwatch_core::WaiverCategory;
 
 use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
-use crate::{EntryId, Notification, RepoName, RunId, Topic, TopicUpdate};
+use crate::{EntryId, Notification, RepoName, RunId, SecretInfo, SecretValue, Topic, TopicUpdate};
 
 /// A frame a client sends to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +234,23 @@ pub enum Command {
     AckNotifications {
         done: Vec<Notification>,
     },
+    /// Every Secret the daemon knows of: the ones set, and the ones an
+    /// Approval covers. Names and dates only, never a value.
+    ListSecrets,
+    /// Sets or rotates the Secret named `secret`. The daemon keeps `value`
+    /// in the Keychain and never sends it back, on any command or topic.
+    /// The next Step spawned gets the new value; running Steps keep the
+    /// old one. Setting a Secret that held PRs back clears its Inbox entry
+    /// and starts them again.
+    SetSecret {
+        secret: String,
+        value: SecretValue,
+    },
+    /// Removes the Secret named `secret`. A Step that requires it errors
+    /// from its next spawn on.
+    DeleteSecret {
+        secret: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +282,10 @@ pub enum Reply {
         steps: Vec<LibraryStep>,
     },
     StepLog(StepLogPage),
+    Secrets {
+        /// Sorted by name.
+        secrets: Vec<SecretInfo>,
+    },
 }
 
 /// One Step in the developer's Library.
@@ -485,5 +506,45 @@ mod tests {
                 "message": "restart the daemon",
             }),
         );
+    }
+
+    #[test]
+    fn a_secret_goes_in_by_name_and_value_and_comes_back_as_names_and_dates() {
+        let set = Command::SetSecret {
+            secret: "JEV_API_KEY".into(),
+            value: SecretValue::new("sk-123"),
+        };
+        assert_eq!(
+            wire(&set),
+            json!({ "name": "set_secret", "secret": "JEV_API_KEY", "value": "sk-123" }),
+        );
+        assert_eq!(parse::<Command>(wire(&set)), set);
+        assert!(!format!("{set:?}").contains("sk-123"));
+
+        let listed = Reply::Secrets {
+            secrets: vec![
+                SecretInfo {
+                    name: "A".into(),
+                    set_at: Some(5),
+                    granted_to: vec!["jev".into()],
+                },
+                SecretInfo {
+                    name: "B".into(),
+                    set_at: None,
+                    granted_to: vec![],
+                },
+            ],
+        };
+        assert_eq!(
+            wire(&listed),
+            json!({
+                "reply": "secrets",
+                "secrets": [
+                    { "name": "A", "set_at": 5, "granted_to": ["jev"] },
+                    { "name": "B", "granted_to": [] },
+                ],
+            }),
+        );
+        assert_eq!(parse::<Reply>(wire(&listed)), listed);
     }
 }

@@ -255,6 +255,28 @@ impl Inbox {
         state.changed(id, latest)
     }
 
+    /// The PRs `cause`'s open entry holds back, if one is open.
+    pub(crate) fn held_by(&self, cause: &Cause) -> Vec<PrRef> {
+        self.state()
+            .open
+            .values()
+            .find(|open| matches!(&open.entry.scope, Scope::Cause { cause: held } if held == cause))
+            .map(|open| open.entry.prs.clone())
+            .unwrap_or_default()
+    }
+
+    /// The causes with an open entry.
+    pub(crate) fn open_causes(&self) -> Vec<Cause> {
+        self.state()
+            .open
+            .values()
+            .filter_map(|open| match &open.entry.scope {
+                Scope::Cause { cause } => Some(cause.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The daemon saw `cause` cleared.
     pub(crate) fn clear(&self, cause: Cause) -> Result<(), StoreError> {
         let scope = Scope::Cause { cause };

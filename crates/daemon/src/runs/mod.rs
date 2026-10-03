@@ -64,15 +64,17 @@ use slopwatch_protocol::step::{
 };
 use slopwatch_protocol::{
     Actor, Cause, Closing, GateTerm, LogFilter, LogKey, LogPage, LogRecord, PrRef, RepoName,
-    RunEvent, RunId, StepInfo, StepLogPage, Waiver,
+    RunEvent, RunId, SecretInfo, SecretValue, StepInfo, StepLogPage, Waiver,
 };
 use tokio::sync::mpsc;
 
+use crate::approvals::Approval;
 use crate::clones::{Clones, PipelineAt};
 use crate::github::{GitHub, GitHubError, OpenPr};
 use crate::inbox::Inbox;
 use crate::notifications::Notifications;
 use crate::plugins::Plugins;
+use crate::secrets::{Keychain, Mask, SecretError, Secrets, held_by_cause, missing_secret};
 use crate::shell_env;
 use crate::store::{ActiveRun, NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
 use crate::watching::{RunInfo, Watching};
@@ -123,6 +125,7 @@ pub struct Runs {
     retention: Retention,
     inbox: Arc<Inbox>,
     notifications: Arc<Notifications>,
+    secrets: Arc<Secrets>,
 }
 
 /// Where Runs keep their files, and for how long.
@@ -136,6 +139,9 @@ pub struct RunsConfig {
     /// with this one merged after it. `None` leaves them the daemon's.
     pub login_path: Option<String>,
     pub retention: Retention,
+    /// Where Secret values live: the login Keychain in the daemon, a
+    /// [`MemoryKeychain`](crate::secrets::MemoryKeychain) in tests.
+    pub keychain: Arc<dyn Keychain>,
 }
 
 #[derive(Debug)]
@@ -207,7 +213,19 @@ impl Runs {
             Arc::clone(&journal),
             Arc::clone(&notifications),
         )?);
+        // Built-in Plugins ship approved for what their manifests ask
+        // (ADR 0012), written again on every start so an update's new
+        // manifest is the one approved.
+        for manifest in config.plugins.builtin_manifests() {
+            store.put_approval(&Approval::builtin(&manifest, now()))?;
+        }
+        let secrets = Arc::new(Secrets::new(config.keychain, store.clone()));
+        {
+            let secrets = Arc::clone(&secrets);
+            tokio::task::spawn_blocking(move || secrets.warm());
+        }
         let mut engine = Engine {
+            secrets: Arc::clone(&secrets),
             inbox: Arc::clone(&inbox),
             notifications: Arc::clone(&notifications),
             data_dir: config.data_dir.clone(),
@@ -247,6 +265,7 @@ impl Runs {
             retention: config.retention,
             inbox,
             notifications,
+            secrets,
         });
         let driver = Arc::clone(&runs);
         tokio::spawn(async move {
@@ -368,6 +387,50 @@ impl Runs {
     /// after it. That answers the Run entries of those Steps.
     pub async fn retry(&self, run: RunId, step: &str, actor: &Actor) -> Result<(), RunError> {
         self.command(|engine| engine.retry(run, step, actor)).await
+    }
+
+    /// Every Secret that's set or that an Approval covers. Names and dates
+    /// only.
+    pub fn list_secrets(&self) -> Result<Vec<SecretInfo>, SecretError> {
+        let approvals = self.store.approvals()?;
+        Ok(self.secrets.list(&approvals)?)
+    }
+
+    /// Sets or rotates a Secret. The next Step spawned gets the new value.
+    /// A missing Secret's Inbox entry clears, and the PRs it held start
+    /// again.
+    pub async fn set_secret(&self, name: String, value: SecretValue) -> Result<(), SecretError> {
+        let set_name = name.clone();
+        self.on_secrets(move |secrets| secrets.set(&set_name, value, now()))
+            .await?;
+        let mut engine = self.engine.lock().await;
+        if let Err(error) = engine.secret_set(&name) {
+            eprintln!("slopwatchd: can't restart what `{name}` held back: {error}");
+        }
+        engine.schedule();
+        self.live
+            .store(!engine.active.is_empty(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Removes a Secret. Steps that require it error from their next spawn.
+    pub async fn delete_secret(&self, name: String) -> Result<(), SecretError> {
+        self.on_secrets(move |secrets| secrets.delete(&name)).await
+    }
+
+    /// Runs `work` on the blocking pool, since it waits on the Keychain.
+    async fn on_secrets(
+        &self,
+        work: impl FnOnce(&Secrets) -> Result<(), SecretError> + Send + 'static,
+    ) -> Result<(), SecretError> {
+        let secrets = Arc::clone(&self.secrets);
+        tokio::task::spawn_blocking(move || work(&secrets))
+            .await
+            .unwrap_or_else(|error| {
+                Err(SecretError::Internal(format!(
+                    "Secret work failed: {error}"
+                )))
+            })
     }
 
     /// The Inbox, which these Runs raise and close entries in.
@@ -569,6 +632,7 @@ impl Runs {
 
 struct Engine {
     store: Store,
+    secrets: Arc<Secrets>,
     inbox: Arc<Inbox>,
     notifications: Arc<Notifications>,
     plugins: Plugins,
@@ -1063,6 +1127,7 @@ impl Engine {
             self.reconcile_effects()?;
             self.reconciled = true;
         }
+        self.clear_set_secrets()?;
 
         let gone: Vec<PrKey> = self
             .blocked
@@ -1475,6 +1540,10 @@ impl Engine {
         for step in run.pipeline.steps() {
             if run.state.steps.get(&step.id) == Some(&StepState::Settled(Verdict::Error)) {
                 let reason = run.reasons.get(&step.id).map_or("error", String::as_str);
+                // A missing Secret's shared entry already asks for it.
+                if held_by_cause(reason) {
+                    continue;
+                }
                 self.inbox
                     .raise_step_error(run.id, pr.clone(), &step.id, reason)?;
             }
@@ -1555,6 +1624,36 @@ impl Engine {
             );
         };
 
+        let manifest = self.plugins.manifest(&step.plugin);
+        let handed = match self.secrets.for_step(&step.plugin, manifest.as_ref()) {
+            Ok(handed) => handed,
+            Err(denied) => {
+                let pr = pr_ref(&run.repo, run.number);
+                let id = run.id;
+                for name in denied.unset {
+                    self.inbox.hold(
+                        Cause::MissingSecret { name: name.clone() },
+                        pr.clone(),
+                        Some(id),
+                        &format!("Secret `{name}` isn't set"),
+                        vec![
+                            "Steps whose Plugin requires it error until it's set. Setting it \
+                             starts the PRs it holds back again."
+                                .to_owned(),
+                        ],
+                    )?;
+                }
+                return self.settle(
+                    key,
+                    step_id,
+                    Verdict::Error,
+                    Some(denied.reason),
+                    Outputs::default(),
+                );
+            }
+        };
+        let mask = Mask::new(handed.iter().map(|(_, value)| value.expose()));
+
         // Taken before the spawn, so a rebuild in between makes the
         // Outcome harder to reuse, never easier.
         let version = self.plugins.version(&step.plugin);
@@ -1579,13 +1678,19 @@ impl Engine {
                 .filter_map(|id| Some((id.clone(), run.outcomes.get(&id)?.clone())))
                 .collect(),
         });
-        let env = step_env(run.id, step_id, &self.step_path);
-        let limits = limits(step, self.plugins.manifest(&step.plugin).as_ref());
+        let mut env = step_env(run.id, step_id, &self.step_path);
+        env.extend(
+            handed
+                .iter()
+                .map(|(name, value)| (name.clone(), value.expose().to_owned())),
+        );
+        let limits = limits(step, manifest.as_ref());
         let plugin = step.plugin.clone();
         let reports = self.reports.clone();
         let (id, name) = (run.id, step_id.to_owned());
         let spawned = std::fs::create_dir_all(&dir).and_then(|()| {
-            let log = log::Writer::create(log_dir, log_key, log::Limits::default(), logs)?;
+            let log = log::Writer::create(log_dir, log_key, log::Limits::default(), logs)?
+                .with_mask(mask.clone());
             process::spawn(
                 Spawn {
                     program,
@@ -1595,6 +1700,7 @@ impl Engine {
                     log,
                     start,
                     limits,
+                    mask,
                 },
                 move |report| {
                     let _ = reports.send(Input::Step(StepReport {
@@ -1942,13 +2048,16 @@ impl Engine {
         self.inbox.run_ended(run.id)?;
         // A Run the developer cancelled, or one a push or close ended,
         // needs nothing from them.
+        // Nor does one whose every failure a shared cause's entry explains.
         if reason == EndReason::NotShippable {
-            let (title, reasons) = match couldnt_merge(&run) {
-                Some(reasons) => (COULDNT_MERGE, reasons),
-                None => (NOT_SHIPPABLE, not_shippable(&run)),
+            let raised = match couldnt_merge(&run) {
+                Some(reasons) => Some((COULDNT_MERGE, reasons)),
+                None => not_shippable(&run).map(|reasons| (NOT_SHIPPABLE, reasons)),
             };
-            self.inbox
-                .raise_pr(pr_ref(&run.repo, run.number), run.id, title, reasons)?;
+            if let Some((title, reasons)) = raised {
+                self.inbox
+                    .raise_pr(pr_ref(&run.repo, run.number), run.id, title, reasons)?;
+            }
         }
         if reason == EndReason::Shippable {
             let title = self.watching.title(&run.repo, run.number);
@@ -1983,15 +2092,31 @@ impl Engine {
                 "Step `{step}` didn't error, and only an errored Step can be retried"
             )));
         }
+        self.rerun_step(&key, step, Some((&format!("retry `{step}`"), actor)))?;
+        Ok(self.advance(&key)?)
+    }
+
+    /// Puts `step` and every Step after it back to pending in the Run going
+    /// on `key`, so the plan starts them again. `answer` closes their Run
+    /// entries as answered by that action and actor.
+    fn rerun_step(
+        &mut self,
+        key: &PrKey,
+        step: &str,
+        answer: Option<(&str, &Actor)>,
+    ) -> Result<(), StoreError> {
+        let run = &self.active[key];
+        let id = run.id;
         let dependents = dependents(&run.pipeline, step);
         for reset in std::iter::once(step).chain(dependents.iter().map(String::as_str)) {
-            self.reset(&key, reset)?;
+            self.reset(key, reset)?;
         }
-        let answered: Vec<String> = std::iter::once(step.to_owned())
-            .chain(dependents.iter().cloned())
-            .collect();
-        self.inbox
-            .answer(id, &answered, &format!("retry `{step}`"), actor)?;
+        if let Some((action, actor)) = answer {
+            let answered: Vec<String> = std::iter::once(step.to_owned())
+                .chain(dependents.iter().cloned())
+                .collect();
+            self.inbox.answer(id, &answered, action, actor)?;
+        }
         self.journal.append(
             id,
             RunEvent::StepRetried {
@@ -1999,7 +2124,93 @@ impl Engine {
                 dependents,
             },
         )?;
-        Ok(self.advance(&key)?)
+        Ok(())
+    }
+
+    /// The developer set the Secret `name`. Its Inbox entry clears, and
+    /// every PR it held starts again: a Run still going reruns the Steps
+    /// that missed it, and an ended latest Run gets a same-SHA Run.
+    fn secret_set(&mut self, name: &str) -> Result<(), StoreError> {
+        // Until GitHub has answered since the start, no held PR can start
+        // again, so the entry stays and the first sync clears it.
+        if !self.watching.fresh() {
+            return Ok(());
+        }
+        let cause = Cause::MissingSecret {
+            name: name.to_owned(),
+        };
+        let held = self.inbox.held_by(&cause);
+        self.inbox.clear(cause)?;
+        for pr in held {
+            let key = (pr.repo.clone(), pr.number);
+            match self.restart_held(&key, name) {
+                Ok(()) => {}
+                Err(RunError::Store(error)) => return Err(error),
+                Err(RunError::NotFound(why) | RunError::Invalid(why)) => {
+                    eprintln!("slopwatchd: {pr} stays as it is after `{name}` was set: {why}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn restart_held(&mut self, key: &PrKey, name: &str) -> Result<(), RunError> {
+        if let Some(run) = self.active.get(key) {
+            let missed: Vec<String> = run
+                .pipeline
+                .ordered_steps()
+                .filter(|step| {
+                    run.state.steps.get(&step.id) == Some(&StepState::Settled(Verdict::Error))
+                        && run
+                            .reasons
+                            .get(&step.id)
+                            .is_some_and(|reason| missing_secret(reason, name))
+                })
+                .map(|step| step.id.clone())
+                .collect();
+            for step in missed {
+                // An earlier rerun may have reset it as a dependent.
+                if self.active[key].state.steps.get(&step)
+                    == Some(&StepState::Settled(Verdict::Error))
+                {
+                    self.rerun_step(key, &step, None)?;
+                }
+            }
+            return Ok(self.advance(key)?);
+        }
+        let (repo, number) = key;
+        let Some(latest) = self.store.latest_run_id(repo, *number)? else {
+            return Ok(());
+        };
+        let stored = self
+            .store
+            .run(latest)?
+            .ok_or_else(|| RunError::NotFound(format!("No Run {latest}")))?;
+        let missed = stored.steps.iter().any(|row| {
+            matches!(
+                &row.state,
+                StepRowState::Settled { verdict: Verdict::Error, reason: Some(reason), .. }
+                    if missing_secret(reason, name)
+            )
+        });
+        if !missed {
+            return Ok(());
+        }
+        let pr = self.same_sha_pr(&stored)?;
+        Ok(self.start_same_sha(stored, &pr)?)
+    }
+
+    /// Clears the entries of missing Secrets that are set by now, as when
+    /// the daemon stopped between setting one and restarting what it held.
+    fn clear_set_secrets(&mut self) -> Result<(), StoreError> {
+        for cause in self.inbox.open_causes() {
+            if let Cause::MissingSecret { name } = cause
+                && self.secrets.is_set(&name)?
+            {
+                self.secret_set(&name)?;
+            }
+        }
+        Ok(())
     }
 
     /// The developer waives `what` in Run `id`. A Run that's still going
@@ -2022,42 +2233,18 @@ impl Engine {
             .store
             .run(id)?
             .ok_or_else(|| RunError::NotFound(format!("No Run {id}")))?;
-        let key = (stored.repo.clone(), stored.number);
         let latest = self.store.latest_run_id(&stored.repo, stored.number)?;
         if latest != Some(id) {
             return Err(RunError::Invalid(format!(
                 "Run {id} has ended and a later Run judges the PR. Waive from the latest Run."
             )));
         }
-        if !self.watching.fresh() {
-            return Err(RunError::Invalid(
-                "The daemon hasn't heard from GitHub since it started. Try again after the \
-                 next poll."
-                    .to_owned(),
-            ));
-        }
-        let pr = self
-            .watching
-            .prs()
-            .into_iter()
-            .find(|(repo, pr)| (repo, pr.number) == (&stored.repo, stored.number))
-            .map(|(_, pr)| pr)
-            .filter(|pr| pr.labeled)
-            .ok_or_else(|| {
-                RunError::Invalid(format!(
-                    "{}#{} isn't a Watched PR any more",
-                    stored.repo, stored.number
-                ))
-            })?;
-        if pr.head_sha != stored.head_sha {
-            return Err(RunError::Invalid(format!(
-                "The PR's head moved on from {}, and a Waiver covers only the SHA it's made on",
-                stored.head_sha
-            )));
-        }
-        if let Some(blocked) = self.blocked.get(&key) {
-            return Err(RunError::Invalid(blocked.message.clone()));
-        }
+        let pr = self.same_sha_pr(&stored).map_err(|error| match error {
+            RunError::Invalid(why) if why.starts_with(HEAD_MOVED) => RunError::Invalid(format!(
+                "{why}, and a Waiver covers only the SHA it's made on"
+            )),
+            error => error,
+        })?;
         let pipeline = load(&stored.pipeline, &self.plugins).map_err(|errors| {
             RunError::Invalid(format!(
                 "Run {id}'s Pipeline no longer loads: {}",
@@ -2083,8 +2270,48 @@ impl Engine {
         for step in waivable(&pipeline, &state, what)? {
             self.store.add_waiver(id, &step, waiver, now())?;
         }
-        // The ended Run's Pipeline, so the same Steps settle the same way.
-        // If the base has a newer one, the next sync compares it as usual.
+        Ok(self.start_same_sha(stored, &pr)?)
+    }
+
+    /// The PR of `stored`, an ended Run, if a new Run on the same SHA may
+    /// start: the PR is still watched on that head, and nothing blocks it.
+    fn same_sha_pr(&self, stored: &ActiveRun) -> Result<OpenPr, RunError> {
+        if !self.watching.fresh() {
+            return Err(RunError::Invalid(
+                "The daemon hasn't heard from GitHub since it started. Try again after the \
+                 next poll."
+                    .to_owned(),
+            ));
+        }
+        let pr = self
+            .watching
+            .prs()
+            .into_iter()
+            .find(|(repo, pr)| (repo, pr.number) == (&stored.repo, stored.number))
+            .map(|(_, pr)| pr)
+            .filter(|pr| pr.labeled)
+            .ok_or_else(|| {
+                RunError::Invalid(format!(
+                    "{}#{} isn't a Watched PR any more",
+                    stored.repo, stored.number
+                ))
+            })?;
+        if pr.head_sha != stored.head_sha {
+            return Err(RunError::Invalid(format!(
+                "{HEAD_MOVED} {}",
+                stored.head_sha
+            )));
+        }
+        if let Some(blocked) = self.blocked.get(&(stored.repo.clone(), stored.number)) {
+            return Err(RunError::Invalid(blocked.message.clone()));
+        }
+        Ok(pr)
+    }
+
+    /// Starts a Run on the same SHA as `stored`, with its Pipeline, so the
+    /// same Steps settle the same way. If the base has a newer one, the
+    /// next sync compares it as usual.
+    fn start_same_sha(&mut self, stored: ActiveRun, pr: &OpenPr) -> Result<(), StoreError> {
         let inputs = Inputs {
             pipeline: PipelineAt {
                 sha: stored.base_sha,
@@ -2092,7 +2319,7 @@ impl Engine {
             },
             files: stored.files,
         };
-        Ok(self.try_start_run(&stored.repo, &pr, StartWhen::Always, Ok(inputs))?)
+        self.try_start_run(&stored.repo, pr, StartWhen::Always, Ok(inputs))
     }
 
     /// The Run's key, if the Run is still going.
@@ -2219,13 +2446,19 @@ async fn blocking<T: Send + 'static>(
         .unwrap_or_else(|error| Err(std::io::Error::other(error)))
 }
 
+/// How a refusal to start a same-SHA Run on a PR whose head moved begins.
+const HEAD_MOVED: &str = "The PR's head moved on from";
+
 /// The title of the PR entry a not-shippable Run raises.
 const NOT_SHIPPABLE: &str = "Not shippable";
 
 /// Why a Run ended not shippable, one line per Step: every errored Step,
 /// and every Step the Gate reads that settled other than pass or skipped.
-fn not_shippable(run: &Active) -> Vec<String> {
+/// `None` when a shared cause, such as a missing Secret, explains every
+/// one of them, and its own entry asks the developer.
+fn not_shippable(run: &Active) -> Option<Vec<String>> {
     let mut reasons = Vec::new();
+    let mut all_held = true;
     for step in run.pipeline.ordered_steps() {
         let Some(StepState::Settled(verdict)) = run.state.steps.get(&step.id) else {
             continue;
@@ -2239,6 +2472,10 @@ fn not_shippable(run: &Active) -> Vec<String> {
             continue;
         }
         let id = &step.id;
+        all_held &= run
+            .reasons
+            .get(id)
+            .is_some_and(|reason| held_by_cause(reason));
         reasons.push(match (verdict, run.reasons.get(id)) {
             (Verdict::Error, Some(reason)) => format!("`{id}`: {reason}"),
             (_, Some(reason)) => format!("`{id}`: {verdict} ({reason})"),
@@ -2247,8 +2484,9 @@ fn not_shippable(run: &Active) -> Vec<String> {
     }
     if reasons.is_empty() {
         reasons.push("The Gate didn't pass".to_owned());
+        all_held = false;
     }
-    reasons
+    (!all_held).then_some(reasons)
 }
 
 const COULDNT_MERGE: &str = "Couldn't merge";

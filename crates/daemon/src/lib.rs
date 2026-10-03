@@ -13,6 +13,7 @@
 //! [`Library`] holds the developer's Library Steps, which clients list and
 //! edit, and which a Pipeline's resolver reads live.
 
+pub mod approvals;
 pub mod auth;
 pub mod clones;
 mod connection;
@@ -24,6 +25,7 @@ pub mod notifications;
 mod pace;
 pub mod plugins;
 pub mod runs;
+pub mod secrets;
 pub mod shell_env;
 pub mod store;
 pub mod transport;

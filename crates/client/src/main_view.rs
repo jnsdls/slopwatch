@@ -1,6 +1,6 @@
 //! The main window: the sources pane, then either the Watched PR list or
-//! the Inbox, each with the PR pane, or the Library editor, or the link
-//! state while the daemon isn't reachable.
+//! the Inbox, each with the PR pane, or the Library editor, or the Secrets
+//! list, or the link state while the daemon isn't reachable.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -32,6 +32,8 @@ use crate::run_pane::{
     GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, end_label, gate_tone,
     run_label, run_tone, step_line, step_tone, waiver_line,
 };
+use crate::secrets::missing_secret;
+use crate::secrets_view::SecretsView;
 use crate::step_log::{self, LogViewer, Row};
 
 /// What fills the window right of the sources pane.
@@ -40,6 +42,7 @@ enum Pane {
     Prs,
     Inbox,
     Library,
+    Secrets,
 }
 
 pub struct MainView {
@@ -53,6 +56,7 @@ pub struct MainView {
     /// A PR a clicked banner asked for before the PR list had it.
     pending_reveal: Option<PrRef>,
     library: Entity<LibraryView>,
+    secrets: Entity<SecretsView>,
     run_pane: RunPane,
     /// Repos the developer can add, while the picker is open.
     picker: Option<Vec<RepoName>>,
@@ -120,6 +124,7 @@ impl MainView {
             poster: Poster::default(),
             pending_reveal: None,
             library: cx.new(|cx| LibraryView::new(commands.clone(), window, cx)),
+            secrets: cx.new(|cx| SecretsView::new(commands.clone(), window, cx)),
             run_pane: RunPane::default(),
             picker: None,
             error: None,
@@ -133,8 +138,11 @@ impl MainView {
                 let connected = matches!(state, LinkState::Connected { .. });
                 if !connected {
                     self.picker = None;
-                } else if self.pane == Pane::Library {
-                    self.library.read(cx).refresh();
+                } else {
+                    if self.pane == Pane::Library {
+                        self.library.read(cx).refresh();
+                    }
+                    self.secrets.read(cx).refresh();
                 }
                 if connected && !matches!(self.link, LinkState::Connected { .. }) {
                     // The new connection subscribes to its topics itself.
@@ -149,6 +157,9 @@ impl MainView {
             LinkEvent::Topic(update @ TopicUpdate::Inbox { .. }) => {
                 self.inbox.apply(update);
                 dock::set_badge(badge(self.inbox.count()).as_deref());
+                // A missing Secret's entry opening or closing changes the
+                // list's set states.
+                self.secrets.read(cx).refresh();
             }
             LinkEvent::Topic(update @ TopicUpdate::Notifications { .. }) => {
                 let center = SystemCenter::new(cx);
@@ -189,6 +200,9 @@ impl MainView {
                 ResponseBody::Ok(Reply::LibrarySteps { steps }) => {
                     self.library
                         .update(cx, |library, cx| library.listed(steps, cx));
+                }
+                ResponseBody::Ok(Reply::Secrets { secrets }) => {
+                    self.secrets.update(cx, |view, cx| view.listed(secrets, cx));
                 }
                 ResponseBody::Ok(Reply::StepLog(page)) => {
                     self.error = None;
@@ -339,6 +353,19 @@ impl MainView {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.pane = Pane::Library;
                     this.library.read(cx).refresh();
+                    cx.notify();
+                })),
+            )
+            .child(
+                entry(
+                    "source-secrets".into(),
+                    "Secrets".to_owned(),
+                    Some(self.secrets.read(cx).unset()),
+                    self.pane == Pane::Secrets,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.pane = Pane::Secrets;
+                    this.secrets.read(cx).refresh();
                     cx.notify();
                 })),
             )
@@ -649,6 +676,22 @@ impl MainView {
                     this.send(command.clone());
                 }),
             ));
+        }
+        if let Some(name) = missing_secret(entry).map(str::to_owned) {
+            let id = SharedString::from(format!("{prefix}-set-secret-{}", entry.id));
+            buttons = buttons.child(
+                Button::new(id)
+                    .label("Set Secret")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.pane = Pane::Secrets;
+                        this.secrets
+                            .update(cx, |view, cx| view.choose(&name, window, cx));
+                        this.secrets.read(cx).refresh();
+                        cx.notify();
+                    })),
+            );
         }
         let mut card = div()
             .id(SharedString::from(format!("{prefix}-entry-{}", entry.id)))
@@ -1445,6 +1488,7 @@ impl Render for MainView {
                         Pane::Prs => this.child(self.pr_list(cx)).child(self.pr_pane(cx)),
                         Pane::Inbox => this.child(self.inbox_list(cx)).child(self.pr_pane(cx)),
                         Pane::Library => this.child(self.library.clone()),
+                        Pane::Secrets => this.child(self.secrets.clone()),
                     }),
             )
             .children(self.footer(cx))

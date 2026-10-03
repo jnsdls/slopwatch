@@ -74,6 +74,7 @@ async fn a_matching_hello_is_answered_with_the_daemons_build_id() {
                 "waivers".into(),
                 "inbox".into(),
                 "notifications".into(),
+                "secrets".into(),
             ],
             build_id: "0123abcd+dirty.feed".into(),
         })

@@ -81,6 +81,9 @@ pub enum Cause {
     /// The Pipeline on `base` doesn't load, such as one that uses a
     /// missing Library Step.
     InvalidPipeline { repo: RepoName, base: String },
+    /// No value is set for the Secret `name`, which a Step requires. It
+    /// clears once the developer sets it.
+    MissingSecret { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -248,6 +251,15 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&cause).unwrap(),
             json!({ "kind": "cause", "cause": { "cause": "invalid_pipeline", "repo": "o/r", "base": "main" } })
+        );
+        let secret = Scope::Cause {
+            cause: Cause::MissingSecret {
+                name: "JEV_API_KEY".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&secret).unwrap(),
+            json!({ "kind": "cause", "cause": { "cause": "missing_secret", "name": "JEV_API_KEY" } })
         );
         assert_eq!(
             serde_json::to_value(Scope::Run {

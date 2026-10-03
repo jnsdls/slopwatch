@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use tokio::time::Sleep;
 
 use super::log;
+use crate::secrets::Mask;
 
 /// After `cancel`, how long a Step gets before SIGTERM, then before SIGKILL.
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
@@ -46,6 +47,9 @@ pub struct Spawn {
     pub log: log::Writer,
     pub start: ToStep,
     pub limits: Limits,
+    /// The Secret values in `env`. Nothing the Step says reaches the
+    /// engine or the log with one in it.
+    pub mask: Mask,
 }
 
 /// How long a Step may run, and how long it may go quiet. `None` is no
@@ -144,6 +148,7 @@ pub fn spawn(spawn: Spawn, report: impl Fn(Report) + Send + 'static) -> io::Resu
         exited: Arc::clone(&exited),
         to_step: writer(stdin),
         log: spawn.log,
+        mask: spawn.mask,
         report,
     };
     let _ = session.to_step.send(spawn.start);
@@ -181,6 +186,7 @@ struct Session<R> {
     exited: Arc<AtomicBool>,
     to_step: mpsc::UnboundedSender<ToStep>,
     log: log::Writer,
+    mask: Mask,
     report: R,
 }
 
@@ -219,14 +225,17 @@ impl<R: Fn(Report)> Session<R> {
                     Ok(None) | Err(_) => stdout_open = false,
                 },
                 line = read_line(&mut stderr, &mut stderr_line, self.log.line_limit()), if stderr_open => match line {
-                    Some(line) => {
+                    Some((line, ended)) => {
                         // Stderr is output too: a Step busy compiling isn't stalled.
                         if let (Some(stall), Some(after)) = (stall.as_mut(), limits.stall_after) {
                             stall.as_mut().reset(tokio::time::Instant::now() + after);
                         }
-                        self.log.write(LogSource::Stderr, None, &line);
+                        self.log.write_stderr(&line, ended);
                     }
-                    None => stderr_open = false,
+                    None => {
+                        stderr_open = false;
+                        self.log.finish_stderr();
+                    }
                 },
                 () = async { timeout.as_mut().expect("guarded").as_mut().await }, if timeout.is_some() => {
                     let after = limits.timeout.expect("armed only with a timeout");
@@ -274,10 +283,11 @@ impl<R: Fn(Report)> Session<R> {
                     let limit = self.log.line_limit();
                     while stderr_open {
                         match tokio::time::timeout_at(deadline, read_line(&mut stderr, &mut stderr_line, limit)).await {
-                            Ok(Some(line)) => self.log.write(LogSource::Stderr, None, &line),
+                            Ok(Some((line, ended))) => self.log.write_stderr(&line, ended),
                             _ => stderr_open = false,
                         }
                     }
+                    self.log.finish_stderr();
                     (self.report)(Report::Exited(status.ok().and_then(|status| status.code())));
                     return;
                 }
@@ -293,29 +303,50 @@ impl<R: Fn(Report)> Session<R> {
     }
 
     /// One stdout line: a log message goes to the Step log, and anything
-    /// else to the engine.
+    /// else to the engine, with the Step's Secret values masked out.
     fn line(&mut self, line: &str) {
-        match serde_json::from_str::<FromStep>(line) {
-            Ok(FromStep::Log { message, level }) => {
+        let message = match serde_json::from_str::<FromStep>(line) {
+            Ok(message) => match self.mask.message(message) {
+                Some(message) => message,
+                None => {
+                    (self.report)(Report::ProtocolError(
+                        "wrote a message that no longer parsed once its Secret values were masked"
+                            .to_owned(),
+                    ));
+                    return;
+                }
+            },
+            Err(error) => {
+                // serde's error can quote the line, so both are masked,
+                // and the line before it's cut short.
+                let masked = self.mask.apply(line);
+                let text = format!(
+                    "wrote a line that isn't a protocol message ({error}): {}",
+                    truncate(&masked)
+                );
+                let text = self.mask.apply(&text).into_owned();
+                (self.report)(Report::ProtocolError(text));
+                return;
+            }
+        };
+        match message {
+            FromStep::Log { message, level } => {
                 self.log.write(LogSource::Log, level, &message);
             }
-            Ok(message) => (self.report)(Report::Message(message)),
-            Err(error) => (self.report)(Report::ProtocolError(format!(
-                "wrote a line that isn't a protocol message ({error}): {}",
-                truncate(line)
-            ))),
+            message => (self.report)(Report::Message(message)),
         }
     }
 }
 
 /// The next stderr line, without its line ending, or the first `limit`
-/// bytes of a longer one. `None` once stderr is closed. Cancel-safe: what
-/// it has read so far waits in `pending` for the next call.
+/// bytes of a longer one, with whether the line ends there. `None` once
+/// stderr is closed. Cancel-safe: what it has read so far waits in
+/// `pending` for the next call.
 async fn read_line(
     reader: &mut (impl AsyncBufRead + Unpin),
     pending: &mut Vec<u8>,
     limit: usize,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     loop {
         let available = match reader.fill_buf().await {
             Ok(available) => available,
@@ -325,7 +356,7 @@ async fn read_line(
             if pending.is_empty() {
                 return None;
             }
-            return Some(take_line(pending));
+            return Some((take_line(pending), true));
         }
         let room = limit.saturating_sub(pending.len()).max(1);
         let window = &available[..available.len().min(room)];
@@ -333,14 +364,14 @@ async fn read_line(
             Some(at) => {
                 pending.extend_from_slice(&window[..at]);
                 reader.consume(at + 1);
-                return Some(take_line(pending));
+                return Some((take_line(pending), true));
             }
             None => {
                 let taken = window.len();
                 pending.extend_from_slice(window);
                 reader.consume(taken);
                 if pending.len() >= limit {
-                    return Some(take_chunk(pending));
+                    return Some((take_chunk(pending), false));
                 }
             }
         }
@@ -520,6 +551,7 @@ mod tests {
             log,
             start: ToStep::Cancel,
             limits: Limits::default(),
+            mask: Mask::default(),
         }
     }
 
@@ -651,9 +683,9 @@ mod tests {
         let second = read_line(&mut reader, &mut pending, 3).await;
         let third = read_line(&mut reader, &mut pending, 3).await;
 
-        assert_eq!(first.as_deref(), Some("ab"));
-        assert_eq!(second.as_deref(), Some("\u{e9}c"));
-        assert_eq!(third.as_deref(), Some("d"));
+        assert_eq!(first, Some(("ab".to_owned(), false)));
+        assert_eq!(second, Some(("\u{e9}c".to_owned(), false)));
+        assert_eq!(third, Some(("d".to_owned(), true)));
     }
 
     #[tokio::test]

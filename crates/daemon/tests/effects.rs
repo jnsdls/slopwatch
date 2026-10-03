@@ -14,6 +14,7 @@ use slopwatch_core::{EndReason, Verdict};
 use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::fake::{CI_PIPELINE, FakeGitHub, Hold};
 use slopwatch_daemon::plugins::Plugins;
+use slopwatch_daemon::secrets::MemoryKeychain;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::{Daemon, Library, Retention, Runs, RunsConfig, Watching};
 use slopwatch_protocol::step::{
@@ -134,6 +135,7 @@ done
                     plugins,
                     login_path: None,
                     retention: Retention::default(),
+                    keychain: Arc::new(MemoryKeychain::default()),
                 },
             )
             .unwrap();

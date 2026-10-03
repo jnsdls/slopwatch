@@ -12,6 +12,7 @@ use slopwatch_protocol::{
     EntryId, InboxEntry, Notification, NotificationId, RepoName, RunId, RunSummary, Waiver,
 };
 
+use crate::approvals::Approval;
 use crate::github::OpenPr;
 
 pub use rusqlite::Error as StoreError;
@@ -165,6 +166,21 @@ const MIGRATIONS: &[&str] = &[
         pending TEXT
     );
     CREATE INDEX notifications_by_entry ON notifications (entry_id);
+",
+    // Secrets: which are set and when. The values live in the Keychain
+    // only. An Approval is what a Plugin may have, by Plugin name; `grant`
+    // is JSON, and a NULL actor is a built-in that ships approved.
+    "
+    CREATE TABLE secrets (
+        name TEXT PRIMARY KEY,
+        set_at INTEGER NOT NULL
+    );
+    CREATE TABLE approvals (
+        plugin TEXT PRIMARY KEY,
+        grant_json TEXT NOT NULL,
+        actor TEXT,
+        approved_at INTEGER NOT NULL
+    );
 ",
 ];
 
@@ -1212,6 +1228,77 @@ impl Store {
         Ok(())
     }
 
+    /// Every Secret that's set, with when, sorted by name.
+    pub fn secrets(&self) -> Result<Vec<(String, i64)>, StoreError> {
+        let db = self.db();
+        let mut query = db.prepare("SELECT name, set_at FROM secrets ORDER BY name")?;
+        let rows = query.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
+    }
+
+    /// When the Secret `name` was last set, if it's set.
+    pub fn secret_set_at(&self, name: &str) -> Result<Option<i64>, StoreError> {
+        self.db()
+            .query_row(
+                "SELECT set_at FROM secrets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    pub fn put_secret(&self, name: &str, set_at: i64) -> Result<(), StoreError> {
+        self.db().execute(
+            "INSERT INTO secrets (name, set_at) VALUES (?1, ?2)
+             ON CONFLICT (name) DO UPDATE SET set_at = excluded.set_at",
+            params![name, set_at],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets the Secret `name`. Returns whether it was set.
+    pub fn remove_secret(&self, name: &str) -> Result<bool, StoreError> {
+        let removed = self
+            .db()
+            .execute("DELETE FROM secrets WHERE name = ?1", params![name])?;
+        Ok(removed > 0)
+    }
+
+    /// Records the Approval of `approval.plugin`, replacing any earlier one.
+    pub fn put_approval(&self, approval: &Approval) -> Result<(), StoreError> {
+        let grant = serde_json::to_string(&approval.grant).expect("grants always serialize");
+        let actor = approval
+            .actor
+            .as_ref()
+            .map(|actor| serde_json::to_string(actor).expect("actors always serialize"));
+        self.db().execute(
+            "INSERT INTO approvals (plugin, grant_json, actor, approved_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (plugin) DO UPDATE SET grant_json = excluded.grant_json,
+                 actor = excluded.actor, approved_at = excluded.approved_at",
+            params![approval.plugin, grant, actor, approval.approved_at],
+        )?;
+        Ok(())
+    }
+
+    /// Every Approval, sorted by Plugin name.
+    pub fn approvals(&self) -> Result<Vec<Approval>, StoreError> {
+        let db = self.db();
+        let mut query = db.prepare(
+            "SELECT plugin, grant_json, actor, approved_at FROM approvals ORDER BY plugin",
+        )?;
+        let rows = query.query_map([], |row| {
+            let grant: String = row.get(1)?;
+            let actor: Option<String> = row.get(2)?;
+            Ok(Approval {
+                plugin: row.get(0)?,
+                grant: json_column(1, &grant)?,
+                actor: actor.map(|actor| json_column(2, &actor)).transpose()?,
+                approved_at: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// Records a SHA slopwatch pushed.
     pub fn record_push(&self, repo: &RepoName, sha: &str) -> Result<(), StoreError> {
         self.db().execute(
@@ -1371,6 +1458,17 @@ fn asked_for(db: &Connection, run: RunId, kind: EffectKind) -> rusqlite::Result<
     )
     .optional()
     .map(|found| found.is_some())
+}
+
+/// A JSON column read back, with a parse failure as a conversion error.
+fn json_column<T: serde::de::DeserializeOwned>(index: usize, text: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
 }
 
 const SELECT_EFFECT: &str =

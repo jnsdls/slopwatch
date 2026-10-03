@@ -15,6 +15,7 @@ use tokio_tungstenite::tungstenite::{Error, Message};
 use crate::inbox::InboxSubscription;
 use crate::notifications::NotificationsSubscription;
 use crate::runs::{Journalled, Live, LiveLog, LogError, RunError, Runs, SubscribeError};
+use crate::secrets::SecretError;
 use crate::{Daemon, LibraryError, Peer, Subscription, WatchError};
 
 /// How long a client gets to send its hello before the daemon hangs up.
@@ -355,9 +356,16 @@ impl Daemon {
             Ok(ClientFrame::Hello(_)) => Ok(None),
             Err(error) => {
                 if let Some(id) = request_id(text) {
+                    // serde can quote what it couldn't read, which in a
+                    // `set_secret` may be the value.
+                    let message = if command_name(text).as_deref() == Some("set_secret") {
+                        "Malformed set_secret request".to_owned()
+                    } else {
+                        error.to_string()
+                    };
                     let result = ResponseBody::Error(ErrorBody {
                         code: ErrorCode::BadRequest,
-                        message: error.to_string(),
+                        message,
                     });
                     send(ws, &ServerFrame::Response(Response { id, result })).await?;
                 }
@@ -440,6 +448,26 @@ impl Daemon {
                 return respond(match self.runs_or_refuse() {
                     Ok(runs) => runs.inbox().dismiss(entry, &actor).map(|()| Reply::Done),
                     Err(error) => Err(error),
+                });
+            }
+            Command::ListSecrets => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs
+                        .list_secrets()
+                        .map(|secrets| Reply::Secrets { secrets }),
+                    Err(error) => Err(error.into()),
+                });
+            }
+            Command::SetSecret { secret, value } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs.set_secret(secret, value).await.map(|()| Reply::Done),
+                    Err(error) => Err(error.into()),
+                });
+            }
+            Command::DeleteSecret { secret } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs.delete_secret(secret).await.map(|()| Reply::Done),
+                    Err(error) => Err(error.into()),
                 });
             }
             Command::ReadStepLog { key, page, filter } => {
@@ -688,6 +716,33 @@ impl From<LogError> for ErrorBody {
     }
 }
 
+impl From<RunError> for SecretError {
+    fn from(error: RunError) -> Self {
+        match error {
+            RunError::NotFound(why) | RunError::Invalid(why) => SecretError::Refused(why),
+            RunError::Store(error) => SecretError::Store(error),
+        }
+    }
+}
+
+impl From<SecretError> for ErrorBody {
+    fn from(error: SecretError) -> Self {
+        let code = match &error {
+            SecretError::BadName(_) | SecretError::BadValue(_) | SecretError::Refused(_) => {
+                ErrorCode::Invalid
+            }
+            SecretError::NotFound(_) => ErrorCode::NotFound,
+            SecretError::Keychain(_) | SecretError::Internal(_) | SecretError::Store(_) => {
+                ErrorCode::Internal
+            }
+        };
+        ErrorBody {
+            code,
+            message: error.to_string(),
+        }
+    }
+}
+
 impl From<LibraryError> for ErrorBody {
     fn from(error: LibraryError) -> Self {
         let code = match &error {
@@ -700,6 +755,12 @@ impl From<LibraryError> for ErrorBody {
             message: error.to_string(),
         }
     }
+}
+
+/// The command a raw request names, read without parsing the rest.
+fn command_name(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(value.pointer("/command/name")?.as_str()?.to_owned())
 }
 
 fn request_id(text: &str) -> Option<RequestId> {

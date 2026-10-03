@@ -111,6 +111,11 @@ impl Plugins {
         Some(hash)
     }
 
+    /// The manifests of the Plugins that ship with the app.
+    pub fn builtin_manifests(&self) -> Vec<Manifest> {
+        builtins()
+    }
+
     /// The program and arguments that start a session with `plugin`.
     pub fn command(&self, plugin: &str) -> Option<(PathBuf, Vec<String>)> {
         if builtin_manifest(plugin).is_some() {
@@ -150,12 +155,15 @@ fn file_hash(path: &Path) -> Option<String> {
     )
 }
 
+/// The manifests of the Plugins that ship with the app.
+fn builtins() -> Vec<Manifest> {
+    vec![ci::manifest(), merge::manifest()]
+}
+
 fn builtin_manifest(plugin: &str) -> Option<Manifest> {
-    match plugin {
-        "ci" => Some(ci::manifest()),
-        "merge" => Some(merge::manifest()),
-        _ => None,
-    }
+    builtins()
+        .into_iter()
+        .find(|manifest| manifest.id == plugin)
 }
 
 impl Resolver for Plugins {

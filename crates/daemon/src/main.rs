@@ -8,6 +8,7 @@ use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::api::Api;
 use slopwatch_daemon::notifications::{self, LaunchPace, OpenApp};
 use slopwatch_daemon::plugins::{self, Plugins};
+use slopwatch_daemon::secrets::SecurityCli;
 use slopwatch_daemon::shell_env;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::unix::Listener;
@@ -96,6 +97,9 @@ async fn serve() -> ExitCode {
         plugins: Plugins::new(exe, Arc::clone(&library)),
         login_path,
         retention: Retention::default(),
+        keychain: Arc::new(SecurityCli::new(SecurityCli::default_service(
+            Flavor::CURRENT,
+        ))),
     };
     let runs = match Runs::start(store, github, Arc::clone(&watching), config) {
         Ok(runs) => runs,

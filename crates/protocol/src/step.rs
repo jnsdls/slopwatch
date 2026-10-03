@@ -42,9 +42,12 @@ pub struct Manifest {
     /// error.
     #[serde(default)]
     pub effects: Vec<EffectKind>,
-    /// Env var names of the Secrets the Step needs.
+    /// The Secrets the Step gets as env vars, by env var name. Written as
+    /// a plain name for a required Secret, or `{"name": ..., "optional":
+    /// true}`. A Step whose required Secret isn't set errors without
+    /// spawning.
     #[serde(default)]
-    pub secrets: Vec<String>,
+    pub secrets: Vec<SecretSpec>,
     /// Defaults a Pipeline may override, written like `90m`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
@@ -54,6 +57,51 @@ pub struct Manifest {
     /// Run. `None` leaves only the daemon's global cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
+}
+
+/// A Secret a manifest asks for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SecretSpec {
+    /// The env var name the Step reads it from, and the Secret's name.
+    pub name: String,
+    /// The Step runs without it, and checks for itself whether it got it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+}
+
+impl SecretSpec {
+    pub fn required(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            optional: false,
+        }
+    }
+
+    pub fn optional(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            optional: true,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Written {
+            Name(String),
+            Spec {
+                name: String,
+                #[serde(default)]
+                optional: bool,
+            },
+        }
+        Ok(match Written::deserialize(deserializer)? {
+            Written::Name(name) => SecretSpec::required(name),
+            Written::Spec { name, optional } => SecretSpec { name, optional },
+        })
+    }
 }
 
 /// A message from the daemon to a Step.
@@ -466,6 +514,29 @@ mod tests {
         assert_eq!(manifest.workspace, Workspace::None);
         assert!(manifest.effects.is_empty());
         assert_eq!(manifest.timeout, None);
+        assert!(manifest.secrets.is_empty());
+    }
+
+    #[test]
+    fn a_manifest_names_a_required_secret_plainly_and_an_optional_one_with_a_flag() {
+        let manifest: Manifest = serde_json::from_value(json!({
+            "id": "jev", "version": "1", "dialect": 1, "workspace": "none",
+            "secrets": ["JEV_API_KEY", { "name": "EXTRA", "optional": true }, { "name": "B" }],
+        }))
+        .unwrap();
+
+        assert_eq!(
+            manifest.secrets,
+            vec![
+                SecretSpec::required("JEV_API_KEY"),
+                SecretSpec::optional("EXTRA"),
+                SecretSpec::required("B"),
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&manifest.secrets).unwrap(),
+            json!([{ "name": "JEV_API_KEY" }, { "name": "EXTRA", "optional": true }, { "name": "B" }])
+        );
     }
 
     #[test]

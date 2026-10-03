@@ -12,6 +12,7 @@ mod inbox;
 pub mod logs;
 mod notifications;
 pub mod runs;
+mod secrets;
 pub mod step;
 mod topics;
 
@@ -34,6 +35,7 @@ pub use runs::{
     EffectView, GateTerm, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView,
     Waiver,
 };
+pub use secrets::{SecretInfo, SecretValue, is_secret_name};
 pub use topics::{
     PollState, PrStatus, PullRequest, RepoName, Topic, TopicUpdate, WatchedPrs, WatchedPrsDelta,
     WatchedPrsUpdate,
@@ -72,6 +74,9 @@ pub const DIALECT: u32 = 1;
 ///
 /// `notifications`: the `notifications` topic and the
 /// `ack_notifications` command (ADR 0013).
+///
+/// `secrets`: the `list_secrets`, `set_secret` and `delete_secret`
+/// commands, and the `missing_secret` Inbox cause.
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -82,6 +87,7 @@ pub const FEATURES: &[&str] = &[
     "waivers",
     "inbox",
     "notifications",
+    "secrets",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no
