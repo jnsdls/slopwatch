@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 use crate::clones::{Clones, PipelineAt};
 use crate::github::{GitHub, OpenPr};
 use crate::plugins::Plugins;
-use crate::store::{NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
+use crate::store::{ActiveRun, NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
 use crate::watching::{RunInfo, Watching};
 
 use journal::Journal;
@@ -266,22 +266,30 @@ impl Engine {
     /// deleted, and after the first poll it starts again from scratch,
     /// which isn't a retry because it never reported.
     fn load(&mut self) -> Result<(), StoreError> {
-        for stored in self.store.active_runs()? {
+        for mut stored in self.store.active_runs()? {
+            for row in &mut stored.steps {
+                if let StepRowState::Running {
+                    pgid,
+                    started_us,
+                    sid,
+                } = row.state
+                {
+                    process::kill_leftover(&process::Leftover {
+                        pgid,
+                        started_us,
+                        sid,
+                    });
+                    let _ = std::fs::remove_dir_all(step_dir(&self.data_dir, stored.id, &row.step));
+                    let restarts = self.store.interrupt_step(stored.id, &row.step)?;
+                    row.state = StepRowState::Interrupted { restarts };
+                }
+            }
             let pipeline = match load(&stored.pipeline, &self.plugins) {
                 Ok(pipeline) => pipeline,
                 Err(errors) => {
-                    eprintln!(
-                        "slopwatchd: Run {} no longer loads its Pipeline ({}), ending it",
-                        stored.id,
-                        join(&errors)
-                    );
-                    self.journal.append(
-                        stored.id,
-                        RunEvent::Ended {
-                            reason: EndReason::Cancelled,
-                        },
-                    )?;
-                    self.store.end_run(stored.id, EndReason::Cancelled, now())?;
+                    let reason = format!("the Pipeline no longer loads: {}", join(&errors));
+                    eprintln!("slopwatchd: Run {}: {reason}, ending it", stored.id);
+                    self.end_unloadable(&stored, &reason)?;
                     continue;
                 }
             };
@@ -313,25 +321,10 @@ impl Engine {
                             .outcomes
                             .insert(row.step, Outcome { verdict, outputs });
                     }
-                    StepRowState::Running {
-                        pgid,
-                        started_us,
-                        sid,
-                    } => {
-                        process::kill_leftover(&process::Leftover {
-                            pgid,
-                            started_us,
-                            sid,
-                        });
-                        let _ =
-                            std::fs::remove_dir_all(step_dir(&self.data_dir, active.id, &row.step));
-                        let restarts = self.store.interrupt_step(active.id, &row.step)?;
-                        active.interrupted.insert(row.step, restarts);
-                    }
                     StepRowState::Interrupted { restarts } => {
                         active.interrupted.insert(row.step, restarts);
                     }
-                    StepRowState::Pending => {}
+                    StepRowState::Running { .. } | StepRowState::Pending => {}
                 }
             }
             let key = (stored.repo, stored.number);
@@ -342,6 +335,46 @@ impl Engine {
         for (repo, number) in self.store.prs_with_runs()? {
             self.publish(&repo, number)?;
         }
+        Ok(())
+    }
+
+    /// Ends a Run whose Pipeline stopped loading while the daemon was
+    /// down, as after an update dropped a Plugin it uses. Its unsettled
+    /// Steps get `error` with the reason, so the Run ends not shippable
+    /// rather than cancelled, which only the developer does.
+    fn end_unloadable(&mut self, run: &ActiveRun, reason: &str) -> Result<(), StoreError> {
+        for row in &run.steps {
+            if matches!(row.state, StepRowState::Settled { .. }) {
+                continue;
+            }
+            let state = StepRowState::Settled {
+                verdict: Verdict::Error,
+                reason: Some(reason.to_owned()),
+                outputs: Outputs::default(),
+            };
+            self.store.put_step(
+                run.id,
+                &StepRow {
+                    step: row.step.clone(),
+                    state,
+                    attempt: row.attempt,
+                },
+            )?;
+            self.journal.append(
+                run.id,
+                RunEvent::StepSettled {
+                    step: row.step.clone(),
+                    verdict: Verdict::Error,
+                    reason: Some(reason.to_owned()),
+                    outputs: Outputs::default(),
+                },
+            )?;
+        }
+        let ended = EndReason::NotShippable;
+        self.store.end_run(run.id, ended, now())?;
+        self.journal
+            .append(run.id, RunEvent::Ended { reason: ended })?;
+        let _ = std::fs::remove_dir_all(run_dir(&self.data_dir, run.id));
         Ok(())
     }
 

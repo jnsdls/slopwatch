@@ -110,7 +110,8 @@ pub fn spawn(spawn: Spawn, report: impl Fn(Report) + Send + 'static) -> io::Resu
         .spawn()?;
     let pid = child.id().expect("a just-spawned child has a pid") as i32;
     let started_us = process_start_us(pid);
-    let sid = session_of(pid);
+    // The Step runs in the daemon's session.
+    let sid = session_of(0);
     let stdin = child.stdin.take().expect("stdin is piped");
     let stdout = child.stdout.take().expect("stdout is piped");
     let (control, controls) = mpsc::unbounded_channel();
@@ -312,7 +313,7 @@ pub(crate) fn kill_leftover(leftover: &Leftover) {
     let ours = match kernel_start_us(pgid) {
         Some(leader_started) => leader_started == started_us,
         None => {
-            // Members that exited in the meantime have nothing to say.
+            // Skip members that exited since the listing.
             let members: Vec<(i64, i32)> = group_members(pgid)
                 .into_iter()
                 .filter_map(|pid| Some((kernel_start_us(pid)?, session_of(pid))))
@@ -328,7 +329,7 @@ pub(crate) fn kill_leftover(leftover: &Leftover) {
     }
 }
 
-/// The session `pid` belongs to, or -1 if it's gone.
+/// The session `pid` belongs to (0 for this process), or -1 if it's gone.
 pub(crate) fn session_of(pid: i32) -> i32 {
     // SAFETY: getsid takes a plain integer and touches no memory.
     unsafe { libc::getsid(pid) }
@@ -550,15 +551,18 @@ mod tests {
             sid: recorded.sid + 1,
             ..recorded
         });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let spared_by_session = alive(child);
         kill_leftover(&Leftover {
             started_us: kernel_start_us(child).unwrap() + 1,
             ..recorded
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let spared = alive(child);
+        let spared_by_start = alive(child);
         signal_group(recorded.pgid, libc::SIGKILL);
 
-        assert!(spared, "nothing proves the group is the Step's");
+        assert!(spared_by_session, "another session spares it");
+        assert!(spared_by_start, "a member older than the leader spares it");
     }
 
     #[tokio::test(start_paused = true)]

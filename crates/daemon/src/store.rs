@@ -147,8 +147,8 @@ pub enum StepRowState {
         sid: i32,
     },
     /// A daemon restart killed the Step's process before it reported. It
-    /// starts again from scratch once the first poll has run, unless
-    /// `restarts`, the restarts in a row that interrupted it, reached two.
+    /// starts again from scratch once the first poll has run, unless too
+    /// many restarts in a row interrupted it. `restarts` counts them.
     Interrupted {
         restarts: u32,
     },
@@ -320,36 +320,35 @@ impl Store {
     }
 
     pub fn put_step(&self, run: RunId, row: &StepRow) -> Result<(), StoreError> {
-        let mut process = (None, None, None);
-        let mut restarts = Some(0);
-        let (state, verdict, reason, outputs) = match &row.state {
-            StepRowState::Pending => ("pending", None, None, None),
+        let columns = match &row.state {
+            StepRowState::Pending => StepColumns::state("pending"),
             StepRowState::Running {
                 pgid,
                 started_us,
                 sid,
-            } => {
-                process = (Some(*pgid), Some(*started_us), Some(*sid));
+            } => StepColumns {
+                pgid: Some(*pgid),
+                started_us: Some(*started_us),
+                sid: Some(*sid),
                 // A respawn keeps counting the restarts before it.
-                restarts = None;
-                ("running", None, None, None)
-            }
-            StepRowState::Interrupted { restarts: count } => {
-                restarts = Some(*count);
-                ("interrupted", None, None, None)
-            }
+                restarts: None,
+                ..StepColumns::state("running")
+            },
+            StepRowState::Interrupted { restarts } => StepColumns {
+                restarts: Some(*restarts),
+                ..StepColumns::state("interrupted")
+            },
             StepRowState::Settled {
                 verdict,
                 reason,
                 outputs,
-            } => (
-                "settled",
-                Some(verdict.as_str()),
-                reason.clone(),
-                Some(serde_json::to_string(outputs).expect("outputs always serialize")),
-            ),
+            } => StepColumns {
+                verdict: Some(verdict.as_str()),
+                reason: reason.clone(),
+                outputs: Some(serde_json::to_string(outputs).expect("outputs always serialize")),
+                ..StepColumns::state("settled")
+            },
         };
-        let (pgid, started, sid) = process;
         self.db().execute(
             "UPDATE run_steps
              SET state = ?3, verdict = ?4, reason = ?5, outputs = ?6, attempt = ?7,
@@ -359,15 +358,15 @@ impl Store {
             params![
                 run.0 as i64,
                 row.step,
-                state,
-                verdict,
-                reason,
-                outputs,
+                columns.state,
+                columns.verdict,
+                columns.reason,
+                columns.outputs,
                 row.attempt,
-                pgid,
-                started,
-                sid,
-                restarts,
+                columns.pgid,
+                columns.started_us,
+                columns.sid,
+                columns.restarts,
             ],
         )?;
         Ok(())
@@ -575,6 +574,35 @@ impl Store {
             params![repo.to_string(), sha],
         )?;
         Ok(())
+    }
+}
+
+/// A [`StepRow`]'s state as `run_steps` columns.
+struct StepColumns {
+    state: &'static str,
+    verdict: Option<&'static str>,
+    reason: Option<String>,
+    outputs: Option<String>,
+    pgid: Option<i32>,
+    started_us: Option<i64>,
+    sid: Option<i32>,
+    /// `None` keeps the stored count.
+    restarts: Option<u32>,
+}
+
+impl StepColumns {
+    /// A state with nothing else to store, which ends a row of restarts.
+    fn state(state: &'static str) -> Self {
+        Self {
+            state,
+            verdict: None,
+            reason: None,
+            outputs: None,
+            pgid: None,
+            started_us: None,
+            sid: None,
+            restarts: Some(0),
+        }
     }
 }
 

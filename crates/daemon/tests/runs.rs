@@ -801,9 +801,11 @@ fn a_push_while_the_daemon_was_down_ends_the_run_and_starts_another() {
 fn a_step_interrupted_by_two_restarts_in_a_row_ends_in_error() {
     let restarts = Restarts::new();
     let run = restarts.life(async |_, client| crash_mid_run(&restarts, client).await);
-    restarts.life(async |_, client| {
+    // The second restart is the `restart` command an update sends.
+    restarts.life(async |daemon, client| {
         client.refresh().await;
         until(|| restarts.slow_pids().len() == 2).await;
+        daemon.kill_steps().await;
     });
 
     restarts.life(async |_, client| {
@@ -826,4 +828,36 @@ fn a_step_interrupted_by_two_restarts_in_a_row_ends_in_error() {
     });
 
     assert_eq!(restarts.slow_pids().len(), 2, "no third start");
+}
+
+#[test]
+fn a_run_whose_pipeline_stopped_loading_ends_not_shippable_and_its_steps_die() {
+    let restarts = Restarts::new();
+    let steps = restarts.data.path().join("steps");
+    std::fs::create_dir_all(&steps).unwrap();
+    std::fs::write(steps.join("slow.yml"), "uses: ci\n").unwrap();
+    restarts.github.set_pipeline(
+        &repo(),
+        "main",
+        "version: 1\nsteps:\n  ci: { uses: ci }\n  slow: { uses: lib/slow }\ngate: [ci, slow]\n",
+    );
+    let run = restarts.life(async |_, client| crash_mid_run(&restarts, client).await);
+    let (_, child) = restarts.slow_pids()[0];
+    std::fs::remove_file(steps.join("slow.yml")).unwrap();
+
+    restarts.life(async |_, client| {
+        until(|| !alive(child)).await;
+        client.subscribe(run, None).await;
+
+        assert_eq!(client.run(run).end, Some(EndReason::NotShippable));
+        let StepStatus::Settled {
+            verdict, reason, ..
+        } = slow_status(client, run)
+        else {
+            panic!("slow settled");
+        };
+        assert_eq!(verdict, Verdict::Error);
+        let reason = reason.unwrap_or_default();
+        assert!(reason.contains("no longer loads"), "{reason}");
+    });
 }

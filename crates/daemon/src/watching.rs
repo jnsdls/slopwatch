@@ -37,8 +37,9 @@ struct State {
     store: Store,
     repos: Vec<RepoName>,
     prs: BTreeMap<(RepoName, u64), OpenPr>,
-    /// Repos GitHub has answered for since the daemon started. Until then
-    /// a repo's PRs are what the store kept, without their detail.
+    /// Repos a poll has covered since the daemon started. Until then a
+    /// repo's PRs are what the store kept, without their detail. A repo
+    /// that vanished counts once a poll found it gone.
     polled: HashSet<RepoName>,
     /// What Runs report for each PR, shown on its row.
     runs: BTreeMap<(RepoName, u64), RunInfo>,
