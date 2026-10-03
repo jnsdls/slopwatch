@@ -14,7 +14,17 @@ use crate::verdict::{GateState, StepState, Verdict};
 /// Words a Step id can't take, because the expression language or the Gate
 /// node already uses them.
 pub(crate) const RESERVED_IDS: &[&str] = &[
-    "gate", "always", "and", "or", "not", "files", "labels", "base", "draft", "author",
+    "gate",
+    "always",
+    "and",
+    "or",
+    "not",
+    "files",
+    "labels",
+    "base",
+    "draft",
+    "author",
+    "linked_issue",
 ];
 
 #[derive(Debug, Clone)]
@@ -52,6 +62,8 @@ pub enum Fact {
     Base(Vec<String>),
     Author(Vec<String>),
     Draft(bool),
+    /// The PR links an issue it closes, or doesn't.
+    LinkedIssue(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -150,7 +162,7 @@ impl Expr {
                     "and" => Ok(Expr::All(parse_block(key, inner, cx)?)),
                     "or" => Ok(Expr::Any(parse_block(key, inner, cx)?)),
                     "not" => Ok(Expr::Not(parse_block(key, inner, cx)?)),
-                    "files" | "labels" | "base" | "author" | "draft" => {
+                    "files" | "labels" | "base" | "author" | "draft" | "linked_issue" => {
                         if cx == Context::Gate {
                             return Err(format!(
                                 "the Gate reads only Verdicts, so it can't read the PR fact `{key}`"
@@ -247,6 +259,7 @@ impl Fact {
             Fact::Base(bases) => bases.contains(&pr.base),
             Fact::Author(authors) => authors.contains(&pr.author),
             Fact::Draft(draft) => pr.draft == *draft,
+            Fact::LinkedIssue(linked) => pr.linked_issue == *linked,
         }
     }
 }
@@ -276,11 +289,12 @@ fn parse_block(key: &str, inner: &Value, cx: Context) -> Result<Vec<Expr>, Strin
 }
 
 fn parse_fact(key: &str, inner: &Value) -> Result<Fact, String> {
-    if key == "draft" {
+    if key == "draft" || key == "linked_issue" {
         return match inner {
-            Value::Bool(b) => Ok(Fact::Draft(*b)),
+            Value::Bool(b) if key == "draft" => Ok(Fact::Draft(*b)),
+            Value::Bool(b) => Ok(Fact::LinkedIssue(*b)),
             other => Err(format!(
-                "`draft` takes true or false, found {}",
+                "`{key}` takes true or false, found {}",
                 describe(other)
             )),
         };
@@ -393,6 +407,7 @@ impl fmt::Display for Expr {
                     f.write_str("}")
                 }
                 Fact::Draft(b) => write!(f, "{{draft: {b}}}"),
+                Fact::LinkedIssue(b) => write!(f, "{{linked_issue: {b}}}"),
             },
             Expr::All(items) => list(f, items),
             Expr::Any(items) => {
@@ -538,6 +553,7 @@ mod tests {
             base: "main".into(),
             draft: false,
             author: "jnsdls".into(),
+            linked_issue: true,
         };
         let truths = [
             (json!({"files": "docs/**"}), Tri::True),
@@ -547,6 +563,8 @@ mod tests {
             (json!({"base": ["release", "main"]}), Tri::True),
             (json!({"author": "someone"}), Tri::False),
             (json!({"draft": false}), Tri::True),
+            (json!({"linked_issue": true}), Tri::True),
+            (json!({"linked_issue": false}), Tri::False),
             (json!(false), Tri::False),
             (json!("always"), Tri::True),
         ];

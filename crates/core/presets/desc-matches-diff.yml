@@ -2,13 +2,15 @@
 # Needs the AI_GATEWAY_API_KEY Secret.
 uses: jev
 with:
+  evidence: [description, diff]
   questions:
     - id: does-what-it-says
       question: Does the diff do what the PR description says it does?
       pass_when: true
     - id: unmentioned-changes
-      question: Does the diff change things the PR description doesn't mention?
+      question: Does the diff make changes the PR description doesn't mention?
       pass_when: false
+      false_when: Every change in the diff is covered by something the description says.
     - id: says-why
       question: Does the PR description say why the change is needed?
       pass_when: true

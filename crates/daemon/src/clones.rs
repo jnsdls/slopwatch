@@ -190,6 +190,54 @@ impl Clones {
             .collect())
     }
 
+    /// PR `number`'s unified diff at `head_sha` against where it branched
+    /// from `base_sha`, the diff GitHub shows for it. The blobless clone
+    /// fetches the blobs it needs from the remote here. Bytes that aren't
+    /// UTF-8 come back replaced.
+    pub async fn diff(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        number: u64,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<String, GitError> {
+        for sha in [base_sha, head_sha] {
+            if sha.is_empty() || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(GitError(format!("`{sha}` isn't a commit SHA")));
+            }
+        }
+        let _turn = self.turn(repo).await;
+        let path = self.cloned(repo, remote).await?;
+        git(
+            &path,
+            remote,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--filter=blob:none",
+                &remote.url,
+                &format!("+refs/pull/{number}/head:refs/slopwatch/pull/{number}"),
+            ],
+        )
+        .await?;
+        let output = git_output(
+            &path,
+            remote,
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                &format!("{base_sha}...{head_sha}"),
+                "--",
+            ],
+        )
+        .await?;
+        Ok(String::from_utf8_lossy(&output).into_owned())
+    }
+
     /// Waits for the repo's turn: one git operation per repo at a time.
     async fn turn(&self, repo: &RepoName) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = self
@@ -240,6 +288,17 @@ impl Clones {
 /// Runs git in `dir` and returns its stdout, trimmed of the final newline
 /// for one-line answers. Text output keeps everything else as is.
 async fn git(dir: &Path, remote: &GitRemote, args: &[&str]) -> Result<String, GitError> {
+    let output = git_output(dir, remote, args).await?;
+    let mut text = String::from_utf8(output)
+        .map_err(|_| GitError(format!("git {} wrote non-UTF-8", args[0])))?;
+    if args[0] != "cat-file" {
+        text.truncate(text.trim_end().len());
+    }
+    Ok(text)
+}
+
+/// Runs git in `dir` and returns its stdout as it wrote it.
+async fn git_output(dir: &Path, remote: &GitRemote, args: &[&str]) -> Result<Vec<u8>, GitError> {
     let output = Command::new("git")
         .current_dir(dir)
         .args(args)
@@ -256,12 +315,7 @@ async fn git(dir: &Path, remote: &GitRemote, args: &[&str]) -> Result<String, Gi
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let mut text = String::from_utf8(output.stdout)
-        .map_err(|_| GitError(format!("git {} wrote non-UTF-8", args[0])))?;
-    if args[0] != "cat-file" {
-        text.truncate(text.trim_end().len());
-    }
-    Ok(text)
+    Ok(output.stdout)
 }
 
 #[cfg(test)]
@@ -368,6 +422,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(files, ["change-3.txt", "docs/guide.md"]);
+    }
+
+    #[tokio::test]
+    async fn reads_the_diff_a_pr_makes_since_it_branched() {
+        let github = FakeGitHub::new("me");
+        github.add_repo(&repo());
+        github.open_pr(&repo(), 3, "me", "Docs");
+        github.push_file(&repo(), 3, "docs/guide.md", "Read me.\n");
+        let base = github.set_pipeline(&repo(), "main", CI_PIPELINE);
+        let head = github.head_sha(&repo(), 3);
+        let remote = github.git_remote(&repo()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let clones = Clones::new(dir.path());
+
+        let diff = clones
+            .diff(&repo(), &remote, 3, &base, &head)
+            .await
+            .unwrap();
+
+        assert!(
+            diff.contains("diff --git a/docs/guide.md b/docs/guide.md"),
+            "{diff}"
+        );
+        assert!(diff.contains("+Read me."), "{diff}");
+        assert!(diff.contains("+A change."), "{diff}");
+        assert!(
+            !diff.contains(".slopwatch/pipeline.yml"),
+            "main moving on isn't part of the PR: {diff}"
+        );
+        assert!(diff.ends_with('\n'), "kept whole");
     }
 
     #[tokio::test]

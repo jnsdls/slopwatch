@@ -112,9 +112,40 @@ async fn a_blobless_clone_reads_the_pipeline_from_a_real_base_branch() {
         .await
         .unwrap();
     assert!(!files.is_empty(), "the PR's head changes something");
+    // The blobless clone fetches the blobs the diff needs, with the token.
+    let diff = clones
+        .diff(&repo, &remote, pr.number, &read.sha, &pr.head_sha)
+        .await
+        .unwrap();
+    for file in &files {
+        assert!(diff.contains(&format!(" b/{file}")), "{file} in {diff}");
+    }
     let config = std::fs::read_to_string(clones.path(&repo).join("config")).unwrap();
     assert!(
         !config.contains("AUTHORIZATION"),
         "the token stays out of the clone"
     );
+}
+
+/// Needs `SLOPWATCH_LIVE_LINKED=<pr>:<issue>` too: a PR on the default
+/// branch whose description closes the issue. GitHub links closing
+/// keywords only on PRs into the default branch.
+#[tokio::test]
+#[ignore = "needs the network, a gh login and a scratch repo"]
+async fn reads_the_issues_a_pr_closes() {
+    let (repo, _, _) = fixture();
+    let linked = std::env::var("SLOPWATCH_LIVE_LINKED").expect("set SLOPWATCH_LIVE_LINKED");
+    let (pr, issue) = linked.split_once(':').expect("<pr>:<issue>");
+    let api = Api::new(Arc::new(GhToken::default()));
+
+    let issues = api.linked_issues(&repo, pr.parse().unwrap()).await.unwrap();
+
+    let issue: u64 = issue.parse().unwrap();
+    let found = issues
+        .iter()
+        .find(|linked| linked.number == issue)
+        .unwrap_or_else(|| panic!("#{issue} isn't in {issues:?}"));
+    assert_eq!(found.repo, repo);
+    assert!(!found.title.is_empty());
+    assert!(found.url.ends_with(&format!("/issues/{issue}")));
 }
