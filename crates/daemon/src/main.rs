@@ -51,7 +51,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let steps = Library::default_dir();
+    let steps = Library::default_dir(Flavor::CURRENT);
     let library = match Library::open(&steps) {
         Ok(library) => Arc::new(library),
         Err(error) => {

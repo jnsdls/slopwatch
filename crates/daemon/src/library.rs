@@ -11,7 +11,7 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use slopwatch_core::{PRESETS, check_library_step, is_library_step_name};
-use slopwatch_protocol::LibraryStep;
+use slopwatch_protocol::{Flavor, LibraryStep};
 
 /// Overrides the config dir that holds the Library, for tests and for
 /// running a second daemon by hand next to the installed one.
@@ -57,17 +57,23 @@ impl From<io::Error> for LibraryError {
 }
 
 impl Library {
-    /// `steps/` under `$SLOPWATCH_CONFIG_DIR`, or under
-    /// `~/.config/slopwatch` when that isn't set.
-    pub fn default_dir() -> PathBuf {
+    /// `steps/` under `$SLOPWATCH_CONFIG_DIR`, or else under
+    /// `~/.config/slopwatch` for release builds and `~/.config/slopwatch-dev`
+    /// for dev builds, so a dev build never edits the real Library.
+    pub fn default_dir(flavor: Flavor) -> PathBuf {
         let config = std::env::var_os(CONFIG_DIR_ENV)
             .filter(|dir| !dir.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| {
+                let name = match flavor {
+                    Flavor::Release => "slopwatch",
+                    Flavor::Dev => "slopwatch-dev",
+                };
                 std::env::var_os("HOME")
                     .map(PathBuf::from)
                     .unwrap_or_default()
-                    .join(".config/slopwatch")
+                    .join(".config")
+                    .join(name)
             });
         config.join("steps")
     }
