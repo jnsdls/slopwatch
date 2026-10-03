@@ -1056,6 +1056,7 @@ mod tests {
             merge: None,
             diff: None,
             linked_issues: vec![],
+            stacked_on: None,
         }
     }
 

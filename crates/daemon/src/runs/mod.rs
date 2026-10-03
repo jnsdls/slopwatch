@@ -48,6 +48,7 @@ pub mod log;
 pub mod process;
 mod retention;
 mod source;
+mod stacks;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -78,7 +79,9 @@ use crate::notifications::Notifications;
 use crate::plugins::{NotApprovable, Plugins, human};
 use crate::secrets::{Keychain, Mask, SecretError, Secrets, held_by_secret, missing_secret};
 use crate::shell_env;
-use crate::store::{ActiveRun, NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
+use crate::store::{
+    ActiveRun, NewRun, NewStep, StackLinkRow, StepRow, StepRowState, Store, StoreError,
+};
 use crate::watching::{RunInfo, Watching};
 
 use journal::Journal;
@@ -254,6 +257,9 @@ impl Runs {
                 .collect(),
             blocked: HashMap::new(),
             checked_base: HashMap::new(),
+            held: HashMap::new(),
+            links: HashMap::new(),
+            updating: HashSet::new(),
             reconciled: false,
             stopped: false,
         };
@@ -281,6 +287,7 @@ impl Runs {
                 match input {
                     Input::Step(report) => engine.on_report(report),
                     Input::Effect(finished) => engine.on_effect_finished(finished),
+                    Input::Stack(finished) => engine.on_stack_update(finished),
                 }
                 engine.schedule();
                 driver
@@ -307,13 +314,15 @@ impl Runs {
             // can't show a PR gone that the merge states saw open.
             let prs = engine.watching.prs();
             let wanted = engine.merge_states_wanted(&prs);
-            (prs, wanted)
+            let parents = engine.parents_wanted(&prs);
+            (prs, wanted, parents)
         };
-        let (prs, wanted) = wanted;
+        let (prs, wanted, parents) = wanted;
         let merge_states = self.read_merge_states(wanted).await;
+        let fates = self.read_fates(parents).await;
         let starts = {
             let mut engine = self.engine.lock().await;
-            let starts = engine.sync(prs, merge_states);
+            let starts = engine.sync(prs, merge_states, fates);
             engine.schedule();
             starts
         };
@@ -326,6 +335,23 @@ impl Runs {
         let engine = self.engine.lock().await;
         self.live
             .store(!engine.active.is_empty(), Ordering::Relaxed);
+    }
+
+    /// Asks GitHub what became of each Stack parent that left the poll. One
+    /// that can't be read is left out, and the next sync asks again.
+    async fn read_fates(&self, parents: Vec<PrKey>) -> stacks::Fates {
+        let mut fates = HashMap::new();
+        for (repo, number) in parents {
+            match self.github.pr_fate(&repo, number).await {
+                Ok(fate) => {
+                    fates.insert((repo, number), fate);
+                }
+                Err(error) => {
+                    eprintln!("slopwatchd: can't read what became of {repo}#{number}: {error}");
+                }
+            }
+        }
+        fates
     }
 
     /// Asks GitHub where each PR stands for merging, at the head its Run
@@ -350,9 +376,9 @@ impl Runs {
     }
 
     /// What a Run on the PR's head starts from: the Pipeline at the tip of
-    /// its base, and the files the head changes, both from the repo's
-    /// clone, with the issues the PR links. The diff too, when a Step in
-    /// the Pipeline asks for it.
+    /// its root base, and the files the head changes against its own base,
+    /// both from the repo's clone, with the issues the PR links. The diff
+    /// too, against the same base, when a Step in the Pipeline asks for it.
     async fn read_inputs(
         &self,
         repo: &RepoName,
@@ -364,11 +390,12 @@ impl Runs {
             .git_remote(repo)
             .await
             .map_err(|error| error.to_string())?;
+        let root = pr.root().name;
         let pipeline = self
             .clones
-            .pipeline_at(repo, &remote, &pr.base)
+            .pipeline_at(repo, &remote, &root)
             .await
-            .map_err(|error| format!("can't read the Pipeline on {}: {error}", pr.base))?;
+            .map_err(|error| format!("can't read the Pipeline on {root}: {error}"))?;
         let unchanged = match when {
             StartWhen::PipelineChanged { from } => pipeline.text.as_ref() == Some(from),
             StartWhen::Always => false,
@@ -383,9 +410,19 @@ impl Runs {
                 diff: None,
             });
         }
+        // A stacked PR changes what its own base, the parent's head,
+        // doesn't have.
+        let base_sha = if pr.base == root {
+            pipeline.sha.clone()
+        } else {
+            self.clones
+                .branch_tip(repo, &remote, &pr.base)
+                .await
+                .map_err(|error| format!("can't fetch {}: {error}", pr.base))?
+        };
         let files = self
             .clones
-            .changed_files(repo, &remote, pr.number, &pipeline.sha, &pr.head_sha)
+            .changed_files(repo, &remote, pr.number, &base_sha, &pr.head_sha)
             .await
             .map_err(|error| format!("can't list the files the PR changes: {error}"))?;
         let linked_issues = self
@@ -399,7 +436,7 @@ impl Runs {
             if !path.exists() {
                 let diff = self
                     .clones
-                    .diff(repo, &remote, pr.number, &pipeline.sha, &pr.head_sha)
+                    .diff(repo, &remote, pr.number, &base_sha, &pr.head_sha)
                     .await
                     .map_err(|error| format!("can't read the PR's diff: {error}"))?;
                 write_diff(&path, diff)
@@ -797,8 +834,15 @@ struct Engine {
     /// The base SHA whose Pipeline each PR's latest Run was last compared
     /// with, so a base commit that leaves the Pipeline alone is read once.
     checked_base: HashMap<PrKey, String>,
-    /// The Effect intents a crash left open have been settled, which waits
-    /// for the first sync (ADR 0009).
+    /// PRs a Stack update holds back from a new Run, with what their row
+    /// says about it ([`stacks`]).
+    held: HashMap<PrKey, String>,
+    /// The parent each watched PR was last seen stacked on.
+    links: HashMap<PrKey, StackLinkRow>,
+    /// Stack updates whose GitHub calls are under way.
+    updating: HashSet<i64>,
+    /// The Effect and Stack update intents a crash left open have been
+    /// settled, which waits for the first sync (ADR 0009).
     reconciled: bool,
     /// The daemon is about to exit: nothing more changes.
     stopped: bool,
@@ -861,6 +905,9 @@ struct Active {
     repo: RepoName,
     number: u64,
     head_sha: String,
+    /// The PR's own base when the Run started. A base change from outside
+    /// the Run ends it (ADR 0011).
+    pr_base: Option<String>,
     pipeline: Pipeline,
     state: RunState,
     gate: GateState,
@@ -1003,6 +1050,7 @@ enum Question {
 enum Input {
     Step(StepReport),
     Effect(effects::Finished),
+    Stack(stacks::Finished),
 }
 
 struct StepReport {
@@ -1056,6 +1104,7 @@ impl Engine {
                 repo: stored.repo.clone(),
                 number: stored.number,
                 head_sha: stored.head_sha.clone(),
+                pr_base: stored.pr_base,
                 pipeline,
                 state: RunState::default(),
                 gate: stored.gate,
@@ -1113,6 +1162,7 @@ impl Engine {
                 self.end_run(older, EndReason::Superseded)?;
             }
         }
+        self.load_stacks()?;
         let going = self.active.values().map(|run| run.id).collect();
         self.inbox.keep_runs(&going)?;
         for (repo, number) in self.store.prs_with_runs()? {
@@ -1167,7 +1217,7 @@ impl Engine {
         self.inbox.run_ended(run.id)?;
         self.inbox.raise_pr(
             pr_ref(&run.repo, run.number),
-            run.id,
+            Some(run.id),
             NOT_SHIPPABLE,
             vec![reason.to_owned()],
         )
@@ -1179,14 +1229,16 @@ impl Engine {
         &mut self,
         prs: Vec<(RepoName, OpenPr)>,
         merge_states: MergeStates,
+        fates: stacks::Fates,
     ) -> Vec<(RepoName, OpenPr, StartWhen)> {
         if self.stopped {
             return Vec::new();
         }
-        self.try_sync(prs, merge_states).unwrap_or_else(|error| {
-            eprintln!("slopwatchd: can't update Runs: {error}");
-            Vec::new()
-        })
+        self.try_sync(prs, merge_states, fates)
+            .unwrap_or_else(|error| {
+                eprintln!("slopwatchd: can't update Runs: {error}");
+                Vec::new()
+            })
     }
 
     /// Whether a Step in the Pipeline `text` asks for the PR's diff
@@ -1243,11 +1295,13 @@ impl Engine {
         &mut self,
         prs: Vec<(RepoName, OpenPr)>,
         merge_states: MergeStates,
+        fates: stacks::Fates,
     ) -> Result<Vec<(RepoName, OpenPr, StartWhen)>, StoreError> {
         let open: BTreeMap<PrKey, (RepoName, OpenPr)> = prs
             .into_iter()
             .map(|(repo, pr)| ((repo.clone(), pr.number), (repo, pr)))
             .collect();
+        let held = self.sync_stacks(&open, &fates)?;
 
         let keys: Vec<PrKey> = self.active.keys().cloned().collect();
         for key in keys {
@@ -1281,6 +1335,12 @@ impl Engine {
                         EndReason::Superseded
                     })
                 }
+                // A base change from outside the Run changes the diff and
+                // maybe the root base, so a new Run judges the same SHA
+                // (ADR 0011). The daemon's own retarget ended it already.
+                Some((_, pr)) if run.pr_base.as_ref().is_some_and(|base| *base != pr.base) => {
+                    Some(EndReason::Superseded)
+                }
                 Some(_) => None,
             };
             if let Some(reason) = ending {
@@ -1289,7 +1349,7 @@ impl Engine {
                 continue;
             }
             let (repo, pr) = &open[&key];
-            let mut snapshot = snapshot(repo, pr);
+            let mut snapshot = snapshot(repo, pr, self.stacked_on(&key, pr));
             let run = self.active.get_mut(&key).expect("listed above");
             run.evidence.fill(&mut snapshot);
             // A merge state read this time replaces the last one, which
@@ -1334,10 +1394,11 @@ impl Engine {
         }
         let mut starts = Vec::new();
         for (key, (repo, pr)) in &open {
-            if !pr.labeled || self.active.contains_key(key) {
+            if !pr.labeled || self.active.contains_key(key) || held.contains(key) {
                 continue;
             }
-            if !pr.base_has_pipeline {
+            let root = pr.root();
+            if !root.has_pipeline {
                 // A Pipeline that's gone holds nothing back: the PR waits.
                 self.unblock(key, Closing::NothingHeld)?;
                 continue;
@@ -1346,7 +1407,7 @@ impl Engine {
             // different only once the Library changed under it.
             let mut cleared = false;
             if let Some(invalid) = self.blocked.get(key).and_then(|b| b.invalid.as_ref())
-                && invalid.base_sha == pr.detail.base_sha
+                && invalid.base_sha == root.sha
             {
                 if load(&invalid.text, &*self.plugins).is_err() {
                     continue;
@@ -1356,15 +1417,21 @@ impl Engine {
             let newly_watched = !self.watched.contains(key);
             let latest = self.store.latest_run(repo, pr.number)?;
             let when = match latest {
-                Some(run) if !cleared && !newly_watched && run.head_sha == pr.head_sha => {
-                    // The base moved since the latest Run read it, so its
-                    // Pipeline may have changed. An empty SHA is a PR no
-                    // poll has seen yet.
-                    let base_sha = &pr.detail.base_sha;
-                    let base_moved = !base_sha.is_empty()
-                        && run.base_sha != *base_sha
-                        && self.checked_base.get(key) != Some(base_sha);
-                    if !base_moved {
+                Some(run)
+                    if !cleared
+                        && !newly_watched
+                        && run.head_sha == pr.head_sha
+                        && run.pr_base.as_ref().is_none_or(|base| *base == pr.base) =>
+                {
+                    // The root base moved since the latest Run read it, so
+                    // its Pipeline may have changed. An empty SHA is a PR
+                    // no poll has seen yet.
+                    let base_moved = !root.sha.is_empty()
+                        && run.base_sha != root.sha
+                        && self.checked_base.get(key) != Some(&root.sha);
+                    // A PR whose parent closed waits for the developer,
+                    // whatever happens to the dead branch under it.
+                    if !base_moved || self.orphaned(key) {
                         continue;
                     }
                     StartWhen::PipelineChanged { from: run.pipeline }
@@ -1440,11 +1507,13 @@ impl Engine {
         read: Result<Inputs, String>,
     ) -> Result<(), StoreError> {
         let key = (repo.clone(), pr.number);
-        // Another sync started one while this one read the Pipeline.
-        if self.active.contains_key(&key) {
+        // Another sync started one while this one read the Pipeline, or
+        // took on a Stack update that holds the PR.
+        if self.active.contains_key(&key) || self.held.contains_key(&key) {
             return Ok(());
         }
-        let base = &pr.base;
+        let root = pr.root();
+        let base = &root.name;
         let Inputs {
             pipeline: read,
             files,
@@ -1472,8 +1541,7 @@ impl Engine {
             return Ok(());
         };
         if let StartWhen::PipelineChanged { from } = &when {
-            self.checked_base
-                .insert(key.clone(), pr.detail.base_sha.clone());
+            self.checked_base.insert(key.clone(), root.sha.clone());
             if *from == text {
                 // A Pipeline that was invalid and is now back as it was,
                 // perhaps while the daemon was down.
@@ -1487,7 +1555,7 @@ impl Engine {
                 let message = format!("The Pipeline on {base} is invalid: {}", join(&errors));
                 let invalid = Invalid {
                     base: base.clone(),
-                    base_sha: pr.detail.base_sha.clone(),
+                    base_sha: root.sha.clone(),
                     text,
                 };
                 let reasons = errors.iter().map(ToString::to_string).collect();
@@ -1506,6 +1574,7 @@ impl Engine {
                 number: pr.number,
                 head_sha: &pr.head_sha,
                 base,
+                pr_base: &pr.base,
                 base_sha: &read.sha,
                 pipeline: &text,
                 files: &files,
@@ -1542,7 +1611,7 @@ impl Engine {
             linked_issues,
             diff,
         };
-        let mut snapshot = snapshot(repo, pr);
+        let mut snapshot = snapshot(repo, pr, self.stacked_on(&key, pr));
         evidence.fill(&mut snapshot);
         self.active.insert(
             key.clone(),
@@ -1551,6 +1620,7 @@ impl Engine {
                 repo: repo.clone(),
                 number: pr.number,
                 head_sha: pr.head_sha.clone(),
+                pr_base: Some(pr.base.clone()),
                 state: RunState {
                     pr: facts(&snapshot, &files),
                     ..RunState::default()
@@ -2376,7 +2446,7 @@ impl Engine {
             };
             if let Some((title, reasons)) = raised {
                 self.inbox
-                    .raise_pr(pr_ref(&run.repo, run.number), run.id, title, reasons)?;
+                    .raise_pr(pr_ref(&run.repo, run.number), Some(run.id), title, reasons)?;
             }
         }
         if reason == EndReason::Shippable {
@@ -2706,8 +2776,14 @@ impl Engine {
                 stored.head_sha
             )));
         }
-        if let Some(blocked) = self.blocked.get(&(stored.repo.clone(), stored.number)) {
-            return Err(RunError::Invalid(blocked.message.clone()));
+        let key = (stored.repo.clone(), stored.number);
+        if let Some(message) = self
+            .blocked
+            .get(&key)
+            .map(|blocked| &blocked.message)
+            .or_else(|| self.held.get(&key))
+        {
+            return Err(RunError::Invalid(message.clone()));
         }
         Ok(pr)
     }
@@ -2778,7 +2854,8 @@ impl Engine {
             blocked: self
                 .blocked
                 .get(&(repo.clone(), number))
-                .map(|blocked| blocked.message.clone()),
+                .map(|blocked| blocked.message.clone())
+                .or_else(|| self.held.get(&(repo.clone(), number)).cloned()),
         };
         self.watching.set_run_info(repo, number, info);
         Ok(())
@@ -3052,7 +3129,7 @@ fn upstream(pipeline: &Pipeline, step: &str) -> Vec<String> {
     found
 }
 
-fn snapshot(repo: &RepoName, pr: &OpenPr) -> PrSnapshot {
+fn snapshot(repo: &RepoName, pr: &OpenPr, stacked_on: Option<u64>) -> PrSnapshot {
     PrSnapshot {
         repo: repo.clone(),
         number: pr.number,
@@ -3068,6 +3145,7 @@ fn snapshot(repo: &RepoName, pr: &OpenPr) -> PrSnapshot {
         merge: None,
         diff: None,
         linked_issues: Vec::new(),
+        stacked_on,
     }
 }
 

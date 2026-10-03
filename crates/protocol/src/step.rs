@@ -393,6 +393,11 @@ pub struct PrSnapshot {
     /// the Run starts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub linked_issues: Vec<LinkedIssue>,
+    /// The open PR whose head branch is this PR's base, when the PR is in a
+    /// Stack and not at its bottom. Such a PR doesn't merge until its parent
+    /// has (ADR 0011).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacked_on: Option<u64>,
 }
 
 /// The manifest feature that asks for [`PrSnapshot::merge`].
@@ -534,6 +539,7 @@ mod tests {
                 merge: None,
                 diff: None,
                 linked_issues: vec![],
+                stacked_on: None,
             },
             upstream: BTreeMap::new(),
         });

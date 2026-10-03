@@ -15,8 +15,8 @@ use slopwatch_protocol::step::{
 };
 
 use super::{
-    GitHub, GitHubError, GitRemote, Merged, OpenPr, PIPELINE_PATH, Poll, PrDetail, RateLimit,
-    RepoPoll, WATCH_LABEL,
+    Branch, GitHub, GitHubError, GitRemote, Merged, OpenPr, PIPELINE_PATH, ParentPr, Poll,
+    PrDetail, PrFate, RateLimit, RepoPoll, StackLink, WATCH_LABEL,
 };
 use crate::auth::Credentials;
 
@@ -107,6 +107,16 @@ impl Api {
             .json()
             .await
             .map_err(|error| GitHubError::Other(format!("unreadable GraphQL answer: {error}")))
+    }
+
+    /// The PR's GraphQL node id, which mutations take.
+    async fn pr_id(&self, repo: &RepoName, number: u64) -> Result<String, GitHubError> {
+        let variables = json!({ "owner": repo.owner, "name": repo.name, "number": number });
+        let data = self.graphql(PR_ID, variables).await?;
+        data["repository"]["pullRequest"]["id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| GitHubError::NotFound(format!("{repo}#{number}")))
     }
 
     async fn rest(
@@ -323,12 +333,7 @@ impl GitHub for Api {
         expected_head: &str,
         method: UpdateMethod,
     ) -> Result<(), GitHubError> {
-        let variables = json!({ "owner": repo.owner, "name": repo.name, "number": number });
-        let data = self.graphql(PR_ID, variables).await?;
-        let id = data["repository"]["pullRequest"]["id"]
-            .as_str()
-            .ok_or_else(|| GitHubError::NotFound(format!("{repo}#{number}")))?
-            .to_owned();
+        let id = self.pr_id(repo, number).await?;
         let method = match method {
             UpdateMethod::Rebase => "REBASE",
             UpdateMethod::Merge => "MERGE",
@@ -338,6 +343,23 @@ impl GitHub for Api {
         // data, holding a null payload next to the error.
         let answer = self.graphql_answer(UPDATE_BRANCH, variables).await?;
         if answer["data"]["updatePullRequestBranch"].is_null() {
+            return Err(graphql_error(&answer));
+        }
+        Ok(())
+    }
+
+    async fn pr_fate(&self, repo: &RepoName, number: u64) -> Result<PrFate, GitHubError> {
+        let variables = json!({ "owner": repo.owner, "name": repo.name, "number": number });
+        let data = self.graphql(PR_FATE, variables).await?;
+        read_pr_fate(repo, number, data)
+    }
+
+    async fn set_base(&self, repo: &RepoName, number: u64, base: &str) -> Result<(), GitHubError> {
+        let id = self.pr_id(repo, number).await?;
+        let answer = self
+            .graphql_answer(SET_BASE, json!({ "id": id, "base": base }))
+            .await?;
+        if answer["data"]["updatePullRequest"].is_null() {
             return Err(graphql_error(&answer));
         }
         Ok(())
@@ -592,6 +614,70 @@ mutation($id: ID!, $head: GitObjectID!, $method: PullRequestBranchUpdateMethod!)
   }
 }";
 
+/// Whether a PR is open, closed or merged. A merge commit has two parents
+/// and keeps the PR's commits on the base. A squash or a rebase merge
+/// leaves the base's tip with one.
+const PR_FATE: &str = "
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      state merged baseRefName
+      mergeCommit { parents(first: 2) { totalCount } }
+    }
+  }
+}";
+
+const SET_BASE: &str = "
+mutation($id: ID!, $base: String!) {
+  updatePullRequest(input: { pullRequestId: $id, baseRefName: $base }) {
+    pullRequest { id }
+  }
+}";
+
+fn read_pr_fate(repo: &RepoName, number: u64, data: Value) -> Result<PrFate, GitHubError> {
+    #[derive(Deserialize)]
+    struct Data {
+        repository: Option<Repo>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Repo {
+        pull_request: Option<Pr>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Pr {
+        state: String,
+        merged: bool,
+        base_ref_name: String,
+        merge_commit: Option<MergeCommit>,
+    }
+    #[derive(Deserialize)]
+    struct MergeCommit {
+        parents: Count,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Count {
+        total_count: u64,
+    }
+
+    let Data { repository } = parse(data)?;
+    let pr = repository
+        .and_then(|repository| repository.pull_request)
+        .ok_or_else(|| GitHubError::NotFound(format!("{repo}#{number}")))?;
+    Ok(match (pr.merged, pr.state.as_str()) {
+        (true, _) => PrFate::Merged {
+            into: pr.base_ref_name,
+            kept_commits: pr
+                .merge_commit
+                .is_some_and(|commit| commit.parents.total_count > 1),
+        },
+        (false, "OPEN") => PrFate::Open,
+        (false, _) => PrFate::Closed,
+    })
+}
+
 /// The async merge API's answer, from the call or from asking after it.
 #[derive(Deserialize)]
 struct MergeAnswer {
@@ -731,7 +817,14 @@ fn poll_query(repos: &[RepoName]) -> (String, Value) {
         author {{ login }}
         repository {{ nameWithOwner }}
         labels(first: {PAGE}) {{ nodes {{ name }} }}
-        baseRef {{ target {{ oid ... on Commit {{ file(path: \"{PIPELINE_PATH}\") {{ oid }} }} }} }}
+        stackEntry {{ position }}
+        baseRef {{
+          target {{ oid ... on Commit {{ file(path: \"{PIPELINE_PATH}\") {{ oid }} }} }}
+          associatedPullRequests(states: OPEN, first: 1) {{ nodes {{
+            number title url baseRefName
+            baseRef {{ target {{ oid ... on Commit {{ file(path: \"{PIPELINE_PATH}\") {{ oid }} }} }} }}
+          }} }}
+        }}
         commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{
           state
           contexts(first: {PAGE}) {{ nodes {{
@@ -783,8 +876,28 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
         author: Option<Author>,
         repository: Repo,
         labels: Nodes<Label>,
+        #[serde(default)]
+        stack_entry: Option<StackEntry>,
         base_ref: Option<BaseRef>,
         commits: Option<Nodes<CommitNode>>,
+    }
+    #[derive(Deserialize)]
+    struct StackEntry {
+        position: u32,
+    }
+    /// The open PR whose head is this PR's base.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Parent {
+        number: u64,
+        title: String,
+        url: String,
+        base_ref_name: String,
+        base_ref: Option<ParentBase>,
+    }
+    #[derive(Deserialize)]
+    struct ParentBase {
+        target: Option<Target>,
     }
     #[derive(Deserialize)]
     struct Author {
@@ -795,14 +908,22 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
         name: String,
     }
     #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct BaseRef {
         target: Option<Target>,
+        #[serde(default)]
+        associated_pull_requests: Option<Nodes<Parent>>,
     }
     #[derive(Deserialize)]
     struct Target {
         #[serde(default)]
         oid: String,
         file: Option<Value>,
+    }
+    impl Target {
+        fn has_pipeline(&self) -> bool {
+            self.file.as_ref().is_some_and(|file| !file.is_null())
+        }
     }
     #[derive(Deserialize)]
     struct CommitNode {
@@ -852,6 +973,29 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
                         .and_then(|node| node.commit.status_check_rollup.as_ref())
                         .map(Rollup::checks)
                         .unwrap_or_default();
+                    let stack = pr
+                        .base_ref
+                        .as_ref()
+                        .and_then(|base| base.associated_pull_requests.as_ref())
+                        .and_then(|parents| parents.nodes.first())
+                        .filter(|parent| parent.number != pr.number)
+                        .map(|parent| {
+                            let target = parent.base_ref.as_ref().and_then(|b| b.target.as_ref());
+                            StackLink {
+                                parent: ParentPr {
+                                    number: parent.number,
+                                    title: parent.title.clone(),
+                                    url: parent.url.clone(),
+                                    base: parent.base_ref_name.clone(),
+                                },
+                                position: pr.stack_entry.as_ref().map(|entry| entry.position),
+                                root: Branch {
+                                    name: parent.base_ref_name.clone(),
+                                    sha: target.map(|t| t.oid.clone()).unwrap_or_default(),
+                                    has_pipeline: target.is_some_and(Target::has_pipeline),
+                                },
+                            }
+                        });
                     OpenPr {
                         number: pr.number,
                         title: pr.title.clone(),
@@ -860,9 +1004,8 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
                         head_sha: pr.head_ref_oid.clone(),
                         base: pr.base_ref_name.clone(),
                         labeled: labels.iter().any(|label| label == WATCH_LABEL),
-                        base_has_pipeline: base
-                            .and_then(|target| target.file.as_ref())
-                            .is_some_and(|file| !file.is_null()),
+                        base_has_pipeline: base.is_some_and(Target::has_pipeline),
+                        stack,
                         detail: PrDetail {
                             body: pr.body.clone(),
                             author: pr
@@ -1135,6 +1278,99 @@ mod tests {
             [(7, true, true, false), (9, false, false, true)]
         );
         assert_eq!(summary(1), [(8, false, false, false)]);
+    }
+
+    #[test]
+    fn a_poll_reads_a_stacked_prs_parent_and_where_the_pipeline_comes_from() {
+        let repos = [RepoName::new("o", "a")];
+        let mut child = pr(
+            "o/a",
+            12,
+            &[],
+            json!({
+                "target": { "oid": "p-head", "file": null },
+                "associatedPullRequests": { "nodes": [{
+                    "number": 11, "title": "Parent", "url": "https://github.com/o/a/pull/11",
+                    "baseRefName": "main",
+                    "baseRef": { "target": { "oid": "main-sha", "file": { "oid": "f" } } },
+                }] },
+            }),
+        );
+        child["baseRefName"] = "feature".into();
+        child["stackEntry"] = json!({ "position": 2 });
+        let data = json!({
+            "rateLimit": null,
+            "r0": { "nameWithOwner": "o/a" },
+            "prs": { "issueCount": 2, "nodes": [
+                child,
+                pr("o/a", 7, &[], json!({ "target": { "oid": "main-sha", "file": null },
+                    "associatedPullRequests": { "nodes": [] } })),
+            ] },
+        });
+
+        let poll = read_poll(&repos, data).unwrap();
+
+        let prs = poll.repos[0].prs.as_ref().unwrap();
+        let child = &prs[0];
+        assert_eq!(
+            child.stack,
+            Some(StackLink {
+                parent: ParentPr {
+                    number: 11,
+                    title: "Parent".into(),
+                    url: "https://github.com/o/a/pull/11".into(),
+                    base: "main".into(),
+                },
+                position: Some(2),
+                root: Branch {
+                    name: "main".into(),
+                    sha: "main-sha".into(),
+                    has_pipeline: true,
+                },
+            })
+        );
+        assert!(!child.base_has_pipeline, "its own base has no Pipeline");
+        assert_eq!(child.root().name, "main");
+        assert_eq!(prs[1].stack, None);
+        assert_eq!(prs[1].root().name, "main");
+    }
+
+    #[test]
+    fn a_parent_merged_with_a_merge_commit_kept_its_commits_and_a_squash_did_not() {
+        let repo = RepoName::new("o", "a");
+        let fate = |merged: bool, state: &str, parents: Option<u64>| {
+            let merge_commit = parents.map(|n| json!({ "parents": { "totalCount": n } }));
+            read_pr_fate(
+                &repo,
+                3,
+                json!({ "repository": { "pullRequest": {
+                    "state": state, "merged": merged, "baseRefName": "main",
+                    "mergeCommit": merge_commit,
+                } } }),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            fate(true, "MERGED", Some(2)),
+            PrFate::Merged {
+                into: "main".into(),
+                kept_commits: true
+            }
+        );
+        assert_eq!(
+            fate(true, "MERGED", Some(1)),
+            PrFate::Merged {
+                into: "main".into(),
+                kept_commits: false
+            }
+        );
+        assert_eq!(fate(false, "CLOSED", None), PrFate::Closed);
+        assert_eq!(fate(false, "OPEN", None), PrFate::Open);
+        assert!(matches!(
+            read_pr_fate(&repo, 3, json!({ "repository": { "pullRequest": null } })),
+            Err(GitHubError::NotFound(_))
+        ));
     }
 
     #[test]

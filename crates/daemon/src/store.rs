@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use slopwatch_core::{EndReason, GateState, ReuseKey, Verdict};
-use slopwatch_protocol::step::{Effect, EffectKind, EffectResult, LinkedIssue, Outputs};
+use slopwatch_protocol::step::{
+    Effect, EffectKind, EffectResult, LinkedIssue, Outputs, UpdateMethod,
+};
 use slopwatch_protocol::{
     EntryId, InboxEntry, Notification, NotificationId, PluginSettings, RepoName, RunId, RunSummary,
     Waiver,
@@ -215,6 +217,46 @@ const MIGRATIONS: &[&str] = &[
         settings_json TEXT NOT NULL
     );
 ",
+    // Stacks (ADR 0011). `runs.pr_base` is the PR's own base when the Run
+    // started; `runs.base` is the root base its Pipeline came from, which
+    // differs for a PR in a Stack. NULL for Runs from before Stacks.
+    //
+    // `stack_links` keeps the parent each watched PR was last seen stacked
+    // on, so the daemon notices when that parent merges or closes.
+    // `orphaned` marks one that closed without merging.
+    //
+    // `stack_updates` is the intent journal for the daemon's retarget and
+    // branch update of a Stack child: a row before the first GitHub call,
+    // its `stage` moved on after each. An open row holds the PR's next Run
+    // until GitHub has pushed the update.
+    "
+    ALTER TABLE runs ADD COLUMN pr_base TEXT;
+    CREATE TABLE stack_links (
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        parent INTEGER NOT NULL,
+        branch TEXT NOT NULL,
+        parent_base TEXT NOT NULL,
+        native INTEGER NOT NULL,
+        orphaned INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (repo, number)
+    );
+    CREATE TABLE stack_updates (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        parent INTEGER NOT NULL,
+        from_base TEXT NOT NULL,
+        to_base TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        kept_commits INTEGER NOT NULL,
+        stage TEXT NOT NULL,
+        method TEXT,
+        reason TEXT,
+        open INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE INDEX stack_updates_open ON stack_updates (open, id);
+",
 ];
 
 mod drafts;
@@ -226,12 +268,102 @@ pub struct Store {
     db: Arc<Mutex<Connection>>,
 }
 
+/// The parent a watched PR was last seen stacked on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackLinkRow {
+    pub repo: RepoName,
+    pub number: u64,
+    pub parent: u64,
+    /// The parent's head branch, which is the PR's base.
+    pub branch: String,
+    /// The parent's own base, which the PR moves onto once the parent
+    /// merges.
+    pub parent_base: String,
+    /// The Stack is a GitHub native stack, which GitHub restacks itself.
+    pub native: bool,
+    /// The parent closed without merging, and the PR's entry says so.
+    pub orphaned: bool,
+}
+
+/// A Stack update as the daemon records it, before its first call.
+pub struct NewStackUpdate<'a> {
+    pub repo: &'a RepoName,
+    pub number: u64,
+    pub parent: u64,
+    pub from_base: &'a str,
+    pub to_base: &'a str,
+    pub head_sha: &'a str,
+    pub kept_commits: bool,
+}
+
+/// The daemon's retarget and branch update of a Stack child whose parent
+/// merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackUpdate {
+    pub id: i64,
+    pub repo: RepoName,
+    pub number: u64,
+    pub parent: u64,
+    pub from_base: String,
+    pub to_base: String,
+    /// The child's head when the parent merged. The update expects it, and
+    /// once the head has moved on, GitHub has pushed the update.
+    pub head_sha: String,
+    /// The parent merged with a merge commit, so the base already has the
+    /// child's copy of the parent's commits.
+    pub kept_commits: bool,
+    pub stage: StackStage,
+    pub method: Option<UpdateMethod>,
+    /// Why it failed.
+    pub reason: Option<String>,
+    /// It holds the PR's next Run.
+    pub open: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackStage {
+    /// Recorded, and the retarget may not have reached GitHub.
+    Retarget,
+    /// Retargeted, and the branch update may not have reached GitHub.
+    Update,
+    /// GitHub took the update and pushes it a moment later.
+    Pushing,
+    /// GitHub pushed the update, or the branch needed none.
+    Done,
+    Failed,
+}
+
+impl StackStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            StackStage::Retarget => "retarget",
+            StackStage::Update => "update",
+            StackStage::Pushing => "pushing",
+            StackStage::Done => "done",
+            StackStage::Failed => "failed",
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        match text {
+            "retarget" => StackStage::Retarget,
+            "update" => StackStage::Update,
+            "pushing" => StackStage::Pushing,
+            "done" => StackStage::Done,
+            _ => StackStage::Failed,
+        }
+    }
+}
+
 /// A Run as it starts.
 pub struct NewRun<'a> {
     pub repo: &'a RepoName,
     pub number: u64,
     pub head_sha: &'a str,
+    /// The root base the Pipeline came from (ADR 0007).
     pub base: &'a str,
+    /// The PR's own base, its parent's head branch for a PR in a Stack.
+    pub pr_base: &'a str,
     pub base_sha: &'a str,
     /// The Pipeline file's text, so the Run can load it again after a
     /// restart.
@@ -255,6 +387,9 @@ pub struct LatestRun {
     pub id: RunId,
     pub head_sha: String,
     pub base_sha: String,
+    /// The PR's own base when the Run started. `None` for Runs from before
+    /// Stacks.
+    pub pr_base: Option<String>,
     pub pipeline: String,
 }
 
@@ -332,6 +467,9 @@ pub struct ActiveRun {
     pub number: u64,
     pub head_sha: String,
     pub base: String,
+    /// The PR's own base when the Run started. `None` for Runs from before
+    /// Stacks.
+    pub pr_base: Option<String>,
     pub base_sha: String,
     pub pipeline: String,
     pub files: Vec<String>,
@@ -465,6 +603,7 @@ impl Store {
                     base: row.get(6)?,
                     labeled: row.get(7)?,
                     base_has_pipeline: row.get(8)?,
+                    stack: None,
                     detail: Default::default(),
                 },
             ))
@@ -506,8 +645,8 @@ impl Store {
         let tx = db.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO runs (repo, number, head_sha, base, base_sha, pipeline, started_at, files,
-                               linked_issues)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                               linked_issues, pr_base)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 run.repo.to_string(),
                 run.number as i64,
@@ -518,6 +657,7 @@ impl Store {
                 now,
                 serde_json::to_string(run.files).expect("paths always serialize"),
                 serde_json::to_string(run.linked_issues).expect("issues always serialize"),
+                run.pr_base,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -759,7 +899,7 @@ impl Store {
         let mut runs = db
             .prepare(&format!(
                 "SELECT id, repo, number, head_sha, base, base_sha, pipeline, gate, files,
-                        linked_issues
+                        linked_issues, pr_base
                  FROM runs WHERE {filter} ORDER BY id"
             ))?
             .query_map(args, |row| {
@@ -769,6 +909,7 @@ impl Store {
                     number: row.get::<_, i64>(2)? as u64,
                     head_sha: row.get(3)?,
                     base: row.get(4)?,
+                    pr_base: row.get(10)?,
                     base_sha: row.get(5)?,
                     pipeline: row.get(6)?,
                     gate: parse_gate(&row.get::<_, String>(7)?),
@@ -857,7 +998,7 @@ impl Store {
     ) -> Result<Option<LatestRun>, StoreError> {
         self.db()
             .query_row(
-                "SELECT id, head_sha, base_sha, pipeline FROM runs
+                "SELECT id, head_sha, base_sha, pipeline, pr_base FROM runs
                  WHERE repo = ?1 AND number = ?2 ORDER BY id DESC LIMIT 1",
                 params![repo.to_string(), number as i64],
                 |row| {
@@ -865,6 +1006,7 @@ impl Store {
                         id: RunId(row.get::<_, i64>(0)? as u64),
                         head_sha: row.get(1)?,
                         base_sha: row.get(2)?,
+                        pr_base: row.get(4)?,
                         pipeline: row.get(3)?,
                     })
                 },
@@ -1533,6 +1675,167 @@ impl Store {
         }
         Ok(streak)
     }
+
+    /// Every parent a watched PR was last seen stacked on.
+    pub fn stack_links(&self) -> Result<Vec<StackLinkRow>, StoreError> {
+        let db = self.db();
+        let mut query = db.prepare(
+            "SELECT repo, number, parent, branch, parent_base, native, orphaned
+             FROM stack_links ORDER BY repo, number",
+        )?;
+        let rows = query.query_map([], |row| {
+            Ok(StackLinkRow {
+                repo: parse_repo(&row.get::<_, String>(0)?),
+                number: row.get::<_, i64>(1)? as u64,
+                parent: row.get::<_, i64>(2)? as u64,
+                branch: row.get(3)?,
+                parent_base: row.get(4)?,
+                native: row.get(5)?,
+                orphaned: row.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn put_stack_link(&self, link: &StackLinkRow) -> Result<(), StoreError> {
+        self.db().execute(
+            "INSERT OR REPLACE INTO stack_links
+                 (repo, number, parent, branch, parent_base, native, orphaned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                link.repo.to_string(),
+                link.number as i64,
+                link.parent as i64,
+                link.branch,
+                link.parent_base,
+                link.native,
+                link.orphaned,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_stack_link(&self, repo: &RepoName, number: u64) -> Result<(), StoreError> {
+        remove_stack_link(&self.db(), repo, number)
+    }
+
+    /// Records the retarget and update of a Stack child, open and at its
+    /// first stage, and drops the link that led to it, both or neither.
+    pub fn insert_stack_update(&self, new: &NewStackUpdate) -> Result<StackUpdate, StoreError> {
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO stack_updates
+                 (repo, number, parent, from_base, to_base, head_sha, kept_commits, stage)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                new.repo.to_string(),
+                new.number as i64,
+                new.parent as i64,
+                new.from_base,
+                new.to_base,
+                new.head_sha,
+                new.kept_commits,
+                StackStage::Retarget.as_str(),
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        remove_stack_link(&tx, new.repo, new.number)?;
+        tx.commit()?;
+        Ok(StackUpdate {
+            id,
+            repo: new.repo.clone(),
+            number: new.number,
+            parent: new.parent,
+            from_base: new.from_base.to_owned(),
+            to_base: new.to_base.to_owned(),
+            head_sha: new.head_sha.to_owned(),
+            kept_commits: new.kept_commits,
+            stage: StackStage::Retarget,
+            method: None,
+            reason: None,
+            open: true,
+        })
+    }
+
+    /// Starts a Stack update's calls over from `stage` on the PR's new
+    /// head, as after the developer pushed to a PR whose update failed.
+    pub fn restart_stack_update(
+        &self,
+        id: i64,
+        head_sha: &str,
+        stage: StackStage,
+    ) -> Result<(), StoreError> {
+        self.db().execute(
+            "UPDATE stack_updates SET head_sha = ?2, stage = ?3, reason = NULL WHERE id = ?1",
+            params![id, head_sha, stage.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Moves a Stack update on to `stage`. A failure keeps the update open:
+    /// the PR waits for the developer until its head moves.
+    pub fn set_stack_stage(
+        &self,
+        id: i64,
+        stage: StackStage,
+        method: Option<UpdateMethod>,
+        reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.db().execute(
+            "UPDATE stack_updates
+             SET stage = ?2, method = COALESCE(?3, method), reason = ?4
+             WHERE id = ?1",
+            params![id, stage.as_str(), method.map(|m| json_str(&m)), reason],
+        )?;
+        Ok(())
+    }
+
+    /// Stops a Stack update from holding its PR, at `stage`.
+    pub fn close_stack_update(&self, id: i64, stage: StackStage) -> Result<(), StoreError> {
+        self.db().execute(
+            "UPDATE stack_updates SET stage = ?2, open = 0 WHERE id = ?1",
+            params![id, stage.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// The Stack updates that hold their PR, oldest first.
+    pub fn open_stack_updates(&self) -> Result<Vec<StackUpdate>, StoreError> {
+        let db = self.db();
+        let mut query = db.prepare(
+            "SELECT id, repo, number, parent, from_base, to_base, head_sha, kept_commits,
+                    stage, method, reason, open
+             FROM stack_updates WHERE open = 1 ORDER BY id",
+        )?;
+        let rows = query.query_map([], |row| {
+            Ok(StackUpdate {
+                id: row.get(0)?,
+                repo: parse_repo(&row.get::<_, String>(1)?),
+                number: row.get::<_, i64>(2)? as u64,
+                parent: row.get::<_, i64>(3)? as u64,
+                from_base: row.get(4)?,
+                to_base: row.get(5)?,
+                head_sha: row.get(6)?,
+                kept_commits: row.get(7)?,
+                stage: StackStage::parse(&row.get::<_, String>(8)?),
+                method: row
+                    .get::<_, Option<String>>(9)?
+                    .and_then(|method| serde_json::from_value(method.into()).ok()),
+                reason: row.get(10)?,
+                open: row.get(11)?,
+            })
+        })?;
+        rows.collect()
+    }
+}
+
+fn remove_stack_link(db: &Connection, repo: &RepoName, number: u64) -> Result<(), StoreError> {
+    db.execute(
+        "DELETE FROM stack_links WHERE repo = ?1 AND number = ?2",
+        params![repo.to_string(), number as i64],
+    )?;
+    Ok(())
 }
 
 fn asked_for(db: &Connection, run: RunId, kind: EffectKind) -> rusqlite::Result<bool> {
@@ -1712,7 +2015,7 @@ mod tests {
             base: "main".into(),
             labeled: true,
             base_has_pipeline: false,
-            detail: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -1760,6 +2063,7 @@ mod tests {
             number: 7,
             head_sha,
             base: "main",
+            pr_base: "main",
             base_sha: "base",
             pipeline: "version: 1",
             files: &[],
@@ -2211,5 +2515,70 @@ mod tests {
             .put_plugin_settings("lint", &PluginSettings::default())
             .unwrap();
         assert!(store.plugin_settings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stack_update_replaces_its_link_and_stays_open_across_a_restart_until_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let repo = RepoName::new("o", "r");
+        let store = Store::open(&path).unwrap();
+        let link = StackLinkRow {
+            repo: repo.clone(),
+            number: 2,
+            parent: 1,
+            branch: "pr-1".into(),
+            parent_base: "main".into(),
+            native: false,
+            orphaned: false,
+        };
+        store.put_stack_link(&link).unwrap();
+        assert_eq!(store.stack_links().unwrap(), [link]);
+
+        let update = store
+            .insert_stack_update(&NewStackUpdate {
+                repo: &repo,
+                number: 2,
+                parent: 1,
+                from_base: "pr-1",
+                to_base: "main",
+                head_sha: "abc",
+                kept_commits: false,
+            })
+            .unwrap();
+        assert_eq!((update.stage, update.open), (StackStage::Retarget, true));
+        assert!(store.stack_links().unwrap().is_empty());
+        store
+            .set_stack_stage(update.id, StackStage::Update, None, None)
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        let [open] = &store.open_stack_updates().unwrap()[..] else {
+            panic!("one open update");
+        };
+        assert_eq!(open.stage, StackStage::Update);
+        store
+            .set_stack_stage(
+                open.id,
+                StackStage::Pushing,
+                Some(UpdateMethod::Merge),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store.open_stack_updates().unwrap()[0].method,
+            Some(UpdateMethod::Merge)
+        );
+        store
+            .restart_stack_update(open.id, "def", StackStage::Update)
+            .unwrap();
+        let restarted = &store.open_stack_updates().unwrap()[0];
+        assert_eq!(
+            (restarted.head_sha.as_str(), restarted.stage),
+            ("def", StackStage::Update)
+        );
+        store.close_stack_update(open.id, StackStage::Done).unwrap();
+        assert!(store.open_stack_updates().unwrap().is_empty());
     }
 }

@@ -176,6 +176,13 @@ impl Engine {
             Effect::Rebase { .. } | Effect::Merge { .. } if run.gate != GateState::Pass => {
                 Some("the Gate hasn't passed".to_owned())
             }
+            Effect::Rebase { .. } | Effect::Merge { .. }
+                if let Some(parent) = run.snapshot.as_ref().and_then(|s| s.stacked_on) =>
+            {
+                Some(format!(
+                    "the PR is stacked on #{parent}, and a Stack lands from the bottom"
+                ))
+            }
             Effect::Merge { .. }
                 if run.snapshot.as_ref().is_some_and(|snapshot| snapshot.draft) =>
             {

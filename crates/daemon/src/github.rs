@@ -94,6 +94,15 @@ pub trait GitHub: Send + Sync {
         number: u64,
     ) -> Result<Vec<LinkedIssue>, GitHubError>;
 
+    /// Whether PR `number` is open, closed or merged, and how it merged.
+    /// The daemon asks after a Stack parent that left the poll.
+    async fn pr_fate(&self, repo: &RepoName, number: u64) -> Result<PrFate, GitHubError>;
+
+    /// Retargets the PR onto `base` through `updatePullRequest`, as the
+    /// daemon does to a Stack child once its parent merged (ADR 0011).
+    /// Retargeting onto the base it already has succeeds.
+    async fn set_base(&self, repo: &RepoName, number: u64, base: &str) -> Result<(), GitHubError>;
+
     /// Where git fetches `repo` from, with what authenticates it.
     async fn git_remote(&self, repo: &RepoName) -> Result<GitRemote, GitHubError>;
 }
@@ -105,6 +114,22 @@ pub enum Merged {
     Merged,
     /// The base's merge queue has it.
     Enqueued,
+}
+
+/// What became of a PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrFate {
+    Open,
+    /// Closed without merging.
+    Closed,
+    Merged {
+        /// The branch it merged into.
+        into: String,
+        /// The base now has the PR's own commits, as after a merge commit.
+        /// A squash or a rebase merge puts copies there instead, while a
+        /// child's branch still holds the originals.
+        kept_commits: bool,
+    },
 }
 
 /// A git remote and the environment a git process needs to reach it.
@@ -152,9 +177,64 @@ pub struct OpenPr {
     pub labeled: bool,
     /// The base branch's head has a Pipeline file.
     pub base_has_pipeline: bool,
+    /// Where the PR sits in a Stack, when its base is another open PR's
+    /// head branch.
+    pub stack: Option<StackLink>,
     /// What a poll reads besides, for Step snapshots. The store doesn't
     /// keep these, so they're empty until the first poll after a start.
     pub detail: PrDetail,
+}
+
+impl OpenPr {
+    /// The branch a Run reads the Pipeline from (ADR 0007): the base, or
+    /// for a PR in a Stack, the base of the Stack's bottom PR.
+    pub fn root(&self) -> Branch {
+        match &self.stack {
+            Some(stack) => stack.root.clone(),
+            None => Branch {
+                name: self.base.clone(),
+                sha: self.detail.base_sha.clone(),
+                has_pipeline: self.base_has_pipeline,
+            },
+        }
+    }
+
+    /// The open PR this one is stacked on.
+    pub fn parent(&self) -> Option<u64> {
+        self.stack.as_ref().map(|stack| stack.parent.number)
+    }
+}
+
+/// A PR's place in a Stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackLink {
+    /// The open PR whose head branch is this PR's base. It may be anyone's.
+    pub parent: ParentPr,
+    /// The PR's position in a GitHub native stack, 1 being the bottom.
+    /// `None` for a Stack chained by hand or by another tool.
+    pub position: Option<u32>,
+    /// The Stack's root base. A poll reads the parent's base, and
+    /// [`Watching`](crate::Watching) follows the parents down through the
+    /// developer's own PRs to the bottom.
+    pub root: Branch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentPr {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    /// The parent's own base branch.
+    pub base: String,
+}
+
+/// A branch's tip, as a Run's Pipeline source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Branch {
+    pub name: String,
+    /// Empty until a poll has read it.
+    pub sha: String,
+    pub has_pipeline: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

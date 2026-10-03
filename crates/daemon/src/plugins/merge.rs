@@ -169,6 +169,17 @@ impl Merge {
 
     /// What a PR nothing was asked for yet calls for.
     fn decide(&mut self, snapshot: &PrSnapshot) -> Next {
+        // A Stack lands from the bottom, and the daemon moves this PR onto
+        // its parent's base once the parent merges (ADR 0011).
+        if let Some(parent) = snapshot.stacked_on {
+            return Next::Report(Outcome {
+                verdict: Verdict::Inconclusive,
+                outputs: Outputs {
+                    findings: vec![finding(Severity::Info, format!("Stacked on #{parent}"))],
+                    ..Outputs::default()
+                },
+            });
+        }
         if snapshot.draft {
             return Next::Report(Outcome {
                 verdict: Verdict::Inconclusive,
@@ -391,6 +402,7 @@ mod tests {
             merge,
             diff: None,
             linked_issues: vec![],
+            stacked_on: None,
         }
     }
 
@@ -445,6 +457,23 @@ mod tests {
 
         assert_eq!(verdict, Verdict::Inconclusive);
         assert!(message.contains("draft"), "{message}");
+    }
+
+    #[test]
+    fn a_stacked_pr_waits_for_its_parent_without_merging() {
+        let mut stacked = snapshot(Some(clean()));
+        stacked.stacked_on = Some(4);
+
+        let mut merge = Merge::default();
+        let (verdict, message) = finding_of(merge.judge(&stacked));
+
+        assert_eq!(verdict, Verdict::Inconclusive);
+        assert_eq!(message, "Stacked on #4");
+        stacked.merge = None;
+        assert!(
+            matches!(Merge::default().judge(&stacked), Next::Report(_)),
+            "it doesn't wait for a merge state it won't use"
+        );
     }
 
     #[test]

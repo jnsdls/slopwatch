@@ -3,17 +3,17 @@
 //! watched, so watching from the app and labelling on github.com are the
 //! same change, and the next poll picks up either.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use slopwatch_protocol::{
-    PollState, PrStatus, PullRequest, RepoName, RunSummary, StorageWarning, WatchedPrs,
-    WatchedPrsDelta,
+    PollState, PrStatus, PullRequest, RepoName, RunSummary, StackParent, StackPlace,
+    StorageWarning, WatchedPrs, WatchedPrsDelta,
 };
 use tokio::sync::broadcast;
 
-use crate::github::{GitHub, GitHubError, OpenPr, Poll, RepoPoll, WATCH_LABEL};
+use crate::github::{Branch, GitHub, GitHubError, OpenPr, Poll, RepoPoll, WATCH_LABEL};
 use crate::pace::Pace;
 use crate::store::{Store, StoreError};
 
@@ -280,6 +280,38 @@ impl Watching {
     }
 }
 
+/// Gives each stacked PR its Stack's root base. A poll reads only the
+/// parent's base, so a PR whose parent is another of the developer's PRs
+/// takes that PR's root, parent by parent down to the bottom. A parent
+/// that isn't the developer's ends the walk at its base, since the poll
+/// doesn't read further below it.
+fn resolve_roots(prs: &mut [OpenPr]) {
+    let polled: HashMap<u64, (Option<u64>, Branch)> = prs
+        .iter()
+        .map(|pr| (pr.number, (pr.parent(), pr.root())))
+        .collect();
+    for pr in prs.iter_mut() {
+        let number = pr.number;
+        let Some(stack) = &mut pr.stack else {
+            continue;
+        };
+        let mut seen = HashSet::from([number]);
+        let mut at = stack.parent.number;
+        // A cycle of bases can't happen on GitHub, but a poll that caught
+        // a retarget halfway could show one.
+        while seen.insert(at) {
+            let Some((below, root)) = polled.get(&at) else {
+                break;
+            };
+            stack.root = root.clone();
+            match below {
+                Some(below) => at = *below,
+                None => break,
+            }
+        }
+    }
+}
+
 impl State {
     fn snapshot(&self) -> WatchedPrs {
         WatchedPrs {
@@ -339,18 +371,30 @@ impl State {
             draft: pr.draft,
             head_sha: pr.head_sha.clone(),
             base: pr.base.clone(),
-            status: match (pr.labeled, pr.base_has_pipeline) {
+            status: match (pr.labeled, pr.root().has_pipeline) {
                 (false, _) => PrStatus::NotWatched,
                 (true, false) => PrStatus::Waiting,
                 (true, true) => PrStatus::Ready,
             },
             runs: info.runs,
             blocked: info.blocked,
+            stack: pr.stack.as_ref().map(|stack| {
+                Box::new(StackPlace {
+                    parent: StackParent {
+                        number: stack.parent.number,
+                        title: stack.parent.title.clone(),
+                        url: stack.parent.url.clone(),
+                    },
+                    position: stack.position,
+                    root_base: stack.root.name.clone(),
+                })
+            }),
         }
     }
 
     /// Makes `repo`'s PRs exactly `prs`.
-    fn reconcile(&mut self, repo: &RepoName, prs: Vec<OpenPr>) -> Result<(), StoreError> {
+    fn reconcile(&mut self, repo: &RepoName, mut prs: Vec<OpenPr>) -> Result<(), StoreError> {
+        resolve_roots(&mut prs);
         let gone: Vec<u64> = self
             .prs
             .keys()
@@ -369,5 +413,84 @@ impl State {
             self.put(repo, pr)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::{ParentPr, PrDetail, StackLink};
+
+    /// PR `number` from `pr-<number>` onto `base`, stacked on `parent` when
+    /// given, with the root a poll reads: the parent's base.
+    fn pr(number: u64, base: &str, parent: Option<(u64, &str)>) -> OpenPr {
+        OpenPr {
+            number,
+            base: base.into(),
+            base_has_pipeline: true,
+            stack: parent.map(|(parent, parent_base)| StackLink {
+                parent: ParentPr {
+                    number: parent,
+                    title: String::new(),
+                    url: String::new(),
+                    base: parent_base.into(),
+                },
+                position: None,
+                root: Branch {
+                    name: parent_base.into(),
+                    sha: format!("{parent_base}-sha"),
+                    has_pipeline: true,
+                },
+            }),
+            detail: PrDetail {
+                base_sha: format!("{base}-sha"),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_stack_reads_its_pipeline_from_the_bottom_prs_base() {
+        let mut prs = vec![
+            pr(1, "main", None),
+            pr(2, "pr-1", Some((1, "main"))),
+            pr(3, "pr-2", Some((2, "pr-1"))),
+            pr(4, "pr-3", Some((3, "pr-2"))),
+        ];
+
+        resolve_roots(&mut prs);
+
+        let roots: Vec<String> = prs.iter().map(|pr| pr.root().name).collect();
+        assert_eq!(roots, ["main", "main", "main", "main"]);
+        assert_eq!(prs[3].root().sha, "main-sha");
+    }
+
+    #[test]
+    fn a_parent_that_isnt_mine_ends_the_walk_at_its_base() {
+        // #2 is someone else's and stacked on #1, so the poll shows only
+        // that #3's parent has `pr-1` as its base.
+        let mut prs = vec![
+            pr(1, "main", None),
+            pr(3, "pr-2", Some((2, "pr-1"))),
+            pr(4, "pr-3", Some((3, "pr-2"))),
+        ];
+
+        resolve_roots(&mut prs);
+
+        assert_eq!(prs[1].root().name, "pr-1");
+        assert_eq!(prs[2].root().name, "pr-1");
+    }
+
+    #[test]
+    fn a_cycle_of_bases_ends_the_walk() {
+        let mut prs = vec![
+            pr(1, "pr-2", Some((2, "pr-1"))),
+            pr(2, "pr-1", Some((1, "pr-2"))),
+        ];
+
+        resolve_roots(&mut prs);
+
+        assert_eq!(prs[0].parent(), Some(2));
     }
 }

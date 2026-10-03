@@ -60,26 +60,9 @@ impl Clones {
         remote: &GitRemote,
         branch: &str,
     ) -> Result<PipelineAt, GitError> {
-        if branch.starts_with('-') || branch.contains("..") || branch.contains(':') {
-            return Err(GitError(format!("`{branch}` isn't a branch name")));
-        }
         let _turn = self.turn(repo).await;
         let path = self.cloned(repo, remote).await?;
-        let local = format!("refs/slopwatch/base/{branch}");
-        git(
-            &path,
-            remote,
-            &[
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--filter=blob:none",
-                &remote.url,
-                &format!("+refs/heads/{branch}:{local}"),
-            ],
-        )
-        .await?;
-        let sha = git(&path, remote, &["rev-parse", "--verify", &local]).await?;
+        let sha = fetch_branch(&path, remote, branch).await?;
         let listed = git(
             &path,
             remote,
@@ -238,6 +221,19 @@ impl Clones {
         Ok(String::from_utf8_lossy(&output).into_owned())
     }
 
+    /// Fetches `branch` and returns the commit at its tip, so a stacked
+    /// PR's files can be listed against its parent's head.
+    pub async fn branch_tip(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        branch: &str,
+    ) -> Result<String, GitError> {
+        let _turn = self.turn(repo).await;
+        let path = self.cloned(repo, remote).await?;
+        fetch_branch(&path, remote, branch).await
+    }
+
     /// Waits for the repo's turn: one git operation per repo at a time.
     async fn turn(&self, repo: &RepoName) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = self
@@ -283,6 +279,28 @@ impl Clones {
         .await
         .map(drop)
     }
+}
+
+/// Fetches `branch` into the clone at `path` and returns its tip.
+async fn fetch_branch(path: &Path, remote: &GitRemote, branch: &str) -> Result<String, GitError> {
+    if branch.starts_with('-') || branch.contains("..") || branch.contains(':') {
+        return Err(GitError(format!("`{branch}` isn't a branch name")));
+    }
+    let local = format!("refs/slopwatch/base/{branch}");
+    git(
+        path,
+        remote,
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--filter=blob:none",
+            &remote.url,
+            &format!("+refs/heads/{branch}:{local}"),
+        ],
+    )
+    .await?;
+    git(path, remote, &["rev-parse", "--verify", &local]).await
 }
 
 /// Runs git in `dir` and returns its stdout, trimmed of the final newline
