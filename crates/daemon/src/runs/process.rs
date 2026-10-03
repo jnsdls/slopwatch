@@ -214,7 +214,12 @@ impl<R: Fn(Report)> Session<R> {
     async fn line(&mut self, line: &str) {
         match serde_json::from_str::<FromStep>(line) {
             Ok(FromStep::Log { message }) => {
-                let _ = self.log.write_all(format!("{message}\n").as_bytes()).await;
+                // tokio's File hands writes to a blocking thread, and only
+                // a flush waits for them to land.
+                let line = format!("{message}\n");
+                if self.log.write_all(line.as_bytes()).await.is_ok() {
+                    let _ = self.log.flush().await;
+                }
             }
             Ok(message) => (self.report)(Report::Message(message)),
             Err(error) => (self.report)(Report::ProtocolError(format!(
