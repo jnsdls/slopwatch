@@ -136,6 +136,7 @@ impl FakeGitHub {
                 Some("main"),
                 &[(&file, Some("A change.\n"))],
             );
+            pull_ref(&git, number, &head_sha);
             state.repo(repo).prs.insert(
                 number,
                 Pr {
@@ -171,6 +172,7 @@ impl FakeGitHub {
         self.with(|state| {
             let git = state.repo(repo).git.clone();
             let sha = state.commit(&git, &head_branch(number), None, &[(path, Some(text))]);
+            pull_ref(&git, number, &sha);
             let pr = state.pr(repo, number);
             pr.head_sha = sha.clone();
             pr.checks = Checks::default();
@@ -196,6 +198,18 @@ impl FakeGitHub {
                 state.pr(repo, number).labels.insert(WATCH_LABEL.to_owned());
             } else {
                 state.pr(repo, number).labels.remove(WATCH_LABEL);
+            }
+        });
+    }
+
+    /// Adds or removes any other label on the PR.
+    pub fn set_label(&self, repo: &RepoName, number: u64, label: &str, on: bool) {
+        self.with(|state| {
+            let labels = &mut state.pr(repo, number).labels;
+            if on {
+                labels.insert(label.to_owned());
+            } else {
+                labels.remove(label);
             }
         });
     }
@@ -245,6 +259,14 @@ impl FakeGitHub {
 
 fn head_branch(number: u64) -> String {
     format!("pr-{number}")
+}
+
+/// Points `refs/pull/<n>/head` at the PR's head, as GitHub does.
+fn pull_ref(git: &Path, number: u64, sha: &str) {
+    run_git(
+        git,
+        &["update-ref", &format!("refs/pull/{number}/head"), sha],
+    );
 }
 
 impl State {

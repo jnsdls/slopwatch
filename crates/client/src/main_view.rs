@@ -480,14 +480,32 @@ impl MainView {
         let short = |sha: &str| sha.chars().take(7).collect::<String>();
         pane = pane.child(
             div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(format!(
-                    "Head {} · Pipeline from {} at {}",
-                    short(&view.head_sha),
-                    view.base,
-                    short(&view.base_sha)
-                )),
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!(
+                            "Head {} · Pipeline from {} at {}",
+                            short(&view.head_sha),
+                            view.base,
+                            short(&view.base_sha)
+                        )),
+                )
+                .when_some(self.run_pane.cancel(), |this, cancel| {
+                    this.child(
+                        Button::new("cancel-run")
+                            .label("Cancel Run")
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+                                this.send(cancel.clone());
+                            })),
+                    )
+                }),
         );
         let mut steps = div()
             .flex()
@@ -524,9 +542,27 @@ impl MainView {
                 )
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(color(step_tone(step)))
-                        .child(step_line(step)),
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(color(step_tone(step)))
+                                .child(step_line(step)),
+                        )
+                        .when_some(self.run_pane.retry(&step.info.id), |this, retry| {
+                            this.child(
+                                Button::new(SharedString::from(format!("retry-{}", step.info.id)))
+                                    .label("Retry")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+                                        this.send(retry.clone());
+                                    })),
+                            )
+                        }),
                 );
             if let slopwatch_protocol::StepStatus::Settled { outputs, .. } = &step.status {
                 for finding in &outputs.findings {

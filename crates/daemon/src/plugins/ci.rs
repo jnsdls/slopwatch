@@ -28,6 +28,8 @@ pub fn manifest() -> Manifest {
         // Step contract: CI gets 90 minutes and no stall watchdog.
         timeout: Some("90m".into()),
         stall_after: None,
+        // Waiting on GitHub costs nothing, so only the global cap applies.
+        concurrency: None,
     }
 }
 

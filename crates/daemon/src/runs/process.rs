@@ -5,6 +5,11 @@
 //! takes [`Control`]s from the engine. Cancel sends `cancel`, then SIGTERM
 //! to the group 10 s later and SIGKILL 5 s after that. Stderr and the
 //! Step's `log` messages go to the Step log file.
+//!
+//! The task also enforces the Step's [`Limits`]: a Step that runs past its
+//! `timeout`, or writes nothing on stdout for `stall_after`, loses its
+//! whole group to SIGKILL on the spot. Tokio's clock is `mach_absolute_time` on macOS,
+//! which stops while the Mac sleeps, so both count awake time only.
 
 use std::io;
 use std::path::PathBuf;
@@ -36,6 +41,22 @@ pub struct Spawn {
     pub env: Vec<(String, String)>,
     pub log: PathBuf,
     pub start: ToStep,
+    pub limits: Limits,
+}
+
+/// How long a Step may run, and how long it may go quiet. `None` is no
+/// limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Limits {
+    pub timeout: Option<Duration>,
+    pub stall_after: Option<Duration>,
+}
+
+/// Which limit a Step tripped, and what it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tripped {
+    Timeout(Duration),
+    Stall(Duration),
 }
 
 /// What a running Step process reports.
@@ -44,6 +65,9 @@ pub enum Report {
     Message(FromStep),
     /// A stdout line that isn't a protocol message.
     ProtocolError(String),
+    /// The Step tripped a limit, and its group was killed. Its exit
+    /// follows.
+    Tripped(Tripped),
     /// The process exited. `None` when a signal ended it.
     Exited(Option<i32>),
 }
@@ -125,7 +149,7 @@ pub fn spawn(spawn: Spawn, report: impl Fn(Report) + Send + 'static) -> io::Resu
         report,
     };
     let _ = session.to_step.send(spawn.start);
-    tokio::spawn(session.run(stdout, controls));
+    tokio::spawn(session.run(stdout, controls, spawn.limits));
     Ok(StepHandle {
         control,
         exited,
@@ -163,17 +187,44 @@ struct Session<R> {
 }
 
 impl<R: Fn(Report)> Session<R> {
-    async fn run(mut self, stdout: ChildStdout, mut controls: mpsc::UnboundedReceiver<Control>) {
+    async fn run(
+        mut self,
+        stdout: ChildStdout,
+        mut controls: mpsc::UnboundedReceiver<Control>,
+        limits: Limits,
+    ) {
         let mut lines = BufReader::new(stdout).lines();
         let mut stdout_open = true;
         let mut controls_open = true;
         // The next signal to send to the group, and when.
         let mut kill: Option<(libc::c_int, Pin<Box<Sleep>>)> = None;
+        // Both limits stop counting once one of them trips.
+        let mut timeout = limits
+            .timeout
+            .map(|after| Box::pin(tokio::time::sleep(after)));
+        let mut stall = limits
+            .stall_after
+            .map(|after| Box::pin(tokio::time::sleep(after)));
         loop {
             tokio::select! {
                 line = lines.next_line(), if stdout_open => match line {
-                    Ok(Some(line)) => self.line(&line).await,
+                    Ok(Some(line)) => {
+                        if let (Some(stall), Some(after)) = (stall.as_mut(), limits.stall_after) {
+                            stall.as_mut().reset(tokio::time::Instant::now() + after);
+                        }
+                        self.line(&line).await;
+                    }
                     Ok(None) | Err(_) => stdout_open = false,
+                },
+                () = async { timeout.as_mut().expect("guarded").as_mut().await }, if timeout.is_some() => {
+                    let after = limits.timeout.expect("armed only with a timeout");
+                    self.trip(Tripped::Timeout(after));
+                    (timeout, stall) = (None, None);
+                },
+                () = async { stall.as_mut().expect("guarded").as_mut().await }, if stall.is_some() => {
+                    let after = limits.stall_after.expect("armed only with a stall_after");
+                    self.trip(Tripped::Stall(after));
+                    (timeout, stall) = (None, None);
                 },
                 control = controls.recv(), if controls_open => match control {
                     Some(Control::Send(message)) => {
@@ -212,6 +263,13 @@ impl<R: Fn(Report)> Session<R> {
                 }
             }
         }
+    }
+
+    /// Reports the limit and kills the group. A Step past its limit has
+    /// had its chance, so it gets no `cancel` and no grace.
+    fn trip(&self, tripped: Tripped) {
+        (self.report)(Report::Tripped(tripped));
+        signal_group(self.pgid, libc::SIGKILL);
     }
 
     /// One stdout line: a log message goes to the Step log, and anything
@@ -376,6 +434,7 @@ mod tests {
             env: vec![("PATH".into(), "/usr/bin:/bin".into())],
             log: dir.path().join("logs/step.log"),
             start: ToStep::Cancel,
+            limits: Limits::default(),
         }
     }
 
@@ -574,6 +633,43 @@ mod tests {
         handle.cancel();
 
         // The paused clock jumps to the SIGTERM deadline once idle.
+        assert!(matches!(reports.recv().await, Some(Report::Exited(None))));
+    }
+
+    #[tokio::test]
+    async fn a_step_past_its_timeout_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spawn = sh("sleep 600", &dir);
+        spawn.limits.timeout = Some(Duration::from_millis(300));
+        let (_handle, mut reports) = reports(spawn).await;
+
+        assert!(matches!(
+            reports.recv().await,
+            Some(Report::Tripped(Tripped::Timeout(after))) if after == Duration::from_millis(300)
+        ));
+        assert!(matches!(reports.recv().await, Some(Report::Exited(None))));
+    }
+
+    #[tokio::test]
+    async fn a_step_that_goes_quiet_stalls_but_heartbeats_keep_it_going() {
+        let dir = tempfile::tempdir().unwrap();
+        // Five heartbeats 100 ms apart outlast a 300 ms stall_after, then
+        // the Step goes quiet.
+        let script =
+            r#"for i in 1 2 3 4 5; do echo '{"type":"progress"}'; sleep 0.1; done; sleep 600"#;
+        let mut spawn = sh(script, &dir);
+        spawn.limits.stall_after = Some(Duration::from_millis(300));
+        let (_handle, mut reports) = reports(spawn).await;
+
+        let mut heartbeats = 0;
+        loop {
+            match reports.recv().await {
+                Some(Report::Message(FromStep::Progress { .. })) => heartbeats += 1,
+                Some(Report::Tripped(Tripped::Stall(_))) => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(heartbeats, 5, "it stalled only once it went quiet");
         assert!(matches!(reports.recv().await, Some(Report::Exited(None))));
     }
 }

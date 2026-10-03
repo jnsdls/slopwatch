@@ -99,6 +99,11 @@ async fn a_blobless_clone_reads_the_pipeline_from_a_real_base_branch() {
 
     assert_eq!(read.sha, pr.detail.base_sha);
     assert!(read.text.is_some());
+    let files = clones
+        .changed_files(&repo, &remote, pr.number, &read.sha, &pr.head_sha)
+        .await
+        .unwrap();
+    assert!(!files.is_empty(), "the PR's head changes something");
     let config = std::fs::read_to_string(clones.path(&repo).join("config")).unwrap();
     assert!(
         !config.contains("AUTHORIZATION"),

@@ -46,6 +46,10 @@ pub struct Manifest {
     pub timeout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_after: Option<String>,
+    /// At most this many of the Plugin's Steps run at once, across every
+    /// Run. `None` leaves only the daemon's global cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<u32>,
 }
 
 /// A message from the daemon to a Step.

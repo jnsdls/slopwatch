@@ -62,6 +62,31 @@ impl RunPane {
         }
     }
 
+    /// What cancels the Run shown, while it's still going.
+    pub fn cancel(&self) -> Option<Command> {
+        let view = self.view()?;
+        let run = self.shown?;
+        view.end.is_none().then_some(Command::CancelRun { run })
+    }
+
+    /// What retries `step` in the Run shown: only an errored Step, while
+    /// the Run is still going.
+    pub fn retry(&self, step: &str) -> Option<Command> {
+        let view = self.view()?;
+        let run = self.shown?;
+        let errored = matches!(
+            view.step(step)?.status,
+            StepStatus::Settled {
+                verdict: Verdict::Error,
+                ..
+            }
+        );
+        (view.end.is_none() && errored).then(|| Command::RetryStep {
+            run,
+            step: step.to_owned(),
+        })
+    }
+
     /// A new connection has no subscriptions, so it asks again for the Run
     /// shown, from the last event the pane has.
     pub fn reconnected(&self) -> Vec<Command> {
@@ -320,6 +345,54 @@ mod tests {
         pane.apply(started(5));
 
         assert_eq!(pane.reconnected(), [subscribe(5, Some(1))]);
+    }
+
+    fn settled(verdict: Verdict) -> TopicUpdate {
+        TopicUpdate::Run {
+            id: RunId(5),
+            seq: 2,
+            event: RunEvent::StepSettled {
+                step: "ci".into(),
+                verdict,
+                reason: None,
+                outputs: Outputs::default(),
+                reused_from: None,
+            },
+        }
+    }
+
+    #[test]
+    fn a_going_run_offers_cancel_and_a_retry_for_an_errored_step() {
+        let mut pane = RunPane::default();
+        pane.select_pr(&pr(vec![summary(5, None)]));
+        assert_eq!(
+            pane.cancel(),
+            None,
+            "nothing to cancel before the Run shows"
+        );
+        pane.apply(started(5));
+
+        assert_eq!(pane.cancel(), Some(Command::CancelRun { run: RunId(5) }));
+        assert_eq!(pane.retry("ci"), None, "ci hasn't errored");
+
+        pane.apply(settled(Verdict::Error));
+        assert_eq!(
+            pane.retry("ci"),
+            Some(Command::RetryStep {
+                run: RunId(5),
+                step: "ci".into(),
+            })
+        );
+
+        pane.apply(TopicUpdate::Run {
+            id: RunId(5),
+            seq: 3,
+            event: RunEvent::Ended {
+                reason: EndReason::NotShippable,
+            },
+        });
+        assert_eq!(pane.cancel(), None);
+        assert_eq!(pane.retry("ci"), None, "an ended Run can't retry");
     }
 
     #[test]

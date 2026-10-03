@@ -58,6 +58,13 @@ pub enum RunEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reused_from: Option<RunId>,
     },
+    /// The developer retried `step`, an errored Step. It and `dependents`,
+    /// every Step after it, go back to pending and run again in this Run.
+    StepRetried {
+        step: String,
+        #[serde(default)]
+        dependents: Vec<String>,
+    },
     Gate {
         state: GateState,
     },
@@ -164,6 +171,13 @@ impl RunView {
                     };
                 }
             }
+            RunEvent::StepRetried { step, dependents } => {
+                for id in std::iter::once(step).chain(dependents) {
+                    if let Some(view) = self.step_mut(&id) {
+                        view.status = StepStatus::Pending;
+                    }
+                }
+            }
             RunEvent::Gate { state } => self.gate = Some(state),
             RunEvent::Ended { reason } => self.end = Some(reason),
         }
@@ -251,6 +265,40 @@ mod tests {
         assert_eq!(view.gate, Some(GateState::Pass));
         assert_eq!(view.end, Some(EndReason::Shippable));
         assert_eq!(view.seq, 5);
+    }
+
+    #[test]
+    fn a_retry_puts_the_step_and_its_dependents_back_to_pending() {
+        let mut view = RunView::default();
+        view.apply(1, started());
+        view.apply(
+            2,
+            RunEvent::StepSettled {
+                step: "ci".into(),
+                verdict: Verdict::Error,
+                reason: Some("error(crash): exited with status 1 before reporting".into()),
+                outputs: Outputs::default(),
+                reused_from: None,
+            },
+        );
+
+        view.apply(
+            3,
+            RunEvent::StepRetried {
+                step: "ci".into(),
+                dependents: vec![],
+            },
+        );
+
+        assert_eq!(view.step("ci").unwrap().status, StepStatus::Pending);
+        assert_eq!(
+            serde_json::to_value(RunEvent::StepRetried {
+                step: "ci".into(),
+                dependents: vec!["review".into()],
+            })
+            .unwrap(),
+            json!({ "kind": "step_retried", "step": "ci", "dependents": ["review"] })
+        );
     }
 
     #[test]

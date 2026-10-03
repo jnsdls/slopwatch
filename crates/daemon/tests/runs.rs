@@ -77,6 +77,7 @@ fn daemon_running(
         RunsConfig {
             data_dir: data.path().to_owned(),
             plugins: Plugins::new(plugin_exe, Arc::clone(&library)),
+            login_path: None,
         },
     )
     .unwrap();
@@ -719,7 +720,7 @@ fn a_restart_resumes_the_run_with_its_settled_outcomes_and_kills_what_was_left()
     restarts.life(async |_, client| {
         until(|| !alive(child)).await;
         let run_dir = restarts.data.path().join("worktrees").join(run.to_string());
-        assert!(!run_dir.join("slow").exists(), "its directory went too");
+        assert!(!run_dir.join("slow.1").exists(), "its directory went too");
 
         client.subscribe(run, None).await;
         client.refresh().await;

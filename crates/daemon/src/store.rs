@@ -90,6 +90,11 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE run_steps ADD COLUMN plugin_version TEXT NOT NULL DEFAULT '';
     ALTER TABLE run_steps ADD COLUMN reused_from INTEGER REFERENCES runs(id);
 ",
+    // The paths the Run's head changes, as a JSON array, for `files:`
+    // Conditions.
+    "
+    ALTER TABLE runs ADD COLUMN files TEXT NOT NULL DEFAULT '[]';
+",
 ];
 
 #[derive(Clone)]
@@ -107,6 +112,8 @@ pub struct NewRun<'a> {
     /// The Pipeline file's text, so the Run can load it again after a
     /// restart.
     pub pipeline: &'a str,
+    /// The paths the head changes since it branched from the base.
+    pub files: &'a [String],
     pub steps: Vec<NewStep>,
 }
 
@@ -145,6 +152,7 @@ pub struct ActiveRun {
     pub base: String,
     pub base_sha: String,
     pub pipeline: String,
+    pub files: Vec<String>,
     pub gate: GateState,
     pub steps: Vec<StepRow>,
 }
@@ -314,8 +322,8 @@ impl Store {
         let db = self.db();
         let tx = db.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO runs (repo, number, head_sha, base, base_sha, pipeline, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO runs (repo, number, head_sha, base, base_sha, pipeline, started_at, files)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 run.repo.to_string(),
                 run.number as i64,
@@ -324,6 +332,7 @@ impl Store {
                 run.base_sha,
                 run.pipeline,
                 now,
+                serde_json::to_string(run.files).expect("paths always serialize"),
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -538,7 +547,7 @@ impl Store {
         let db = self.db();
         let mut runs = db
             .prepare(
-                "SELECT id, repo, number, head_sha, base, base_sha, pipeline, gate
+                "SELECT id, repo, number, head_sha, base, base_sha, pipeline, gate, files
                  FROM runs WHERE end_reason IS NULL ORDER BY id",
             )?
             .query_map([], |row| {
@@ -551,6 +560,7 @@ impl Store {
                     base_sha: row.get(5)?,
                     pipeline: row.get(6)?,
                     gate: parse_gate(&row.get::<_, String>(7)?),
+                    files: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
                     steps: Vec::new(),
                 })
             })?
@@ -837,6 +847,7 @@ mod tests {
             base: "main",
             base_sha: "base",
             pipeline: "version: 1",
+            files: &[],
             steps: vec![NewStep {
                 id: "ci".into(),
                 plugin: "ci".into(),

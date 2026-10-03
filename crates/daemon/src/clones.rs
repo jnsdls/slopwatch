@@ -63,19 +63,8 @@ impl Clones {
         if branch.starts_with('-') || branch.contains("..") || branch.contains(':') {
             return Err(GitError(format!("`{branch}` isn't a branch name")));
         }
-        let lock = self
-            .locks
-            .lock()
-            .expect("no panics while holding the clone locks")
-            .entry(repo.clone())
-            .or_default()
-            .clone();
-        let _turn = lock.lock().await;
-
-        let path = self.path(repo);
-        if !path.join("HEAD").exists() {
-            self.clone_bare(&path, remote).await?;
-        }
+        let _turn = self.turn(repo).await;
+        let path = self.cloned(repo, remote).await?;
         let local = format!("refs/slopwatch/base/{branch}");
         git(
             &path,
@@ -111,6 +100,79 @@ impl Clones {
             )
         };
         Ok(PipelineAt { sha, text })
+    }
+
+    /// The paths PR `number` changes at `head_sha`, against where it
+    /// branched from `base_sha`, the way GitHub lists a PR's files. A
+    /// rename lists both paths. Fetches the PR's head first; listing names
+    /// needs only trees, so no blob comes down.
+    pub async fn changed_files(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        number: u64,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<Vec<String>, GitError> {
+        for sha in [base_sha, head_sha] {
+            if sha.is_empty() || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(GitError(format!("`{sha}` isn't a commit SHA")));
+            }
+        }
+        let _turn = self.turn(repo).await;
+        let path = self.cloned(repo, remote).await?;
+        git(
+            &path,
+            remote,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--filter=blob:none",
+                &remote.url,
+                &format!("+refs/pull/{number}/head:refs/slopwatch/pull/{number}"),
+            ],
+        )
+        .await?;
+        let listed = git(
+            &path,
+            remote,
+            &[
+                "diff",
+                "--name-only",
+                "--no-renames",
+                "-z",
+                &format!("{base_sha}...{head_sha}"),
+                "--",
+            ],
+        )
+        .await?;
+        Ok(listed
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Waits for the repo's turn: one git operation per repo at a time.
+    async fn turn(&self, repo: &RepoName) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self
+            .locks
+            .lock()
+            .expect("no panics while holding the clone locks")
+            .entry(repo.clone())
+            .or_default()
+            .clone();
+        lock.lock_owned().await
+    }
+
+    /// The repo's clone, made first if the daemon has none.
+    async fn cloned(&self, repo: &RepoName, remote: &GitRemote) -> Result<PathBuf, GitError> {
+        let path = self.path(repo);
+        if !path.join("HEAD").exists() {
+            self.clone_bare(&path, remote).await?;
+        }
+        Ok(path)
     }
 
     async fn clone_bare(&self, path: &Path, remote: &GitRemote) -> Result<(), GitError> {
@@ -228,6 +290,27 @@ mod tests {
 
         assert_eq!(read.sha, github.branch_sha(&repo(), "main"));
         assert_eq!(read.text, None);
+    }
+
+    #[tokio::test]
+    async fn lists_the_files_a_pr_changes_since_it_branched() {
+        let github = FakeGitHub::new("me");
+        github.add_repo(&repo());
+        github.open_pr(&repo(), 3, "me", "Docs");
+        github.push_file(&repo(), 3, "docs/guide.md", "Read me.\n");
+        // main moving on doesn't add its files to the PR's.
+        let base = github.set_pipeline(&repo(), "main", CI_PIPELINE);
+        let head = github.head_sha(&repo(), 3);
+        let remote = github.git_remote(&repo()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let clones = Clones::new(dir.path());
+
+        let files = clones
+            .changed_files(&repo(), &remote, 3, &base, &head)
+            .await
+            .unwrap();
+
+        assert_eq!(files, ["change-3.txt", "docs/guide.md"]);
     }
 
     #[tokio::test]

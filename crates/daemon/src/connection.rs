@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
-use crate::runs::{Live, SubscribeError};
+use crate::runs::{Live, RunError, Runs, SubscribeError};
 use crate::{Daemon, LibraryError, Peer, Subscription, WatchError};
 
 /// How long a client gets to send its hello before the daemon hangs up.
@@ -285,12 +285,33 @@ impl Daemon {
             Command::DeleteLibraryStep { step } => {
                 return respond(self.library.delete(&step).map(|()| Reply::Done));
             }
+            Command::CancelRun { run } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs.cancel(run).await.map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
+            Command::RetryStep { run, step } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs.retry(run, &step).await.map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
         };
         if changes_prs {
             // What changed, even with a failed poll, may start or end a Run.
             self.sync_runs().await;
         }
         respond(result)
+    }
+}
+
+impl Daemon {
+    /// The daemon's Runs. Only some tests build a daemon without them.
+    fn runs_or_refuse(&self) -> Result<&Runs, RunError> {
+        self.runs
+            .as_deref()
+            .ok_or_else(|| RunError::Invalid("This daemon doesn't run Pipelines".to_owned()))
     }
 }
 
@@ -383,6 +404,17 @@ impl From<WatchError> for ErrorBody {
             WatchError::NotFound(what) => (ErrorCode::NotFound, format!("Not found: {what}")),
             WatchError::GitHub(error) => (ErrorCode::GitHub, error.to_string()),
             WatchError::Store(error) => (ErrorCode::Internal, format!("Database error: {error}")),
+        };
+        ErrorBody { code, message }
+    }
+}
+
+impl From<RunError> for ErrorBody {
+    fn from(error: RunError) -> Self {
+        let (code, message) = match error {
+            RunError::NotFound(message) => (ErrorCode::NotFound, message),
+            RunError::Invalid(message) => (ErrorCode::Invalid, message),
+            RunError::Store(error) => (ErrorCode::Internal, format!("Database error: {error}")),
         };
         ErrorBody { code, message }
     }
