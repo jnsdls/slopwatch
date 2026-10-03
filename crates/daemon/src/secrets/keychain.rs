@@ -319,4 +319,34 @@ mod tests {
         );
         assert!(gone.is_none(), "the item is still there");
     }
+
+    /// Whether an item one build wrote reads back from a different build
+    /// with no prompt (ADR 0014). Run by hand in three steps, rebuilding in
+    /// between with a different `SLOPWATCH_TEST_70_BUILD`, which lands in
+    /// the binary and so changes its ad-hoc signature:
+    ///
+    /// ```text
+    /// SLOPWATCH_TEST_70_BUILD=a SLOPWATCH_TEST_70_PHASE=write cargo test -p slopwatch-daemon across_a_rebuild -- --ignored
+    /// SLOPWATCH_TEST_70_BUILD=b SLOPWATCH_TEST_70_PHASE=read cargo test -p slopwatch-daemon across_a_rebuild -- --ignored
+    /// ```
+    ///
+    /// The read phase deletes the item.
+    #[test]
+    #[ignore = "touches the developer's login Keychain"]
+    fn an_item_reads_back_across_a_rebuild() {
+        const BUILD: Option<&str> = option_env!("SLOPWATCH_TEST_70_BUILD");
+        let keychain = SecurityCli::new("slopwatch-test-70-rebuild");
+        let name = "SLOPWATCH_TEST_70";
+        let value = SecretValue::new("rebuild-value-0123456789");
+        eprintln!("build {BUILD:?}");
+        match std::env::var("SLOPWATCH_TEST_70_PHASE").as_deref() {
+            Ok("write") => keychain.set(name, &value).unwrap(),
+            Ok("read") => {
+                let read = keychain.get(name).unwrap();
+                keychain.delete(name).unwrap();
+                assert!(read == Some(value), "the value didn't read back");
+            }
+            _ => {}
+        }
+    }
 }
