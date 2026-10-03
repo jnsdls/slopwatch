@@ -1,6 +1,7 @@
-//! Stamps `SLOPWATCH_BUILD_ID`: the git SHA, plus a hash of the uncommitted
-//! changes to the build inputs when they're dirty, so builds of different
-//! sources get different ids.
+//! Stamps `SLOPWATCH_FLAVOR`, passed through from the build environment
+//! (see `Flavor`), and `SLOPWATCH_BUILD_ID`: the git SHA, plus a hash of the
+//! uncommitted changes to the build inputs when they're dirty, so builds of
+//! different sources get different ids.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,6 +18,10 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     println!("cargo:rerun-if-env-changed=SLOPWATCH_BUILD_ID");
+    println!("cargo:rerun-if-env-changed=SLOPWATCH_FLAVOR");
+
+    let flavor = std::env::var("SLOPWATCH_FLAVOR").unwrap_or_default();
+    println!("cargo:rustc-env=SLOPWATCH_FLAVOR={flavor}");
 
     let id = std::env::var("SLOPWATCH_BUILD_ID")
         .ok()

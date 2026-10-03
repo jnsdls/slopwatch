@@ -11,6 +11,7 @@
 
 pub mod auth;
 mod connection;
+mod data_dir;
 pub mod github;
 mod pace;
 pub mod store;
@@ -18,6 +19,8 @@ pub mod transport;
 mod watching;
 
 use std::sync::Arc;
+
+pub use data_dir::DataDir;
 
 use slopwatch_protocol::{
     Auth, BUILD_ID, ClientFrame, ClientHello, DIALECT, FEATURES, Refusal, RefusalReason,
@@ -36,6 +39,7 @@ pub struct Daemon {
     build_id: String,
     uid: u32,
     watching: Arc<Watching>,
+    restart: tokio::sync::watch::Sender<bool>,
 }
 
 impl Daemon {
@@ -50,6 +54,7 @@ impl Daemon {
             build_id: build_id.into(),
             uid: current_uid(),
             watching,
+            restart: tokio::sync::watch::Sender::new(false),
         }
     }
 
@@ -61,6 +66,15 @@ impl Daemon {
     /// same uid.
     pub fn uid(&self) -> u32 {
         self.uid
+    }
+
+    /// Resolves once a client's `restart` has been answered. The process
+    /// then kills its Step process groups and exits, with no drain
+    /// (ADR 0009).
+    pub async fn restart_requested(&self) {
+        let mut requested = self.restart.subscribe();
+        // The sender lives in `self`, so the channel can't close under us.
+        let _ = requested.wait_for(|requested| *requested).await;
     }
 
     /// Answers a client's first frame. A stranger learns nothing about the

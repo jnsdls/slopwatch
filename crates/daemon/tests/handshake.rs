@@ -1,6 +1,7 @@
 //! The hello exchange and requests, over the in-process transport.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use slopwatch_daemon::github::fake::FakeGitHub;
 use slopwatch_daemon::store::Store;
@@ -57,7 +58,7 @@ async fn a_matching_hello_is_answered_with_the_daemons_build_id() {
         answer,
         ServerFrame::Hello(ServerHello {
             dialect: DIALECT,
-            features: vec!["watched_prs".into()],
+            features: vec!["watched_prs".into(), "restart".into()],
             build_id: "0123abcd+dirty.feed".into(),
         })
     );
@@ -145,6 +146,27 @@ async fn each_response_carries_its_requests_id() {
     assert_eq!(first.id, RequestId(1));
     assert_eq!(second.id, RequestId(2));
     assert_eq!(second.result, ResponseBody::Ok(Reply::Pong));
+}
+
+#[tokio::test]
+async fn restart_is_answered_before_the_daemon_asks_to_exit() {
+    let daemon = daemon();
+    let mut client = InProcessClient::connect(Arc::clone(&daemon)).await.unwrap();
+    hello(&mut client, ClientHello::local()).await;
+    let requested = tokio::spawn({
+        let daemon = Arc::clone(&daemon);
+        async move { daemon.restart_requested().await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!requested.is_finished(), "nobody asked for a restart yet");
+
+    let answer = response(client.request(Command::Restart).await.unwrap());
+
+    assert_eq!(answer.result, ResponseBody::Ok(Reply::Restarting));
+    tokio::time::timeout(Duration::from_secs(5), requested)
+        .await
+        .expect("the daemon asks to exit once it answered")
+        .unwrap();
 }
 
 #[tokio::test]

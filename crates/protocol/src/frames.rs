@@ -150,6 +150,9 @@ pub enum Command {
     Subscribe {
         topic: Topic,
     },
+    /// Kill every Step process group and exit, so launchd starts the binary
+    /// the bundle now holds (ADR 0009). The daemon replies before it exits.
+    Restart,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +177,8 @@ pub enum Reply {
     AvailableRepos {
         repos: Vec<RepoName>,
     },
+    /// The daemon exits right after sending this.
+    Restarting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +276,15 @@ mod tests {
 
         assert_eq!(wire(&request), expected);
         assert_eq!(parse::<ClientFrame>(expected), request);
+    }
+
+    #[test]
+    fn restart_is_a_command_answered_before_the_daemon_exits() {
+        assert_eq!(wire(&Command::Restart), json!({ "name": "restart" }));
+        assert_eq!(
+            wire(&ResponseBody::Ok(Reply::Restarting)),
+            json!({ "ok": { "reply": "restarting" } }),
+        );
     }
 
     #[test]
