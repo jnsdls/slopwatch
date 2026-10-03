@@ -9,6 +9,7 @@
 
 use rusqlite::{OptionalExtension, params};
 use slopwatch_core::EndReason;
+use slopwatch_protocol::step::EffectKind;
 use slopwatch_protocol::{RepoName, RunId};
 
 use super::{Store, StoreError, append_event, json_str, parse_repo};
@@ -120,7 +121,8 @@ impl Store {
     /// Settles a commit with the SHA GitHub made, or `None` if it made
     /// none. A made commit goes in the push journal, and `event`, the Run
     /// event that says so, in its Run's journal, all or nothing. Returns
-    /// the event's sequence number.
+    /// the event's sequence number. A commit settled already stays as it
+    /// was, and nothing is appended.
     pub fn finish_commit(
         &self,
         intent: &CommitIntent,
@@ -128,10 +130,13 @@ impl Store {
     ) -> Result<Option<u64>, StoreError> {
         let db = self.db();
         let tx = db.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE commits SET sha = ?2, finished = 1 WHERE id = ?1",
+        let settled = tx.execute(
+            "UPDATE commits SET sha = ?2, finished = 1 WHERE id = ?1 AND finished = 0",
             params![intent.id, made.map(|(sha, _, _)| sha)],
         )?;
+        if settled == 0 {
+            return Ok(None);
+        }
         let mut seq = None;
         if let Some((sha, ts, event)) = made {
             tx.execute(
@@ -170,9 +175,10 @@ impl Store {
     /// The Runs are walked newest first. One on the same head as the Run
     /// after it is a same-SHA Run, which no push separates. Otherwise a
     /// push came between them: a commit of the earlier Run's that made the
-    /// later head is a Fix round, any other push a Run ended as pushed is
-    /// slopwatch's own rebase or update, and anything else came from
-    /// outside and ends the streak.
+    /// later head is a Fix round. A rebase the earlier Run asked for, a
+    /// Stack update of its head or a push in the push journal is
+    /// slopwatch's own, which neither counts nor resets. Anything else came
+    /// from outside and ends the streak.
     pub fn fix_streak(
         &self,
         repo: &RepoName,
@@ -215,7 +221,8 @@ impl Store {
                     streak.rounds += 1;
                     streak.trees.push(tree);
                 }
-                None if reason.as_deref() == Some(pushed.as_str()) => {}
+                None if reason.as_deref() == Some(pushed.as_str())
+                    && slopwatch_pushed(&db, repo, number, id, &run_head, &later)? => {}
                 None => break,
             }
             streak.heads.push(run_head.clone());
@@ -223,6 +230,37 @@ impl Store {
         }
         Ok(streak)
     }
+}
+
+/// Whether slopwatch made the push from Run `run`, on `head`, to `later`:
+/// a SHA in the push journal, a rebase the Run asked GitHub for, or a
+/// Stack update of that head. A rebase or an update doesn't say what head
+/// it made, so any head after one counts (ADR 0004).
+fn slopwatch_pushed(
+    db: &rusqlite::Connection,
+    repo: &RepoName,
+    number: u64,
+    run: RunId,
+    head: &str,
+    later: &str,
+) -> Result<bool, StoreError> {
+    let journaled = db
+        .query_row(
+            "SELECT 1 FROM push_journal WHERE repo = ?1 AND sha = ?2",
+            params![repo.to_string(), later],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    let updated = db
+        .query_row(
+            "SELECT 1 FROM stack_updates WHERE repo = ?1 AND number = ?2 AND head_sha = ?3",
+            params![repo.to_string(), number as i64, head],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(journaled || updated || super::asked_for(db, run, EffectKind::Rebase)?)
 }
 
 #[cfg(test)]
@@ -351,11 +389,40 @@ mod tests {
         let first = run(&store, "a", EndReason::Pushed);
         commit(&store, first, "a", "b", "tb");
         // The Run on `b` ended with a rebase, which made `r`.
-        run(&store, "b", EndReason::Pushed);
+        let rebased = run(&store, "b", EndReason::Pushed);
+        let effect = slopwatch_protocol::step::Effect::Rebase {
+            method: slopwatch_protocol::step::UpdateMethod::Merge,
+        };
+        let name = repo();
+        store
+            .insert_effect(&crate::store::NewEffect {
+                run: rebased,
+                step: "merge",
+                request: "rebase",
+                repo: &name,
+                number: 7,
+                head_sha: "b",
+                effect: &effect,
+            })
+            .unwrap();
 
         let streak = store.fix_streak(&repo(), 7, "r", None).unwrap();
         assert_eq!(streak.rounds, 1);
         assert_eq!(streak.heads, ["r", "b", "a"]);
+    }
+
+    #[test]
+    fn an_outside_push_after_a_fix_commit_resets_the_streak() {
+        let store = Store::in_memory();
+        let first = run(&store, "a", EndReason::Pushed);
+        commit(&store, first, "a", "b", "tb");
+        // The Run on `b` ended pushed, but `x` came from someone else
+        // before a Run on it started.
+        run(&store, "b", EndReason::Pushed);
+
+        let streak = store.fix_streak(&repo(), 7, "x", None).unwrap();
+        assert_eq!(streak.rounds, 0);
+        assert_eq!(streak.heads, ["x"]);
     }
 
     #[test]

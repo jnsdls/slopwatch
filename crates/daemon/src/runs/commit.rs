@@ -49,6 +49,7 @@ pub(super) const CO_AUTHOR: &str = "slopwatch <noreply@slopwatch.invalid>";
 /// How a Step's reason starts when its changes stopped the Fix loop, as
 /// the "Fix stopped" PR entry reads them.
 pub(super) const NOTHING_ACTIONABLE: &str = "nothing actionable";
+/// How a Step's reason starts when its changes would repeat a tree.
 pub(super) const LOOP_DETECTED: &str = "loop detected";
 
 /// The longest commit headline, in characters.
@@ -63,6 +64,7 @@ pub(super) struct Write {
 }
 
 #[derive(Debug)]
+/// Where a write Step's changes are on their way to a commit.
 pub(super) enum Stage {
     /// The process hasn't exited, so the worktree may still change.
     Exiting,
@@ -92,6 +94,7 @@ pub(super) struct Done {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// What a commit call came to.
 enum Committed {
     /// GitHub made it.
     Made(String),
@@ -115,6 +118,7 @@ pub(super) enum Judgement {
     Unsupported(Vec<(String, &'static str)>),
     /// The tree is one the streak's heads already had.
     Loop,
+    /// Nothing stops the commit.
     Commit,
 }
 
@@ -170,9 +174,10 @@ fn unsupported(change: &Change) -> Option<&'static str> {
 fn message(run: RunId, step: &str, outputs: &Outputs) -> (String, String) {
     let note = outputs.note.as_deref().map(str::trim).unwrap_or_default();
     let first = note.lines().next().unwrap_or_default().trim();
+    let long = first.chars().count() > HEADLINE;
     let headline = if first.is_empty() {
         format!("Changes from slopwatch Step `{step}`")
-    } else if first.chars().count() > HEADLINE {
+    } else if long {
         let cut: String = first.chars().take(HEADLINE - 1).collect();
         format!("{}…", cut.trim_end())
     } else {
@@ -183,7 +188,7 @@ fn message(run: RunId, step: &str, outputs: &Outputs) -> (String, String) {
         .map(str::trim)
         .filter(|rest| !rest.is_empty());
     let mut body = String::new();
-    if first.chars().count() > HEADLINE {
+    if long {
         body.push_str(first);
         body.push_str("\n\n");
     }
@@ -336,8 +341,8 @@ impl Engine {
             }
             Judgement::Loop => {
                 let reason = format!(
-                    "{LOOP_DETECTED}: its changes would put back a tree the PR already had in \
-                     this run of Fix rounds"
+                    "{LOOP_DETECTED}: its changes would put back a tree the PR already had \
+                     since the last push from outside"
                 );
                 self.settle(&key, &step, Verdict::Pass, Some(reason), outputs)?;
             }
@@ -390,22 +395,33 @@ impl Engine {
         else {
             return Ok(());
         };
-        // The Run's snapshot is pinned to its head, and a poll that saw the
-        // head move would have ended it. This keeps a stale Run from
-        // committing all the same.
-        if run
+        // A commit whose fate is unknown may have moved the branch, so no
+        // other commit goes out on the head the Run judged. The Run's
+        // snapshot is pinned to its head, and a poll that saw the head move
+        // would have ended it, so a moved head there means a stale Run.
+        let refusal = if self.store.committing(run.id)? {
+            Some("an earlier commit in this Run may have landed, so nothing more is committed")
+        } else if run
             .snapshot
             .as_ref()
             .is_some_and(|s| s.head_sha != run.head_sha)
         {
-            return Ok(());
+            Some("the PR's head moved on from the one the Run judged")
+        } else {
+            None
+        };
+        if let Some(why) = refusal {
+            let outputs = run.writes[&step].outcome.outputs.clone();
+            let reason = format!("error(commit): {why}");
+            self.settle(key, &step, Verdict::Error, Some(reason), outputs)?;
+            return self.commit_next(key);
         }
         let write = run.writes.get_mut(&step).expect("found above");
         let Stage::Ready(changes) = std::mem::replace(&mut write.stage, Stage::Committing) else {
             unreachable!("found Ready above");
         };
         let (headline, body) = message(run.id, &step, &write.outcome.outputs);
-        let job = CommitJob {
+        let call = CommitCall {
             run: run.id,
             step: step.clone(),
             repo: run.repo.clone(),
@@ -430,7 +446,7 @@ impl Engine {
         tokio::spawn(async move {
             let work =
                 tokio::spawn(
-                    async move { job.run(&store, &journal, github.as_ref(), &clones).await },
+                    async move { call.run(&store, &journal, github.as_ref(), &clones).await },
                 );
             let result = work.await.unwrap_or_else(|error| {
                 Committed::Unknown(format!("the commit task failed: {error}"))
@@ -496,7 +512,7 @@ impl Engine {
 }
 
 /// One commit, as its task makes it.
-struct CommitJob {
+struct CommitCall {
     run: RunId,
     step: String,
     repo: RepoName,
@@ -507,7 +523,7 @@ struct CommitJob {
     body: String,
 }
 
-impl CommitJob {
+impl CommitCall {
     async fn run(
         self,
         store: &Store,
@@ -678,6 +694,7 @@ impl Runs {
     }
 }
 
+/// A SHA cut to the seven characters a person reads.
 fn short(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }

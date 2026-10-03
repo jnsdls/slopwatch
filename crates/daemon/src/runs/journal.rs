@@ -94,11 +94,11 @@ impl Journal {
         };
         let text = serde_json::to_string(&event).expect("Run events always serialize");
         let ts = now_ms();
-        let seq = self
-            .store
-            .finish_commit(intent, Some((sha, ts, &text)))?
-            .expect("a made commit appends its event");
-        let _ = live.send((intent.run, Journalled { seq, ts, event }));
+        // A commit settled already, as by the sync and its own call both,
+        // has its event.
+        if let Some(seq) = self.store.finish_commit(intent, Some((sha, ts, &text)))? {
+            let _ = live.send((intent.run, Journalled { seq, ts, event }));
+        }
         Ok(())
     }
 

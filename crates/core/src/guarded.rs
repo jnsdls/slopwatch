@@ -6,6 +6,7 @@
 /// What a Pipeline guards besides what's always guarded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Guard {
+    /// Lockfiles are guarded, as they are unless the Pipeline says not.
     pub lockfiles: bool,
 }
 

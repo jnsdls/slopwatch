@@ -192,7 +192,7 @@ async fn a_real_fix_is_committed_verified_with_the_tree_the_clone_made() {
         .commit_of(&repo, &remote, number, &sha)
         .await
         .unwrap();
-    assert_eq!(parents, [head.sha.clone()]);
+    assert_eq!(parents, std::slice::from_ref(&head.sha));
     assert_eq!(made, changes.tree, "GitHub made the tree the clone did");
 
     let verified = Command::new("gh")

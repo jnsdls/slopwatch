@@ -357,30 +357,49 @@ impl Clones {
         index: &Path,
     ) -> Result<WorktreeChanges, GitError> {
         let _turn = self.turn(repo).await;
-        let index_path = index
-            .to_str()
-            .ok_or_else(|| GitError(format!("{} isn't UTF-8", index.display())))?;
-        let env = [("GIT_INDEX_FILE", index_path)];
+        let clone = self.cloned(repo, remote).await?;
+        // The clone is named outright, never found through the worktree's
+        // `.git` file. The Step could have pointed that at a repo whose
+        // config runs its code with the remote's credential in reach.
+        let env = [
+            ("GIT_DIR", utf8(&clone)?),
+            ("GIT_WORK_TREE", utf8(dir)?),
+            ("GIT_INDEX_FILE", utf8(index)?),
+        ];
+        let safe = |args: &[&str]| -> Vec<String> {
+            [
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ]
+            .iter()
+            .chain(args)
+            .map(|arg| (*arg).to_owned())
+            .collect()
+        };
         let _ = tokio::fs::remove_file(index).await;
         let result = async {
-            git_env(dir, remote, &env, &["read-tree", head]).await?;
-            git_env(dir, remote, &env, &["add", "--all", "--", "."]).await?;
-            let tree = git_env(dir, remote, &env, &["write-tree"]).await?;
-            let raw = git_output_env(
-                dir,
-                remote,
-                &[],
-                &[
-                    "diff-tree",
-                    "-r",
-                    "-z",
-                    "--raw",
-                    "--no-renames",
-                    head,
-                    &tree,
-                ],
-            )
-            .await?;
+            let run = async |args: Vec<String>| {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                git_output_env(dir, remote, &env, &args).await
+            };
+            run(safe(&["read-tree", head])).await?;
+            run(safe(&["add", "--all", "--", "."])).await?;
+            let tree = String::from_utf8(run(safe(&["write-tree"])).await?)
+                .map_err(|_| GitError("git write-tree wrote non-UTF-8".to_owned()))?
+                .trim_end()
+                .to_owned();
+            let diff = [
+                "diff-tree",
+                "-r",
+                "-z",
+                "--raw",
+                "--no-renames",
+                head,
+                &tree,
+            ];
+            let raw = run(safe(&diff)).await?;
             Ok(WorktreeChanges {
                 tree,
                 changes: parse_raw_diff(&raw)?,
@@ -544,6 +563,12 @@ pub struct Change {
     pub new_mode: String,
     /// The blob after, all zeroes for a deletion.
     pub blob: String,
+}
+
+/// `path` as text, for an env var.
+fn utf8(path: &Path) -> Result<&str, GitError> {
+    path.to_str()
+        .ok_or_else(|| GitError(format!("{} isn't UTF-8", path.display())))
 }
 
 /// Reads `git diff-tree -r -z --raw` output: `:old new oldsha newsha
@@ -889,6 +914,14 @@ mod tests {
             ]
         );
         assert!(!index.exists(), "the scratch index goes");
+        // A Step that repoints the worktree's `.git` file at a repo of its
+        // own changes nothing: the clone is named outright.
+        std::fs::write(tree.join(".git"), "gitdir: /nonexistent\n").unwrap();
+        let again = clones
+            .worktree_changes(&repo(), &remote, &tree, &head, &index)
+            .await
+            .unwrap();
+        assert_eq!(again.tree, changed.tree);
         let guide = &changed.changes[0];
         assert_eq!(
             clones.blob(&repo(), &remote, &guide.blob).await.unwrap(),

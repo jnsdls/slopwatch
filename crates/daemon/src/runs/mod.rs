@@ -1237,8 +1237,9 @@ impl Preparation {
     }
 }
 
-/// The most of a CI log's end a Step gets, in lines and in bytes.
+/// The most lines of a CI log's end a Step gets.
 const CI_LOG_LINES: usize = 200;
+/// The most bytes of a CI log's end a Step gets.
 const CI_LOG_BYTES: usize = 32 * 1024;
 
 /// The last [`CI_LOG_LINES`] lines of `log`, at most [`CI_LOG_BYTES`] of
@@ -3539,6 +3540,7 @@ fn couldnt_merge(run: &Active) -> Option<Vec<String>> {
     (!reasons.is_empty()).then_some(reasons)
 }
 
+/// The title of the PR entry a Run raises when the Fix loop stopped.
 const FIX_STOPPED: &str = "Fix stopped";
 
 /// Why the Fix loop stopped in a Run whose Gate failed: a write Step
@@ -3554,7 +3556,8 @@ fn fix_stopped(run: &Active) -> Option<Vec<String>> {
             let reason = run.reasons.get(&step.id)?;
             let line = if reason == &SkipReason::RoundCap.to_string() {
                 format!(
-                    "`{}`: round cap: {} Fix rounds in a row didn't get the Gate to pass                      (`fix_rounds` is {})",
+                    "`{}`: round cap: {} Fix rounds in a row didn't get the Gate to pass \
+                     (`fix_rounds` is {})",
                     step.id,
                     run.state.fix_round,
                     run.pipeline.fix_rounds()
