@@ -491,7 +491,13 @@ impl MainView {
         let theme = cx.theme().clone();
         let mut list = div()
             .id("inbox-list")
-            .flex_1()
+            .map(|this| {
+                if self.run_pane.graph_shown() {
+                    this.flex_none().w(px(GRAPH_MODE_LIST_WIDTH))
+                } else {
+                    this.flex_1()
+                }
+            })
             .h_full()
             .flex()
             .flex_col()
@@ -789,18 +795,40 @@ impl MainView {
                     ),
                 );
             }
-            if self.run_pane.waiver_form().is_some() {
-                pane = pane.child(self.waiver_form(cx));
-            }
-            return pane.when_some(view.end, |this, end| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("Ended: {}", end_label(end, view.waived))),
-                )
-            });
+        } else {
+            pane = pane.child(self.step_list(view, cx));
         }
+        if self.run_pane.waiver_form().is_some() {
+            pane = pane.child(self.waiver_form(cx));
+        }
+        if let Some(end) = view.end {
+            pane = pane.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("Ended: {}", end_label(end, view.waived))),
+            );
+        }
+        if !view.inbox.is_empty() {
+            let mut history = div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Inbox history");
+            for entry in &view.inbox {
+                history = history.child(format!("• {}", history_line(entry)));
+            }
+            pane = pane.child(history);
+        }
+        pane
+    }
+
+    /// The Run as a Step list, with the Gate as its last row.
+    fn step_list(&self, view: &RunView, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
+        let color = |tone| tone_color(&theme, tone);
         let mut steps = div()
             .flex()
             .flex_col()
@@ -845,32 +873,7 @@ impl MainView {
                         ),
                 ),
         );
-        pane = pane.child(steps);
-        if self.run_pane.waiver_form().is_some() {
-            pane = pane.child(self.waiver_form(cx));
-        }
-        if let Some(end) = view.end {
-            pane = pane.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("Ended: {}", end_label(end, view.waived))),
-            );
-        }
-        if !view.inbox.is_empty() {
-            let mut history = div()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("Inbox history");
-            for entry in &view.inbox {
-                history = history.child(format!("• {}", history_line(entry)));
-            }
-            pane = pane.child(history);
-        }
-        pane
+        steps
     }
 
     /// The Waiver being filled in: a category, a reason, and the buttons
@@ -1342,7 +1345,7 @@ impl Render for MainView {
                     .flex()
                     .overflow_hidden()
                     .when(
-                        !(self.pane == Pane::Prs && self.run_pane.graph_shown()),
+                        !(self.pane != Pane::Library && self.run_pane.graph_shown()),
                         |this| this.child(self.sources(cx)),
                     )
                     .map(|this| match self.pane {
