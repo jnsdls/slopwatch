@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, params};
-use slopwatch_core::{EndReason, GateState, Verdict};
+use slopwatch_core::{EndReason, GateState, ReuseKey, Verdict};
 use slopwatch_protocol::step::Outputs;
 use slopwatch_protocol::{RepoName, RunId, RunSummary};
 
@@ -84,6 +84,12 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE run_steps ADD COLUMN process_sid INTEGER;
     ALTER TABLE run_steps ADD COLUMN restarts INTEGER NOT NULL DEFAULT 0;
 ",
+    // Outcome reuse (ADR 0007): the Plugin version each Step ran with, and
+    // the Run whose Outcome a Step took instead of running.
+    "
+    ALTER TABLE run_steps ADD COLUMN plugin_version TEXT NOT NULL DEFAULT '';
+    ALTER TABLE run_steps ADD COLUMN reused_from INTEGER REFERENCES runs(id);
+",
 ];
 
 #[derive(Clone)]
@@ -109,6 +115,24 @@ pub struct NewStep {
     pub id: String,
     pub plugin: String,
     pub config_hash: String,
+}
+
+/// The newest Run of a PR, as a sync compares it with the PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatestRun {
+    pub head_sha: String,
+    pub base_sha: String,
+    pub pipeline: String,
+}
+
+/// A settled Outcome a later Run may take instead of running its Step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reusable {
+    /// The Run where the Step ran and reported it.
+    pub run: RunId,
+    pub verdict: Verdict,
+    pub reason: Option<String>,
+    pub outputs: Outputs,
 }
 
 /// A Run that hasn't ended, as the store keeps it.
@@ -393,6 +417,106 @@ impl Store {
         Ok(restarts)
     }
 
+    /// Records the Plugin version a Step is about to run with, which its
+    /// Outcome is reused under.
+    pub fn set_plugin_version(
+        &self,
+        run: RunId,
+        step: &str,
+        version: &str,
+    ) -> Result<(), StoreError> {
+        self.db().execute(
+            "UPDATE run_steps SET plugin_version = ?3 WHERE run_id = ?1 AND step = ?2",
+            params![run.0 as i64, step, version],
+        )?;
+        Ok(())
+    }
+
+    /// Settles the Step with an Outcome reused from an earlier Run under
+    /// `key`.
+    pub fn put_reused_step(
+        &self,
+        run: RunId,
+        key: &ReuseKey,
+        reused: &Reusable,
+    ) -> Result<(), StoreError> {
+        self.db().execute(
+            "UPDATE run_steps
+             SET state = 'settled', verdict = ?3, reason = ?4, outputs = ?5,
+                 plugin_version = ?6, reused_from = ?7,
+                 pgid = NULL, process_started_us = NULL, process_sid = NULL
+             WHERE run_id = ?1 AND step = ?2",
+            params![
+                run.0 as i64,
+                key.step,
+                reused.verdict.as_str(),
+                reused.reason,
+                serde_json::to_string(&reused.outputs).expect("outputs always serialize"),
+                key.plugin_version,
+                reused.run.0 as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The newest Outcome the PR settled under `key` in a Run before
+    /// `before`, if its Verdict may be reused. A reused Outcome names the
+    /// Run that first reported it.
+    pub fn reusable_outcome(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        key: &ReuseKey,
+        before: RunId,
+    ) -> Result<Option<Reusable>, StoreError> {
+        let found = self
+            .db()
+            .query_row(
+                "SELECT s.run_id, s.reused_from, s.verdict, s.reason, s.outputs
+                 FROM run_steps s JOIN runs r ON r.id = s.run_id
+                 WHERE r.repo = ?1 AND r.number = ?2 AND r.head_sha = ?3 AND r.id < ?4
+                   AND s.step = ?5 AND s.config_hash = ?6 AND s.plugin_version = ?7
+                   AND s.state = 'settled'
+                 ORDER BY s.run_id DESC LIMIT 1",
+                params![
+                    repo.to_string(),
+                    number as i64,
+                    key.head_sha,
+                    before.0 as i64,
+                    key.step,
+                    key.config_hash,
+                    key.plugin_version,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((run, reused_from, verdict, reason, outputs)) = found else {
+            return Ok(None);
+        };
+        let Some(verdict) = verdict
+            .and_then(|v| serde_json::from_value::<Verdict>(v.into()).ok())
+            .filter(|verdict| verdict.reusable())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Reusable {
+            run: RunId(reused_from.unwrap_or(run) as u64),
+            verdict,
+            reason,
+            outputs: outputs
+                .and_then(|o| serde_json::from_str(&o).ok())
+                .unwrap_or_default(),
+        }))
+    }
+
     pub fn set_gate(&self, run: RunId, gate: GateState) -> Result<(), StoreError> {
         self.db().execute(
             "UPDATE runs SET gate = ?2 WHERE id = ?1",
@@ -498,6 +622,28 @@ impl Store {
             },
         )?;
         rows.collect()
+    }
+
+    /// The PR's newest Run, ended or not.
+    pub fn latest_run(
+        &self,
+        repo: &RepoName,
+        number: u64,
+    ) -> Result<Option<LatestRun>, StoreError> {
+        self.db()
+            .query_row(
+                "SELECT head_sha, base_sha, pipeline FROM runs
+                 WHERE repo = ?1 AND number = ?2 ORDER BY id DESC LIMIT 1",
+                params![repo.to_string(), number as i64],
+                |row| {
+                    Ok(LatestRun {
+                        head_sha: row.get(0)?,
+                        base_sha: row.get(1)?,
+                        pipeline: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
     }
 
     /// Every PR that has a Run.
@@ -780,6 +926,33 @@ mod tests {
         }
     }
 
+    /// Runs `ci` in `run` with version `1+exe` and settles it.
+    fn settle(store: &Store, run: RunId, verdict: Verdict) {
+        store.set_plugin_version(run, "ci", "1+exe").unwrap();
+        let row = StepRow {
+            step: "ci".into(),
+            state: StepRowState::Settled {
+                verdict,
+                reason: Some(format!("why in {run}")),
+                outputs: Outputs {
+                    note: Some(format!("in {run}")),
+                    ..Outputs::default()
+                },
+            },
+            attempt: 1,
+        };
+        store.put_step(run, &row).unwrap();
+    }
+
+    fn ci_key(head_sha: &str) -> ReuseKey {
+        ReuseKey {
+            head_sha: head_sha.into(),
+            step: "ci".into(),
+            config_hash: "hash".into(),
+            plugin_version: "1+exe".into(),
+        }
+    }
+
     #[test]
     fn restarts_count_only_in_a_row_until_the_step_settles() {
         let dir = tempfile::tempdir().unwrap();
@@ -827,6 +1000,69 @@ mod tests {
             store.interrupt_step(run, "ci").unwrap(),
             1,
             "settling breaks the row"
+        );
+    }
+
+    #[test]
+    fn a_settled_outcome_is_reused_under_its_key_and_names_the_run_that_reported_it() {
+        let store = Store::in_memory();
+        let repo = RepoName::new("o", "r");
+        let first = store.insert_run(&new_run(&repo, "aaa"), 1).unwrap();
+        settle(&store, first, Verdict::Fail);
+        let second = store.insert_run(&new_run(&repo, "aaa"), 2).unwrap();
+        let third = store.insert_run(&new_run(&repo, "aaa"), 3).unwrap();
+
+        let found = store
+            .reusable_outcome(&repo, 7, &ci_key("aaa"), second)
+            .unwrap()
+            .expect("the first Run's fail is reusable");
+        assert_eq!((found.run, found.verdict), (first, Verdict::Fail));
+        assert_eq!(found.outputs.note.as_deref(), Some("in 1"));
+        assert_eq!(found.reason.as_deref(), Some("why in 1"));
+
+        store
+            .put_reused_step(second, &ci_key("aaa"), &found)
+            .unwrap();
+        let again = store
+            .reusable_outcome(&repo, 7, &ci_key("aaa"), third)
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.run, first, "a reuse of a reuse names the first");
+
+        assert_eq!(
+            store
+                .reusable_outcome(&repo, 7, &ci_key("bbb"), third)
+                .unwrap(),
+            None,
+            "another head SHA"
+        );
+        let other_version = ReuseKey {
+            plugin_version: "2+exe".into(),
+            ..ci_key("aaa")
+        };
+        assert_eq!(
+            store
+                .reusable_outcome(&repo, 7, &other_version, third)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn the_newest_outcome_decides_and_an_errored_one_is_not_reused() {
+        let store = Store::in_memory();
+        let repo = RepoName::new("o", "r");
+        let first = store.insert_run(&new_run(&repo, "aaa"), 1).unwrap();
+        settle(&store, first, Verdict::Pass);
+        let second = store.insert_run(&new_run(&repo, "aaa"), 2).unwrap();
+        settle(&store, second, Verdict::Error);
+        let third = store.insert_run(&new_run(&repo, "aaa"), 3).unwrap();
+
+        assert_eq!(
+            store
+                .reusable_outcome(&repo, 7, &ci_key("aaa"), third)
+                .unwrap(),
+            None
         );
     }
 }

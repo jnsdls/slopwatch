@@ -79,3 +79,21 @@ fn key_order_in_the_file_does_not_change_the_hash() {
         b.step("r").unwrap().config_hash()
     );
 }
+
+#[test]
+fn only_verdicts_a_step_reported_are_reused() {
+    use slopwatch_core::Verdict;
+
+    for verdict in [Verdict::Pass, Verdict::Fail, Verdict::Inconclusive] {
+        assert!(verdict.reusable(), "{verdict}");
+    }
+    // A skip depends on the rest of the Run, so the new Run decides it again.
+    for verdict in [
+        Verdict::Error,
+        Verdict::Cancelled,
+        Verdict::Missing,
+        Verdict::Skipped,
+    ] {
+        assert!(!verdict.reusable(), "{verdict}");
+    }
+}

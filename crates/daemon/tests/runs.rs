@@ -861,3 +861,275 @@ fn a_run_whose_pipeline_stopped_loading_ends_not_shippable_and_its_steps_die() {
         assert!(reason.contains("no longer loads"), "{reason}");
     });
 }
+
+/// CI plus a second Step, `lint`, configured with `name`.
+fn ci_and_lint(name: &str) -> String {
+    format!(
+        "version: 1\nsteps:\n  ci: {{ uses: ci }}\n  lint: {{ uses: ci, with: {{ name: {name} }} }}\ngate: [ci, lint]\n"
+    )
+}
+
+fn pass_checks(harness: &Harness, number: u64) {
+    harness.github.set_checks(
+        &repo(),
+        number,
+        checks(ChecksState::Success, CheckState::Success),
+    );
+}
+
+impl Client {
+    fn history_of(&self, number: u64) -> Vec<RunId> {
+        self.prs
+            .pr(&repo(), number)
+            .map(|pr| pr.runs.iter().map(|run| run.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// The Step's Verdict and the Run its Outcome was reused from.
+    fn settled(&self, run: RunId, step: &str) -> (Verdict, Option<RunId>) {
+        match &self
+            .run(run)
+            .step(step)
+            .expect("the Run lists the Step")
+            .status
+        {
+            StepStatus::Settled {
+                verdict,
+                reused_from,
+                ..
+            } => (*verdict, *reused_from),
+            other => panic!("`{step}` hasn't settled: {other:?}"),
+        }
+    }
+
+    /// Waits for PR `number` to get a Run after `after`, subscribes to it
+    /// and waits for it to end.
+    async fn next_run_ends(&mut self, number: u64, after: RunId) -> RunId {
+        self.until("a new Run", |c| {
+            c.history_of(number)
+                .first()
+                .is_some_and(|&run| run != after)
+        })
+        .await;
+        let run = self.history_of(number)[0];
+        self.subscribe(run, None).await;
+        self.until("the new Run to end", |c| ended(c, run)).await;
+        run
+    }
+}
+
+/// The Steps whose process the Run started, from its journal.
+fn started_steps(store: &Store, run: RunId) -> Vec<String> {
+    store
+        .events_after(run, 0)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, text)| match serde_json::from_str(&text).unwrap() {
+            RunEvent::StepStarted { step } => Some(step),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Ends the first Run on PR 1 as shippable, with CI passed.
+async fn first_run_passes(harness: &Harness) -> (Client, RunId) {
+    let (mut client, run) = first_run(harness).await;
+    pass_checks(harness, 1);
+    client.refresh().await;
+    client
+        .until("the first Run to end", |c| ended(c, run))
+        .await;
+    assert_eq!(client.run(run).end, Some(EndReason::Shippable));
+    (client, run)
+}
+
+#[tokio::test]
+async fn a_pipeline_change_that_adds_a_step_runs_only_that_step_on_every_ended_pr() {
+    let harness = harness();
+    harness.github.open_pr(&repo(), 2, "me", "Another thing");
+    harness.github.label_on_github(&repo(), 2, true);
+    pass_checks(&harness, 1);
+    pass_checks(&harness, 2);
+    let mut client = Client::connect(&harness.daemon).await;
+    client.ok(Command::AddRepo { repo: repo() }).await;
+    let firsts: Vec<RunId> = [1, 2].map(|n| client.history_of(n)[0]).to_vec();
+    for &run in &firsts {
+        client.subscribe(run, None).await;
+    }
+    client.refresh().await;
+    client
+        .until("both first Runs to end", |c| {
+            firsts.iter().all(|&run| ended(c, run))
+        })
+        .await;
+
+    harness
+        .github
+        .set_pipeline(&repo(), "main", &ci_and_lint("lint"));
+    client.refresh().await;
+
+    for (number, first) in [1, 2].into_iter().zip(firsts) {
+        let second = client.next_run_ends(number, first).await;
+        let view = client.run(second);
+        assert_eq!(view.head_sha, client.run(first).head_sha, "the same SHA");
+        assert_eq!(view.base_sha, harness.github.branch_sha(&repo(), "main"));
+        assert_eq!(
+            client.settled(second, "ci"),
+            (Verdict::Pass, Some(first)),
+            "ci is reused"
+        );
+        assert_eq!(client.settled(second, "lint"), (Verdict::Pass, None));
+        assert_eq!(started_steps(&harness.store, second), ["lint"]);
+        assert_eq!(view.end, Some(EndReason::Shippable));
+    }
+}
+
+#[tokio::test]
+async fn changing_a_steps_with_reruns_only_that_step() {
+    let harness = harness();
+    harness
+        .github
+        .set_pipeline(&repo(), "main", &ci_and_lint("one"));
+    let (mut client, first) = first_run_passes(&harness).await;
+    assert_eq!(started_steps(&harness.store, first), ["ci", "lint"]);
+
+    harness
+        .github
+        .set_pipeline(&repo(), "main", &ci_and_lint("two"));
+    client.refresh().await;
+    let second = client.next_run_ends(1, first).await;
+
+    assert_eq!(client.settled(second, "ci"), (Verdict::Pass, Some(first)));
+    assert_eq!(client.settled(second, "lint"), (Verdict::Pass, None));
+    assert_eq!(started_steps(&harness.store, second), ["lint"]);
+}
+
+#[tokio::test]
+async fn a_base_commit_that_leaves_the_pipeline_alone_starts_no_run() {
+    let harness = harness();
+    let (mut client, first) = first_run_passes(&harness).await;
+
+    let moved =
+        harness
+            .github
+            .set_pipeline(&repo(), "main", slopwatch_daemon::github::fake::CI_PIPELINE);
+    assert_ne!(moved, client.run(first).base_sha);
+    client.refresh().await;
+    client.refresh().await;
+
+    assert_eq!(client.history(), [first]);
+}
+
+#[tokio::test]
+async fn a_pipeline_broken_and_restored_on_the_base_blocks_and_then_unblocks() {
+    let harness = harness();
+    let (mut client, first) = first_run_passes(&harness).await;
+
+    harness.github.set_pipeline(
+        &repo(),
+        "main",
+        "version: 1\nsteps:\n  review: { uses: nobody }\ngate: [review]\n",
+    );
+    client.refresh().await;
+    client
+        .until("the PR to show the block", |c| c.pr().blocked.is_some())
+        .await;
+    assert_eq!(client.history(), [first]);
+
+    harness.github.add_pipeline(&repo(), "main");
+    client.refresh().await;
+    client
+        .until("the block to clear", |c| c.pr().blocked.is_none())
+        .await;
+    assert_eq!(
+        client.history(),
+        [first],
+        "the Pipeline is the one the latest Run read"
+    );
+}
+
+#[tokio::test]
+async fn an_errored_outcome_runs_again_in_the_next_run() {
+    let harness = harness();
+    let (mut client, first) = first_run(&harness).await;
+    let active = harness.store.active_runs().unwrap();
+    let ci = &active[0].steps[0];
+    let slopwatch_daemon::store::StepRowState::Running { pgid, .. } = ci.state else {
+        panic!("ci runs: {ci:?}");
+    };
+    std::process::Command::new("kill")
+        .args(["-KILL", &pgid.to_string()])
+        .status()
+        .unwrap();
+    client
+        .until("the first Run to end", |c| ended(c, first))
+        .await;
+    assert_eq!(client.settled(first, "ci").0, Verdict::Error);
+
+    pass_checks(&harness, 1);
+    harness
+        .github
+        .set_pipeline(&repo(), "main", &ci_and_lint("lint"));
+    client.refresh().await;
+    let second = client.next_run_ends(1, first).await;
+
+    assert_eq!(client.settled(second, "ci"), (Verdict::Pass, None));
+    assert_eq!(started_steps(&harness.store, second), ["ci", "lint"]);
+}
+
+#[tokio::test]
+async fn a_pr_waiting_for_a_pipeline_starts_its_first_run_once_it_lands() {
+    let github = Arc::new(FakeGitHub::new("me"));
+    github.add_repo(&repo());
+    github.open_pr(&repo(), 1, "me", "Add the thing");
+    github.label_on_github(&repo(), 1, true);
+    let store = Store::in_memory();
+    let data = tempfile::tempdir().unwrap();
+    let daemon = daemon(&github, &store, &data);
+    let mut client = Client::connect(&daemon).await;
+    client.ok(Command::AddRepo { repo: repo() }).await;
+    assert!(client.history().is_empty());
+
+    github.add_pipeline(&repo(), "main");
+    client.refresh().await;
+
+    client
+        .until("the first Run", |c| c.history().len() == 1)
+        .await;
+    let run = client.history()[0];
+    client.subscribe(run, None).await;
+    assert_eq!(*client.ci(run), StepStatus::Running);
+}
+
+#[tokio::test]
+async fn a_run_still_going_isnt_interrupted_by_a_pipeline_change() {
+    let harness = harness();
+    let (mut client, first) = first_run(&harness).await;
+
+    harness
+        .github
+        .set_pipeline(&repo(), "main", &ci_and_lint("lint"));
+    client.refresh().await;
+
+    assert_eq!(client.history(), [first]);
+    assert_eq!(*client.ci(first), StepStatus::Running);
+    let steps: Vec<&str> = client
+        .run(first)
+        .steps
+        .iter()
+        .map(|s| s.info.id.as_str())
+        .collect();
+    assert_eq!(steps, ["ci"], "the Run keeps the Pipeline it started with");
+
+    // Once it ends, the new Pipeline judges the PR, reusing what it can.
+    pass_checks(&harness, 1);
+    client.refresh().await;
+    client
+        .until("the first Run to end", |c| ended(c, first))
+        .await;
+    assert_eq!(client.run(first).end, Some(EndReason::Shippable));
+    client.refresh().await;
+    let second = client.next_run_ends(1, first).await;
+    assert_eq!(client.settled(second, "ci"), (Verdict::Pass, Some(first)));
+    assert_eq!(started_steps(&harness.store, second), ["lint"]);
+}

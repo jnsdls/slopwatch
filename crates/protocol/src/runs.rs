@@ -53,6 +53,10 @@ pub enum RunEvent {
         reason: Option<String>,
         #[serde(default)]
         outputs: Outputs,
+        /// The earlier Run on the same head SHA whose Outcome this is. The
+        /// Step didn't run in this Run (ADR 0007).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reused_from: Option<RunId>,
     },
     Gate {
         state: GateState,
@@ -102,6 +106,7 @@ pub enum StepStatus {
         verdict: Verdict,
         reason: Option<String>,
         outputs: Outputs,
+        reused_from: Option<RunId>,
     },
 }
 
@@ -148,12 +153,14 @@ impl RunView {
                 verdict,
                 reason,
                 outputs,
+                reused_from,
             } => {
                 if let Some(view) = self.step_mut(&step) {
                     view.status = StepStatus::Settled {
                         verdict,
                         reason,
                         outputs,
+                        reused_from,
                     };
                 }
             }
@@ -218,6 +225,7 @@ mod tests {
                 verdict: Verdict::Pass,
                 reason: None,
                 outputs: Outputs::default(),
+                reused_from: None,
             },
         );
         view.apply(
@@ -276,5 +284,30 @@ mod tests {
             serde_json::to_value(&event).unwrap(),
             json!({ "kind": "ended", "reason": "not_shippable" })
         );
+    }
+
+    #[test]
+    fn a_reused_outcome_names_its_run_and_an_older_event_reads_as_not_reused() {
+        let event = RunEvent::StepSettled {
+            step: "ci".into(),
+            verdict: Verdict::Pass,
+            reason: None,
+            outputs: Outputs::default(),
+            reused_from: Some(RunId(3)),
+        };
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["reused_from"], json!(3));
+
+        let older: RunEvent = serde_json::from_value(
+            json!({ "kind": "step_settled", "step": "ci", "verdict": "pass" }),
+        )
+        .unwrap();
+        assert!(matches!(
+            older,
+            RunEvent::StepSettled {
+                reused_from: None,
+                ..
+            }
+        ));
     }
 }

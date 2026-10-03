@@ -6,6 +6,13 @@
 //! one (ADR 0001). The Run reads the Pipeline from the PR's root base in
 //! the daemon's own clone and records that base SHA (ADR 0007).
 //!
+//! When the Pipeline on the base changes, a PR whose latest Run has ended
+//! gets a new Run on the same SHA. A Step about to start first looks for
+//! an earlier Outcome on that SHA under the same reuse key and takes it
+//! instead of running, unless its Verdict was error, cancelled, missing or
+//! skipped. A Run still going keeps its Pipeline; the change reaches the PR
+//! once it ends.
+//!
 //! Within a Run, core's [`Pipeline::plan`] decides what happens next, and
 //! the engine carries it out: it spawns each Step that may start as its own
 //! process (ADR 0003), marks skips, and ends the Run once every Step has
@@ -95,6 +102,7 @@ impl Runs {
                 .map(|(repo, pr)| (repo, pr.number))
                 .collect(),
             blocked: HashMap::new(),
+            checked_base: HashMap::new(),
             stopped: false,
         };
         engine.load()?;
@@ -130,9 +138,9 @@ impl Runs {
             let prs = engine.watching.prs();
             engine.sync(prs)
         };
-        for (repo, pr) in starts {
+        for (repo, pr, when) in starts {
             let read = self.read_pipeline(&repo, &pr.base).await;
-            self.engine.lock().await.start_run(&repo, &pr, read);
+            self.engine.lock().await.start_run(&repo, &pr, when, read);
         }
         let engine = self.engine.lock().await;
         self.live
@@ -207,8 +215,22 @@ struct Engine {
     watched: HashSet<PrKey>,
     /// Why a PR's next Run can't start.
     blocked: HashMap<PrKey, Blocked>,
+    /// The base SHA whose Pipeline each PR's latest Run was last compared
+    /// with, so a base commit that leaves the Pipeline alone is read once.
+    checked_base: HashMap<PrKey, String>,
     /// The daemon is about to exit: nothing more changes.
     stopped: bool,
+}
+
+/// When a PR the sync picked gets its new Run.
+#[derive(Debug, Clone)]
+enum StartWhen {
+    /// Always: the PR has a new head or was just watched.
+    Always,
+    /// Only if the Pipeline on its base differs from `from`, the text its
+    /// latest Run, now ended, read. The new Run is on the same SHA (ADR
+    /// 0007).
+    PipelineChanged { from: String },
 }
 
 struct Blocked {
@@ -367,6 +389,7 @@ impl Engine {
                     verdict: Verdict::Error,
                     reason: Some(reason.to_owned()),
                     outputs: Outputs::default(),
+                    reused_from: None,
                 },
             )?;
         }
@@ -379,8 +402,8 @@ impl Engine {
     }
 
     /// Ends the Runs the poll says are over, passes PR updates to running
-    /// Steps, and returns the PRs that need a new Run.
-    fn sync(&mut self, prs: Vec<(RepoName, OpenPr)>) -> Vec<(RepoName, OpenPr)> {
+    /// Steps, and returns the PRs that may need a new Run.
+    fn sync(&mut self, prs: Vec<(RepoName, OpenPr)>) -> Vec<(RepoName, OpenPr, StartWhen)> {
         if self.stopped {
             return Vec::new();
         }
@@ -393,7 +416,7 @@ impl Engine {
     fn try_sync(
         &mut self,
         prs: Vec<(RepoName, OpenPr)>,
-    ) -> Result<Vec<(RepoName, OpenPr)>, StoreError> {
+    ) -> Result<Vec<(RepoName, OpenPr, StartWhen)>, StoreError> {
         let open: BTreeMap<PrKey, (RepoName, OpenPr)> = prs
             .into_iter()
             .map(|(repo, pr)| ((repo.clone(), pr.number), (repo, pr)))
@@ -448,18 +471,36 @@ impl Engine {
             if !pr.base_has_pipeline || self.active.contains_key(key) {
                 continue;
             }
-            let newly_watched = !self.watched.contains(key);
-            let latest = self.store.run_summaries(repo, pr.number, 1)?;
-            let new_head = latest.first().is_none_or(|run| run.head_sha != pr.head_sha);
             let still_invalid = self
                 .blocked
                 .get(key)
                 .and_then(|blocked| blocked.invalid_at.as_ref())
                 .is_some_and(|sha| *sha == pr.detail.base_sha);
-            if (newly_watched || new_head) && !still_invalid {
-                starts.push((repo.clone(), pr.clone()));
+            if still_invalid {
+                continue;
             }
+            let newly_watched = !self.watched.contains(key);
+            let latest = self.store.latest_run(repo, pr.number)?;
+            let when = match latest {
+                Some(run) if !newly_watched && run.head_sha == pr.head_sha => {
+                    // The base moved since the latest Run read it, so its
+                    // Pipeline may have changed. An empty SHA is a PR no
+                    // poll has seen yet.
+                    let base_sha = &pr.detail.base_sha;
+                    let base_moved = !base_sha.is_empty()
+                        && run.base_sha != *base_sha
+                        && self.checked_base.get(key) != Some(base_sha);
+                    if !base_moved {
+                        continue;
+                    }
+                    StartWhen::PipelineChanged { from: run.pipeline }
+                }
+                _ => StartWhen::Always,
+            };
+            starts.push((repo.clone(), pr.clone(), when));
         }
+        self.checked_base
+            .retain(|key, _| open.get(key).is_some_and(|(_, pr)| pr.labeled));
         self.watched = open
             .into_iter()
             .filter(|(_, (_, pr))| pr.labeled)
@@ -471,11 +512,17 @@ impl Engine {
     /// Starts a Run on the PR's head, with the Pipeline from its root
     /// base. A Stack's root base comes with Stacks; until then it's the
     /// PR's own base.
-    fn start_run(&mut self, repo: &RepoName, pr: &OpenPr, read: Result<PipelineAt, String>) {
+    fn start_run(
+        &mut self,
+        repo: &RepoName,
+        pr: &OpenPr,
+        when: StartWhen,
+        read: Result<PipelineAt, String>,
+    ) {
         if self.stopped {
             return;
         }
-        if let Err(error) = self.try_start_run(repo, pr, read) {
+        if let Err(error) = self.try_start_run(repo, pr, when, read) {
             eprintln!(
                 "slopwatchd: can't start a Run on {repo}#{}: {error}",
                 pr.number
@@ -487,6 +534,7 @@ impl Engine {
         &mut self,
         repo: &RepoName,
         pr: &OpenPr,
+        when: StartWhen,
         read: Result<PipelineAt, String>,
     ) -> Result<(), StoreError> {
         let key = (repo.clone(), pr.number);
@@ -495,9 +543,15 @@ impl Engine {
             return Ok(());
         }
         let base = &pr.base;
-        let read = match read {
-            Ok(read) => read,
-            Err(error) => {
+        let read = match (read, &when) {
+            (Ok(read), _) => read,
+            // The PR's latest Run stands, so nothing blocks it. The next
+            // sync tries again.
+            (Err(error), StartWhen::PipelineChanged { .. }) => {
+                eprintln!("slopwatchd: can't read the Pipeline on {repo} {base}: {error}");
+                return Ok(());
+            }
+            (Err(error), StartWhen::Always) => {
                 let message = format!("Can't read the Pipeline on {base}: {error}");
                 return self.block(&key, None, message);
             }
@@ -507,6 +561,17 @@ impl Engine {
             // catches up.
             return Ok(());
         };
+        if let StartWhen::PipelineChanged { from } = &when {
+            self.checked_base
+                .insert(key.clone(), pr.detail.base_sha.clone());
+            if *from == text {
+                // A Pipeline that was invalid and is now back as it was.
+                if self.blocked.remove(&key).is_some() {
+                    self.publish(repo, pr.number)?;
+                }
+                return Ok(());
+            }
+        }
         let pipeline = match load(&text, &self.plugins) {
             Ok(pipeline) => pipeline,
             Err(errors) => {
@@ -631,18 +696,33 @@ impl Engine {
         if run.snapshot.is_none() {
             return Ok(());
         }
-        let plan = run.pipeline.plan(&run.state);
-        for (step, decision) in plan.decisions {
-            match decision {
-                slopwatch_core::Decision::Start => self.start_step(key, &step)?,
-                slopwatch_core::Decision::Skip(reason) => self.settle(
-                    key,
-                    &step,
-                    Verdict::Skipped,
-                    Some(reason.to_string()),
-                    Outputs::default(),
-                )?,
-                slopwatch_core::Decision::Wait => {}
+        // A Step that settles as it starts, reused or unable to spawn, needs
+        // another plan for the Steps after it.
+        let mut replan = true;
+        while replan {
+            replan = false;
+            let run = &self.active[key];
+            let plan = run.pipeline.plan(&run.state);
+            for (step, decision) in plan.decisions {
+                match decision {
+                    slopwatch_core::Decision::Start => {
+                        if !self.reuse(key, &step)? {
+                            self.start_step(key, &step)?;
+                        }
+                        replan |= matches!(
+                            self.active[key].state.steps.get(&step),
+                            Some(StepState::Settled(_))
+                        );
+                    }
+                    slopwatch_core::Decision::Skip(reason) => self.settle(
+                        key,
+                        &step,
+                        Verdict::Skipped,
+                        Some(reason.to_string()),
+                        Outputs::default(),
+                    )?,
+                    slopwatch_core::Decision::Wait => {}
+                }
             }
         }
 
@@ -691,6 +771,9 @@ impl Engine {
             );
         };
 
+        // Taken before the spawn, so a rebuild in between makes the
+        // Outcome harder to reuse, never easier.
+        let version = self.plugins.version(&step.plugin);
         let dir = step_dir(&self.data_dir, run.id, step_id);
         let log = self
             .data_dir
@@ -760,6 +843,9 @@ impl Engine {
             },
         )?;
         run.interrupted.remove(step_id);
+        if let Some(version) = &version {
+            self.store.set_plugin_version(run.id, step_id, version)?;
+        }
         run.state
             .steps
             .insert(step_id.to_owned(), StepState::Running);
@@ -780,6 +866,38 @@ impl Engine {
         Ok(())
     }
 
+    /// Settles the Step with an earlier same-SHA Run's Outcome under the
+    /// same reuse key, if there is one it may take (ADR 0007). Returns
+    /// whether it did.
+    fn reuse(&mut self, key: &PrKey, step_id: &str) -> Result<bool, StoreError> {
+        let run = &self.active[key];
+        let step = run
+            .pipeline
+            .step(step_id)
+            .expect("the plan names Pipeline Steps");
+        let Some(version) = self.plugins.version(&step.plugin) else {
+            return Ok(false);
+        };
+        let reuse_key = step.reuse_key(&run.head_sha, &version);
+        let Some(reused) = self
+            .store
+            .reusable_outcome(&run.repo, run.number, &reuse_key, run.id)?
+        else {
+            return Ok(false);
+        };
+        let id = run.id;
+        self.store.put_reused_step(id, &reuse_key, &reused)?;
+        self.record_settled(
+            key,
+            step_id,
+            reused.verdict,
+            reused.reason,
+            reused.outputs,
+            Some(reused.run),
+        )?;
+        Ok(true)
+    }
+
     /// Records a Step's Verdict. Its process, if it still runs, is
     /// cancelled when its handle drops.
     fn settle(
@@ -790,11 +908,36 @@ impl Engine {
         reason: Option<String>,
         outputs: Outputs,
     ) -> Result<(), StoreError> {
+        let run = &self.active[key];
+        self.store.put_step(
+            run.id,
+            &StepRow {
+                step: step.to_owned(),
+                state: StepRowState::Settled {
+                    verdict,
+                    reason: reason.clone(),
+                    outputs: outputs.clone(),
+                },
+                attempt: run.attempts.get(step).copied().unwrap_or(0),
+            },
+        )?;
+        self.record_settled(key, step, verdict, reason, outputs, None)
+    }
+
+    /// Puts a Verdict the store already has into the Run and its journal.
+    fn record_settled(
+        &mut self,
+        key: &PrKey,
+        step: &str,
+        verdict: Verdict,
+        reason: Option<String>,
+        outputs: Outputs,
+        reused_from: Option<RunId>,
+    ) -> Result<(), StoreError> {
         let run = self
             .active
             .get_mut(key)
             .expect("only active Runs settle Steps");
-        let attempt = run.attempts.get(step).copied().unwrap_or(0);
         run.state
             .steps
             .insert(step.to_owned(), StepState::Settled(verdict));
@@ -809,18 +952,6 @@ impl Engine {
             running.reported = true;
         }
         run.interrupted.remove(step);
-        self.store.put_step(
-            run.id,
-            &StepRow {
-                step: step.to_owned(),
-                state: StepRowState::Settled {
-                    verdict,
-                    reason: reason.clone(),
-                    outputs: outputs.clone(),
-                },
-                attempt,
-            },
-        )?;
         self.journal.append(
             run.id,
             RunEvent::StepSettled {
@@ -828,6 +959,7 @@ impl Engine {
                 verdict,
                 reason,
                 outputs,
+                reused_from,
             },
         )?;
         Ok(())
@@ -960,6 +1092,7 @@ impl Engine {
                     verdict: Verdict::Cancelled,
                     reason: Some(format!("the Run ended {reason}")),
                     outputs: Outputs::default(),
+                    reused_from: None,
                 },
             )?;
         }
