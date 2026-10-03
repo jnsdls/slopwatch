@@ -2,8 +2,8 @@
 //! `~/.config/slopwatch/steps/<name>.yml`, on the daemon's machine.
 //!
 //! Pipelines reference Library Steps live, so [`Library::step`] reads the
-//! file each time it's asked, and a saved edit reaches the next load of
-//! every Pipeline that uses the Step.
+//! file each time it's asked. A Pipeline's resolver calls it, so a saved
+//! edit reaches the next load of every Pipeline that uses the Step.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -41,11 +41,11 @@ impl fmt::Display for LibraryError {
         match self {
             LibraryError::BadName(name) => write!(
                 f,
-                "`{name}` can't name a Library Step; use letters, digits, `-` and `_`"
+                "`{name}` can't name a Library Step; use lowercase letters, digits, `-` and `_`"
             ),
             LibraryError::Invalid(message) => f.write_str(message),
             LibraryError::NotFound(name) => write!(f, "There's no Library Step `{name}`"),
-            LibraryError::Io(error) => write!(f, "Can't write the Library: {error}"),
+            LibraryError::Io(error) => write!(f, "Can't read or write the Library: {error}"),
         }
     }
 }
@@ -148,21 +148,16 @@ impl Library {
 
     /// Creates or replaces the Library Step `name`, if `text` would load.
     pub fn save(&self, name: &str, text: &str) -> Result<(), LibraryError> {
-        if !is_library_step_name(name) {
-            return Err(LibraryError::BadName(name.to_owned()));
-        }
+        let path = self.checked_path(name)?;
         check_library_step(text).map_err(|message| {
             LibraryError::Invalid(format!("Library Step `{name}` is invalid: {message}"))
         })?;
-        write_atomically(&self.path(name), text)?;
+        write_atomically(&path, text)?;
         Ok(())
     }
 
     pub fn delete(&self, name: &str) -> Result<(), LibraryError> {
-        if !is_library_step_name(name) {
-            return Err(LibraryError::BadName(name.to_owned()));
-        }
-        match std::fs::remove_file(self.path(name)) {
+        match std::fs::remove_file(self.checked_path(name)?) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 Err(LibraryError::NotFound(name.to_owned()))
@@ -173,6 +168,14 @@ impl Library {
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(format!("{name}.{EXTENSION}"))
+    }
+
+    fn checked_path(&self, name: &str) -> Result<PathBuf, LibraryError> {
+        if is_library_step_name(name) {
+            Ok(self.path(name))
+        } else {
+            Err(LibraryError::BadName(name.to_owned()))
+        }
     }
 }
 

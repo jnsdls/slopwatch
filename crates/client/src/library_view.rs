@@ -12,10 +12,10 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Command, LibraryStep};
 
-use crate::library::{Library, NEW_STEP_TEXT};
+use crate::library::{LibraryEditor, NEW_STEP_TEXT};
 
 pub struct LibraryView {
-    library: Library,
+    library: LibraryEditor,
     editor: Entity<TextareaState>,
     new_name: Entity<InputState>,
     /// Text for the editor that arrived outside a render. Rendering puts it
@@ -47,7 +47,7 @@ impl LibraryView {
             ),
         ];
         Self {
-            library: Library::default(),
+            library: LibraryEditor::default(),
             editor,
             new_name,
             replace_with: None,

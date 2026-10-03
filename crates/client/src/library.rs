@@ -9,7 +9,7 @@ use slopwatch_protocol::LibraryStep;
 pub const NEW_STEP_TEXT: &str = "# What this Step checks, and why.\nuses: jev\nwith: {}\n";
 
 #[derive(Debug, Default)]
-pub struct Library {
+pub struct LibraryEditor {
     /// `None` until the daemon first lists the Library.
     steps: Option<Vec<LibraryStep>>,
     open: Option<String>,
@@ -20,7 +20,7 @@ pub struct Library {
     pending: Option<String>,
 }
 
-impl Library {
+impl LibraryEditor {
     pub fn loaded(&self) -> bool {
         self.steps.is_some()
     }
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn the_first_listing_opens_the_first_step() {
-        let mut library = Library::default();
+        let mut library = LibraryEditor::default();
 
         assert_eq!(library.listed(presets(), ""), Some("uses: fix\n".into()));
         assert_eq!(library.open_step().unwrap().name, "claude-fix");
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn a_saved_edit_comes_back_without_touching_the_editor() {
-        let mut library = Library::default();
+        let mut library = LibraryEditor::default();
         library.listed(presets(), "");
         let edited = "uses: fix\nwith: { agent: codex }\n";
 
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn a_refused_save_keeps_the_unsaved_edits() {
-        let mut library = Library::default();
+        let mut library = LibraryEditor::default();
         library.listed(presets(), "");
 
         assert_eq!(library.listed(presets(), "uses: lib/x\n"), None);
@@ -145,7 +145,7 @@ mod tests {
 
     #[test]
     fn a_change_from_elsewhere_reaches_an_editor_without_edits() {
-        let mut library = Library::default();
+        let mut library = LibraryEditor::default();
         library.listed(presets(), "");
 
         let changed = vec![step("claude-fix", "uses: fix\n# changed\n")];
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn a_created_step_opens_once_listed() {
-        let mut library = Library::default();
+        let mut library = LibraryEditor::default();
         library.listed(presets(), "");
         library.open_when_listed("docs-check");
         let mut steps = presets();
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn deleting_the_open_step_opens_the_first_one_left() {
-        let mut library = Library::default();
+        let mut library = LibraryEditor::default();
         library.listed(presets(), "");
         library.open("claude-review");
 
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn an_empty_library_opens_nothing() {
-        let mut library = Library::default();
+        let mut library = LibraryEditor::default();
 
         assert_eq!(library.listed(Vec::new(), ""), None);
         assert!(library.loaded());

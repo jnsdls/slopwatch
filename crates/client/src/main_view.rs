@@ -98,6 +98,15 @@ impl MainView {
         let _ = self.commands.send(command);
     }
 
+    fn show_prs(&mut self, source: Source) {
+        self.pane = Pane::Prs;
+        self.prs.source = source;
+    }
+
+    fn showing(&self, source: &Source) -> bool {
+        self.pane == Pane::Prs && &self.prs.source == source
+    }
+
     fn sources(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let entry = |id: SharedString, label: String, count: Option<usize>, selected: bool| {
@@ -136,11 +145,10 @@ impl MainView {
                     "source-all".into(),
                     "All PRs".to_owned(),
                     None,
-                    self.pane == Pane::Prs && self.prs.source == Source::All,
+                    self.showing(&Source::All),
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.pane = Pane::Prs;
-                    this.prs.source = Source::All;
+                    this.show_prs(Source::All);
                     cx.notify();
                 })),
             )
@@ -167,7 +175,7 @@ impl MainView {
             );
 
         for repo in self.prs.repos() {
-            let selected = self.pane == Pane::Prs && self.prs.source == Source::Repo(repo.clone());
+            let selected = self.showing(&Source::Repo(repo.clone()));
             let chosen = repo.clone();
             pane = pane.child(
                 entry(
@@ -177,8 +185,7 @@ impl MainView {
                     selected,
                 )
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.pane = Pane::Prs;
-                    this.prs.source = Source::Repo(chosen.clone());
+                    this.show_prs(Source::Repo(chosen.clone()));
                     cx.notify();
                 })),
             );
@@ -232,8 +239,7 @@ impl MainView {
                                 this.send(Command::AddRepo {
                                     repo: chosen.clone(),
                                 });
-                                this.pane = Pane::Prs;
-                                this.prs.source = Source::Repo(chosen.clone());
+                                this.show_prs(Source::Repo(chosen.clone()));
                                 this.picker = None;
                                 cx.notify();
                             })),

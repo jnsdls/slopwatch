@@ -101,11 +101,20 @@ fn a_library_step_writes_durations_the_pipeline_way() {
 
 #[test]
 fn a_library_step_name_is_one_plain_path_segment() {
-    for good in ["claude-review", "my_step2", "A1"] {
+    for good in ["claude-review", "my_step2", "2fa"] {
         assert!(is_library_step_name(good), "{good}");
     }
     for bad in [
-        "", ".hidden", "-x", "_x", "a/b", "..", "../x", "a b", "a.yml",
+        "",
+        ".hidden",
+        "-x",
+        "_x",
+        "Claude-Review",
+        "a/b",
+        "..",
+        "../x",
+        "a b",
+        "a.yml",
     ] {
         assert!(!is_library_step_name(bad), "{bad}");
     }

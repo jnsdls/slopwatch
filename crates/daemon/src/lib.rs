@@ -10,7 +10,7 @@
 //! it reaches only through the [`github::GitHub`] trait.
 //!
 //! [`Library`] holds the developer's Library Steps, which clients list and
-//! edit, and which Pipelines resolve live.
+//! edit, and which a Pipeline's resolver reads live.
 
 pub mod auth;
 mod connection;

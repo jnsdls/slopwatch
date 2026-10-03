@@ -3,7 +3,6 @@
 # `[pass, skipped]`. Needs the AI_GATEWAY_API_KEY Secret.
 uses: jev
 with:
-  requires: linked_issue
   questions:
     - id: resolves-issue
       question: Does the diff do what the linked issue asks for?

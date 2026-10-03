@@ -5,5 +5,4 @@
 uses: fix
 with:
   agent: claude
-  model: opus
   auth: subscription

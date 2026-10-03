@@ -52,8 +52,8 @@ pub(crate) struct LibraryFile {
     pub stall_after: Option<String>,
 }
 
-/// Parses a Library Step file. The error reads after "Library Step `x` is
-/// invalid: ".
+/// Parses a Library Step file. The error says what's wrong, without naming
+/// the Step.
 pub(crate) fn parse(text: &str) -> Result<LibraryFile, String> {
     let library: LibraryFile = serde_saphyr::from_str(text).map_err(|e| e.to_string())?;
     if library.uses.starts_with("lib/") {
@@ -66,8 +66,8 @@ pub(crate) fn parse(text: &str) -> Result<LibraryFile, String> {
 }
 
 /// Checks a Library Step's text the way loading a Pipeline that uses it
-/// would, short of the Plugin being installed. The error reads after
-/// "Library Step `x` is invalid: ".
+/// would, short of the Plugin being installed. The error says what's
+/// wrong, without naming the Step.
 pub fn check_library_step(text: &str) -> Result<(), String> {
     let library = parse(text)?;
     for (key, value) in [
@@ -85,12 +85,11 @@ pub fn check_library_step(text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `name` can name a Library Step: ASCII letters, digits, `-` and
-/// `_`, starting with a letter or digit. That keeps `lib/<name>` to one
-/// plain file in the Library, whatever a Pipeline writes.
+/// Whether `name` can name a Library Step: lowercase ASCII letters, digits,
+/// `-` and `_`, starting with a letter or digit. That keeps `lib/<name>` to
+/// one plain file in the Library whatever a Pipeline writes, and two names
+/// can't land on the same file on a case-insensitive disk.
 pub fn is_library_step_name(name: &str) -> bool {
-    name.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    let plain = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    name.starts_with(plain) && name.chars().all(|c| plain(c) || c == '-' || c == '_')
 }

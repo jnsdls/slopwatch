@@ -24,7 +24,5 @@ tempfile.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 
-[dev-dependencies]
-
 [lints]
 workspace = true

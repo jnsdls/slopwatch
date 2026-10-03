@@ -156,14 +156,15 @@ pub enum Command {
     /// Every Step in the developer's Library, by name.
     ListLibrarySteps,
     /// Creates or replaces the Library Step `step` with `text`, the whole
-    /// file. The daemon refuses text that wouldn't load. The next Run of
-    /// every Pipeline that uses the Step reads the new text.
+    /// file. The daemon refuses text that wouldn't load. Pipelines resolve
+    /// Library Steps when they load, so every one that uses the Step gets
+    /// the new text from its next load on.
     SaveLibraryStep {
         step: String,
         text: String,
     },
-    /// Removes the Library Step `step`. Pipelines that use it stop loading
-    /// until it's back.
+    /// Removes the Library Step `step`. A Pipeline that uses it fails to
+    /// load, naming it, until it's back.
     DeleteLibraryStep {
         step: String,
     },
