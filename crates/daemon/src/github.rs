@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use slopwatch_protocol::RepoName;
-use slopwatch_protocol::step::{Checks, MergeMethod, MergeState, UpdateMethod};
+use slopwatch_protocol::step::{Checks, LinkedIssue, MergeMethod, MergeState, UpdateMethod};
 
 /// The label that makes a PR a Watched PR.
 pub const WATCH_LABEL: &str = "slopwatch";
@@ -85,6 +85,14 @@ pub trait GitHub: Send + Sync {
         expected_head: &str,
         method: UpdateMethod,
     ) -> Result<(), GitHubError>;
+
+    /// The issues PR `number` closes when it merges, as GitHub links them
+    /// from its description or its sidebar.
+    async fn linked_issues(
+        &self,
+        repo: &RepoName,
+        number: u64,
+    ) -> Result<Vec<LinkedIssue>, GitHubError>;
 
     /// Where git fetches `repo` from, with what authenticates it.
     async fn git_remote(&self, repo: &RepoName) -> Result<GitRemote, GitHubError>;

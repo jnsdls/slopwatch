@@ -10,7 +10,8 @@ use serde_json::{Value, json};
 use slopwatch_protocol::RepoName;
 
 use slopwatch_protocol::step::{
-    Check, CheckState, Checks, ChecksState, MergeMethod, MergeState, MergeStatus, UpdateMethod,
+    Check, CheckState, Checks, ChecksState, LinkedIssue, MergeMethod, MergeState, MergeStatus,
+    UpdateMethod,
 };
 
 use super::{
@@ -231,6 +232,16 @@ impl GitHub for Api {
     async fn rerun_job(&self, repo: &RepoName, job: u64) -> Result<(), GitHubError> {
         let path = format!("/repos/{repo}/actions/jobs/{job}/rerun");
         self.rest(Method::POST, &path, None).await
+    }
+
+    async fn linked_issues(
+        &self,
+        repo: &RepoName,
+        number: u64,
+    ) -> Result<Vec<LinkedIssue>, GitHubError> {
+        let variables = json!({ "owner": repo.owner, "name": repo.name, "number": number });
+        let data = self.graphql(LINKED_ISSUES, variables).await?;
+        read_linked_issues(repo, number, data)
     }
 
     async fn merge_state(
@@ -499,6 +510,75 @@ query($owner: String!, $name: String!, $number: Int!, $head: String!) {
     }
   }
 }";
+
+/// The issues a PR closes. Ten is more than a PR links in practice; the
+/// rest are left out.
+const LINKED_ISSUES: &str = "
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      closingIssuesReferences(first: 10) {
+        nodes { number title body url repository { nameWithOwner } }
+      }
+    }
+  }
+}";
+
+fn read_linked_issues(
+    repo: &RepoName,
+    number: u64,
+    data: Value,
+) -> Result<Vec<LinkedIssue>, GitHubError> {
+    #[derive(Deserialize)]
+    struct Data {
+        repository: Option<Repo>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Repo {
+        pull_request: Option<Pr>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Pr {
+        closing_issues_references: Option<Nodes<Issue>>,
+    }
+    #[derive(Deserialize)]
+    struct Issue {
+        number: u64,
+        title: String,
+        #[serde(default)]
+        body: String,
+        url: String,
+        repository: IssueRepo,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct IssueRepo {
+        name_with_owner: String,
+    }
+    let data: Data = serde_json::from_value(data)
+        .map_err(|error| GitHubError::Other(format!("unreadable linked issues: {error}")))?;
+    let pr = data
+        .repository
+        .and_then(|repo| repo.pull_request)
+        .ok_or_else(|| GitHubError::NotFound(format!("{repo}#{number}")))?;
+    let issues = pr
+        .closing_issues_references
+        .map_or_else(Vec::new, |n| n.nodes);
+    Ok(issues
+        .into_iter()
+        .filter_map(|issue| {
+            Some(LinkedIssue {
+                repo: issue.repository.name_with_owner.parse().ok()?,
+                number: issue.number,
+                title: issue.title,
+                body: issue.body,
+                url: issue.url,
+            })
+        })
+        .collect())
+}
 
 const PR_ID: &str = "
 query($owner: String!, $name: String!, $number: Int!) {

@@ -14,7 +14,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use slopwatch_protocol::RepoName;
 use slopwatch_protocol::step::{
-    CheckState, Checks, ChecksState, MergeMethod, MergeState, MergeStatus, UpdateMethod,
+    CheckState, Checks, ChecksState, LinkedIssue, MergeMethod, MergeState, MergeStatus,
+    UpdateMethod,
 };
 
 use super::{
@@ -89,6 +90,7 @@ struct Pr {
     conflicts: bool,
     /// Something outside the Run, such as a missing review, blocks it.
     blocked: bool,
+    linked_issues: Vec<LinkedIssue>,
 }
 
 const LIMIT: u32 = 5000;
@@ -194,9 +196,16 @@ impl FakeGitHub {
                     in_merge_queue: false,
                     conflicts: false,
                     blocked: false,
+                    linked_issues: Vec::new(),
                 },
             );
         });
+    }
+
+    /// Links an issue the PR closes, as `Fixes #n` in its description
+    /// would.
+    pub fn link_issue(&self, repo: &RepoName, number: u64, issue: LinkedIssue) {
+        self.with(|state| state.pr(repo, number).linked_issues.push(issue));
     }
 
     pub fn close_pr(&self, repo: &RepoName, number: u64) {
@@ -719,6 +728,19 @@ impl GitHub for FakeGitHub {
             state.next_job += 1;
             state.reruns.push(job);
             Ok(())
+        })
+    }
+
+    async fn linked_issues(
+        &self,
+        repo: &RepoName,
+        number: u64,
+    ) -> Result<Vec<LinkedIssue>, GitHubError> {
+        self.with(|state| {
+            let not_found = || GitHubError::NotFound(format!("{repo}#{number}"));
+            let fake = state.repos.get(repo).ok_or_else(not_found)?;
+            let pr = fake.prs.get(&number).ok_or_else(not_found)?;
+            Ok(pr.linked_issues.clone())
         })
     }
 

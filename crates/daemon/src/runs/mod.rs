@@ -60,8 +60,8 @@ use slopwatch_core::{
     load, parse_duration,
 };
 use slopwatch_protocol::step::{
-    EffectKind, FromStep, MERGE_STATE, Manifest, MergeState, Outcome, Outputs, PrSnapshot, Start,
-    ToStep,
+    EffectKind, FromStep, LinkedIssue, MERGE_STATE, Manifest, MergeState, Outcome, Outputs,
+    PR_DIFF, PrSnapshot, Start, ToStep,
 };
 use slopwatch_protocol::{
     Actor, Answer, Cause, Closing, GateTerm, LogFilter, LogKey, LogPage, LogRecord, PrRef,
@@ -342,7 +342,8 @@ impl Runs {
 
     /// What a Run on the PR's head starts from: the Pipeline at the tip of
     /// its base, and the files the head changes, both from the repo's
-    /// clone.
+    /// clone, with the issues the PR links. The diff too, when a Step in
+    /// the Pipeline asks for it.
     async fn read_inputs(
         &self,
         repo: &RepoName,
@@ -369,6 +370,8 @@ impl Runs {
             return Ok(Inputs {
                 pipeline,
                 files: Vec::new(),
+                linked_issues: Vec::new(),
+                diff: None,
             });
         }
         let files = self
@@ -376,7 +379,34 @@ impl Runs {
             .changed_files(repo, &remote, pr.number, &pipeline.sha, &pr.head_sha)
             .await
             .map_err(|error| format!("can't list the files the PR changes: {error}"))?;
-        Ok(Inputs { pipeline, files })
+        let linked_issues = self
+            .github
+            .linked_issues(repo, pr.number)
+            .await
+            .map_err(|error| format!("can't read the issues the PR links: {error}"))?;
+        let text = pipeline.text.as_deref().unwrap_or_default();
+        let diff = if self.engine.lock().await.wants_diff(text) {
+            let path = diff_path(&self.data_dir, repo, pr.number, &pipeline.sha, &pr.head_sha);
+            if !path.exists() {
+                let diff = self
+                    .clones
+                    .diff(repo, &remote, pr.number, &pipeline.sha, &pr.head_sha)
+                    .await
+                    .map_err(|error| format!("can't read the PR's diff: {error}"))?;
+                write_diff(&path, diff)
+                    .await
+                    .map_err(|error| format!("can't keep the PR's diff: {error}"))?;
+            }
+            Some(path)
+        } else {
+            None
+        };
+        Ok(Inputs {
+            pipeline,
+            files,
+            linked_issues,
+            diff,
+        })
     }
 
     /// Ends a Run that's still going as cancelled.
@@ -696,6 +726,24 @@ enum StartWhen {
 struct Inputs {
     pipeline: PipelineAt,
     files: Vec<String>,
+    linked_issues: Vec<LinkedIssue>,
+    diff: Option<PathBuf>,
+}
+
+/// What a Run's snapshot carries besides what the poll reads, fixed when
+/// the Run starts.
+#[derive(Debug, Clone, Default)]
+struct Evidence {
+    linked_issues: Vec<LinkedIssue>,
+    /// The diff file, when a Step in the Pipeline asks for it.
+    diff: Option<PathBuf>,
+}
+
+impl Evidence {
+    fn fill(&self, snapshot: &mut PrSnapshot) {
+        snapshot.linked_issues.clone_from(&self.linked_issues);
+        snapshot.diff.clone_from(&self.diff);
+    }
 }
 
 struct Blocked {
@@ -728,6 +776,7 @@ struct Active {
     snapshot: Option<PrSnapshot>,
     /// The paths the head changes, for `files:` Conditions.
     files: Vec<String>,
+    evidence: Evidence,
     /// Steps the developer's retry reset. They run again rather than take
     /// an earlier Run's Outcome.
     rerun: HashSet<String>,
@@ -913,12 +962,22 @@ impl Engine {
                 id: stored.id,
                 repo: stored.repo.clone(),
                 number: stored.number,
-                head_sha: stored.head_sha,
+                head_sha: stored.head_sha.clone(),
                 pipeline,
                 state: RunState::default(),
                 gate: stored.gate,
                 snapshot: None,
                 files: stored.files,
+                evidence: Evidence {
+                    diff: kept_diff(
+                        &self.data_dir,
+                        &stored.repo,
+                        stored.number,
+                        &stored.base_sha,
+                        &stored.head_sha,
+                    ),
+                    linked_issues: stored.linked_issues,
+                },
                 outcomes: HashMap::new(),
                 reasons: HashMap::new(),
                 attempts: HashMap::new(),
@@ -1041,6 +1100,18 @@ impl Engine {
     /// their Run judges: those with a running Step that reads it, and those
     /// that left the poll after their Run asked to merge them, which may
     /// mean GitHub merged them.
+    /// Whether a Step in the Pipeline `text` asks for the PR's diff
+    /// ([`PR_DIFF`]). A Pipeline that doesn't load asks for nothing.
+    fn wants_diff(&self, text: &str) -> bool {
+        load(text, &self.plugins).is_ok_and(|pipeline| {
+            pipeline.steps().any(|step| {
+                self.plugins
+                    .manifest(&step.plugin)
+                    .is_some_and(|manifest| manifest.features.iter().any(|f| f == PR_DIFF))
+            })
+        })
+    }
+
     fn merge_states_wanted(&self, prs: &[(RepoName, OpenPr)]) -> Vec<(PrKey, MergeRead)> {
         let open: HashSet<PrKey> = prs
             .iter()
@@ -1127,6 +1198,7 @@ impl Engine {
             let (repo, pr) = &open[&key];
             let mut snapshot = snapshot(repo, pr);
             let run = self.active.get_mut(&key).expect("listed above");
+            run.evidence.fill(&mut snapshot);
             // A merge state read this time replaces the last one, which
             // stays until then.
             snapshot.merge = match merge_states.get(&key) {
@@ -1282,6 +1354,8 @@ impl Engine {
         let Inputs {
             pipeline: read,
             files,
+            linked_issues,
+            diff,
         } = match (read, &when) {
             (Ok(inputs), _) => inputs,
             // The PR's latest Run stands, so nothing blocks it. The next
@@ -1341,6 +1415,7 @@ impl Engine {
                 base_sha: &read.sha,
                 pipeline: &text,
                 files: &files,
+                linked_issues: &linked_issues,
                 steps: steps
                     .iter()
                     .map(|step| NewStep {
@@ -1369,7 +1444,12 @@ impl Engine {
         self.inbox
             .close_pr(&pr_ref(repo, pr.number), Closing::NextRunStarted)?;
 
-        let snapshot = snapshot(repo, pr);
+        let evidence = Evidence {
+            linked_issues,
+            diff,
+        };
+        let mut snapshot = snapshot(repo, pr);
+        evidence.fill(&mut snapshot);
         self.active.insert(
             key.clone(),
             Active {
@@ -1385,6 +1465,7 @@ impl Engine {
                 gate: GateState::Pending,
                 snapshot: Some(snapshot),
                 files,
+                evidence,
                 outcomes: HashMap::new(),
                 reasons: HashMap::new(),
                 attempts: HashMap::new(),
@@ -2021,6 +2102,12 @@ impl Engine {
             Report::Message(FromStep::Ask { prompt }) if !reported => {
                 self.on_ask(&key, &step, &prompt)?;
             }
+            // Usage counts even after a cancel: the call was made.
+            Report::Message(FromStep::Usage(usage)) => {
+                self.journal
+                    .append(report.run, RunEvent::StepUsage { step, usage })?;
+                return Ok(());
+            }
             Report::Message(FromStep::Progress {
                 message: Some(message),
             }) if !reported => {
@@ -2172,6 +2259,10 @@ impl Engine {
         // A cancelled Step's process may take a moment to go, and its
         // directory with it; the Run's own directory goes now.
         let _ = std::fs::remove_dir_all(run_dir(&self.data_dir, run.id));
+        // No Run judges a closed PR again, so its diff goes too.
+        if matches!(reason, EndReason::Closed | EndReason::Merged) {
+            let _ = std::fs::remove_dir_all(pr_diffs(&self.data_dir, &run.repo, run.number));
+        }
         self.inbox.run_ended(run.id)?;
         // A Run the developer cancelled, or one a push or close ended,
         // needs nothing from them.
@@ -2440,12 +2531,21 @@ impl Engine {
     /// same Steps settle the same way. If the base has a newer one, the
     /// next sync compares it as usual.
     fn start_same_sha(&mut self, stored: ActiveRun, pr: &OpenPr) -> Result<(), StoreError> {
+        let diff = kept_diff(
+            &self.data_dir,
+            &stored.repo,
+            stored.number,
+            &stored.base_sha,
+            &stored.head_sha,
+        );
         let inputs = Inputs {
             pipeline: PipelineAt {
                 sha: stored.base_sha,
                 text: Some(stored.pipeline),
             },
             files: stored.files,
+            linked_issues: stored.linked_issues,
+            diff,
         };
         self.try_start_run(&stored.repo, pr, StartWhen::Always, Ok(inputs))
     }
@@ -2774,7 +2874,58 @@ fn snapshot(repo: &RepoName, pr: &OpenPr) -> PrSnapshot {
         labels: pr.detail.labels.clone(),
         checks: pr.detail.checks.clone(),
         merge: None,
+        diff: None,
+        linked_issues: Vec::new(),
     }
+}
+
+/// Where the diff of PR `number` at `head_sha` against `base_sha` is kept.
+/// It belongs to the PR rather than one Run, so a same-SHA Run finds the
+/// diff its predecessor read, and the next new head replaces it.
+fn diff_path(
+    data_dir: &std::path::Path,
+    repo: &RepoName,
+    number: u64,
+    base_sha: &str,
+    head_sha: &str,
+) -> PathBuf {
+    pr_diffs(data_dir, repo, number).join(format!("{base_sha}-{head_sha}.diff"))
+}
+
+fn pr_diffs(data_dir: &std::path::Path, repo: &RepoName, number: u64) -> PathBuf {
+    data_dir
+        .join("diffs")
+        .join(&repo.owner)
+        .join(&repo.name)
+        .join(number.to_string())
+}
+
+/// The kept diff, if there is one.
+fn kept_diff(
+    data_dir: &std::path::Path,
+    repo: &RepoName,
+    number: u64,
+    base_sha: &str,
+    head_sha: &str,
+) -> Option<PathBuf> {
+    Some(diff_path(data_dir, repo, number, base_sha, head_sha)).filter(|path| path.exists())
+}
+
+/// Keeps `diff` at `path`, written whole before it shows up there, and
+/// drops the PR's older diffs.
+async fn write_diff(path: &std::path::Path, diff: String) -> std::io::Result<()> {
+    let dir = path.parent().expect("diff paths have a parent");
+    tokio::fs::create_dir_all(dir).await?;
+    let partial = path.with_extension("partial");
+    tokio::fs::write(&partial, diff).await?;
+    tokio::fs::rename(&partial, path).await?;
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.path() != path {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+    Ok(())
 }
 
 /// What Conditions can read about the PR: the snapshot, plus the files
@@ -2786,6 +2937,7 @@ fn facts(snapshot: &PrSnapshot, files: &[String]) -> PrFacts {
         base: snapshot.base.clone(),
         draft: snapshot.draft,
         author: snapshot.author.clone(),
+        linked_issue: !snapshot.linked_issues.is_empty(),
     }
 }
 

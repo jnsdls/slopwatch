@@ -14,6 +14,7 @@
 //! the Step log.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -155,6 +156,9 @@ pub enum FromStep {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    /// What one call to a model cost. A Step sends one per call, as it
+    /// goes, so usage before a cancel or a crash still counts.
+    Usage(Usage),
     /// A line for the Step log.
     Log {
         message: String,
@@ -175,6 +179,19 @@ pub enum FromStep {
     Ask { prompt: String },
     /// The Step's one Outcome. It exits after sending it.
     Outcome(Outcome),
+}
+
+/// What one model call used. `usd` is the list price when the provider
+/// reports it. Without it the cost is unknown, never zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub model: String,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usd: Option<f64>,
 }
 
 /// A change on GitHub that a Step asks for and the daemon carries out with
@@ -366,10 +383,34 @@ pub struct PrSnapshot {
     /// `None` until then, and for a while after such a Step starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge: Option<MergeState>,
+    /// A file holding the PR's unified diff against where it branched from
+    /// its base, at the Run's head SHA. The daemon writes it when the Run
+    /// starts, only if a Step in the Pipeline lists [`PR_DIFF`], since a
+    /// diff can run to megabytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<PathBuf>,
+    /// The issues the PR says it closes, as GitHub links them, read when
+    /// the Run starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_issues: Vec<LinkedIssue>,
 }
 
 /// The manifest feature that asks for [`PrSnapshot::merge`].
 pub const MERGE_STATE: &str = "merge_state";
+
+/// The manifest feature that asks for [`PrSnapshot::diff`].
+pub const PR_DIFF: &str = "pr_diff";
+
+/// An issue the PR closes when it merges.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedIssue {
+    /// The issue's repo, which can differ from the PR's.
+    pub repo: RepoName,
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub url: String,
+}
 
 /// What GitHub says about merging the PR at the Run's head SHA.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,6 +532,8 @@ mod tests {
                 labels: vec![],
                 checks: Checks::default(),
                 merge: None,
+                diff: None,
+                linked_issues: vec![],
             },
             upstream: BTreeMap::new(),
         });
@@ -518,6 +561,44 @@ mod tests {
         assert_eq!(outcome.verdict, Verdict::Fail);
         assert_eq!(outcome.outputs.findings[0].message, "test failed");
         assert_eq!(outcome.outputs.findings[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn usage_reads_with_or_without_a_price() {
+        let priced =
+            r#"{"type":"usage","model":"typesafe-ai/jev","input_tokens":303,"usd":0.0000127}"#;
+        let unpriced = r#"{"type":"usage","model":"gpt-5","input_tokens":10,"output_tokens":4}"#;
+
+        let FromStep::Usage(priced) = serde_json::from_str(priced).unwrap() else {
+            panic!("expected usage");
+        };
+        let FromStep::Usage(unpriced) = serde_json::from_str(unpriced).unwrap() else {
+            panic!("expected usage");
+        };
+
+        assert_eq!(priced.usd, Some(0.0000127));
+        assert_eq!(priced.output_tokens, 0);
+        assert_eq!(unpriced.usd, None);
+        assert_eq!(unpriced.output_tokens, 4);
+    }
+
+    #[test]
+    fn a_snapshot_carries_the_diff_file_and_the_linked_issues() {
+        let snapshot: PrSnapshot = serde_json::from_value(json!({
+            "repo": "o/r", "number": 1, "title": "", "body": "", "url": "",
+            "author": "me", "head_sha": "abc", "base": "main", "draft": false,
+            "labels": [], "checks": { "state": "none", "runs": [] },
+            "diff": "/data/worktrees/4/pr.diff",
+            "linked_issues": [{ "repo": "o/r", "number": 3, "title": "Crash", "body": "It crashes", "url": "u" }],
+        }))
+        .unwrap();
+
+        assert_eq!(
+            snapshot.diff.as_deref(),
+            Some(std::path::Path::new("/data/worktrees/4/pr.diff"))
+        );
+        assert_eq!(snapshot.linked_issues[0].number, 3);
+        assert_eq!(snapshot.linked_issues[0].repo, RepoName::new("o", "r"));
     }
 
     #[test]
@@ -633,12 +714,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(snapshot.merge, None);
-        assert!(
-            serde_json::to_value(&snapshot)
-                .unwrap()
-                .get("merge")
-                .is_none()
-        );
+        assert_eq!(snapshot.diff, None);
+        assert!(snapshot.linked_issues.is_empty());
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        for key in ["merge", "diff", "linked_issues"] {
+            assert!(wire.get(key).is_none(), "{key}");
+        }
         let state: MergeState =
             serde_json::from_value(json!({ "status": "blocked", "behind_by": 2 })).unwrap();
         assert_eq!(state.status, MergeStatus::Blocked);

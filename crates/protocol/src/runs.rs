@@ -9,7 +9,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use slopwatch_core::{EndReason, Expr, GateState, StepTerm, Verdict, WaiverCategory};
 
-use crate::step::{Effect, EffectResult, Outputs};
+use crate::step::{Effect, EffectResult, Outputs, Usage};
 use crate::{Actor, InboxEntry, RepoName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -55,6 +55,11 @@ pub enum RunEvent {
     StepProgress {
         step: String,
         message: String,
+    },
+    /// A running Step's `usage` report for one model call.
+    StepUsage {
+        step: String,
+        usage: Usage,
     },
     /// The Step has its Verdict, from the Step itself or from the daemon.
     StepSettled {
@@ -221,6 +226,47 @@ pub struct StepView {
     pub progress: Option<String>,
     /// The Waiver that counts the Step's Verdict as pass, if any.
     pub waiver: Option<Waiver>,
+    /// What the Step's model calls cost, over every attempt. `None` while
+    /// it reported no usage.
+    pub cost: Option<Cost>,
+}
+
+/// What a Step spent, at list price.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Cost {
+    /// The sum of the calls that reported a price.
+    pub usd: f64,
+    /// Some call reported no price, so the real cost is more than `usd`.
+    pub unknown: bool,
+}
+
+impl Cost {
+    pub fn add(&mut self, usage: &Usage) {
+        match usage.usd {
+            Some(usd) => self.usd += usd,
+            None => self.unknown = true,
+        }
+    }
+}
+
+impl fmt::Display for Cost {
+    /// `$0.0013`, `$0.0013 +?`, or `+?` when no call reported a price.
+    /// Below a cent it keeps four decimals, so a Jev call doesn't read as
+    /// free.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.unknown && self.usd == 0.0 {
+            return f.write_str("+?");
+        }
+        if self.usd >= 0.01 || self.usd == 0.0 {
+            write!(f, "${:.2}", self.usd)?;
+        } else {
+            write!(f, "${:.4}", self.usd.max(0.0001))?;
+        }
+        if self.unknown {
+            f.write_str(" +?")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -267,6 +313,7 @@ impl RunView {
                         attempt: 0,
                         progress: None,
                         waiver: None,
+                        cost: None,
                     })
                     .collect();
                 self.gate_text = gate;
@@ -283,6 +330,11 @@ impl RunView {
             RunEvent::StepProgress { step, message } => {
                 if let Some(view) = self.step_mut(&step) {
                     view.progress = Some(message);
+                }
+            }
+            RunEvent::StepUsage { step, usage } => {
+                if let Some(view) = self.step_mut(&step) {
+                    view.cost.get_or_insert_default().add(&usage);
                 }
             }
             RunEvent::StepSettled {
@@ -383,6 +435,50 @@ mod tests {
             gate: "[ci]".into(),
             gate_terms: vec![],
         }
+    }
+
+    #[test]
+    fn usage_adds_up_into_the_steps_cost() {
+        let usage = |usd| RunEvent::StepUsage {
+            step: "ci".into(),
+            usage: Usage {
+                model: "typesafe-ai/jev".into(),
+                input_tokens: 300,
+                output_tokens: 0,
+                usd,
+            },
+        };
+        let mut view = RunView::default();
+        view.apply(1, started());
+        assert_eq!(view.step("ci").unwrap().cost, None);
+
+        view.apply(2, usage(Some(0.0004)));
+        view.apply(3, usage(Some(0.0009)));
+        let cost = view.step("ci").unwrap().cost.unwrap();
+        assert!((cost.usd - 0.0013).abs() < 1e-12);
+        assert_eq!(cost.to_string(), "$0.0013");
+
+        view.apply(4, usage(None));
+        assert_eq!(
+            view.step("ci").unwrap().cost.unwrap().to_string(),
+            "$0.0013 +?"
+        );
+        assert_eq!(
+            Cost {
+                usd: 0.0,
+                unknown: true
+            }
+            .to_string(),
+            "+?"
+        );
+        assert_eq!(
+            Cost {
+                usd: 1.5,
+                unknown: false
+            }
+            .to_string(),
+            "$1.50"
+        );
     }
 
     #[test]

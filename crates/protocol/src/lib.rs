@@ -34,8 +34,8 @@ pub use notifications::{
     About, Notification, NotificationId, NotificationsDelta, NotificationsUpdate,
 };
 pub use runs::{
-    EffectView, GateTerm, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView,
-    Waiver,
+    Cost, EffectView, GateTerm, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus,
+    StepView, Waiver,
 };
 pub use secrets::{SecretInfo, SecretValue, is_secret_name};
 pub use topics::{

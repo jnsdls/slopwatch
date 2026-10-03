@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use slopwatch_core::{EndReason, GateState, ReuseKey, Verdict};
-use slopwatch_protocol::step::{Effect, EffectKind, EffectResult, Outputs};
+use slopwatch_protocol::step::{Effect, EffectKind, EffectResult, LinkedIssue, Outputs};
 use slopwatch_protocol::{
     EntryId, InboxEntry, Notification, NotificationId, RepoName, RunId, RunSummary, Waiver,
 };
@@ -200,6 +200,11 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (repo, node)
     );
 ",
+    // The issues a Run's PR closes, as a JSON array, read when the Run
+    // starts, for Step snapshots and `linked_issue:` Conditions.
+    "
+    ALTER TABLE runs ADD COLUMN linked_issues TEXT NOT NULL DEFAULT '[]';
+",
 ];
 
 mod drafts;
@@ -223,6 +228,7 @@ pub struct NewRun<'a> {
     pub pipeline: &'a str,
     /// The paths the head changes since it branched from the base.
     pub files: &'a [String],
+    pub linked_issues: &'a [LinkedIssue],
     pub steps: Vec<NewStep>,
 }
 
@@ -319,6 +325,7 @@ pub struct ActiveRun {
     pub base_sha: String,
     pub pipeline: String,
     pub files: Vec<String>,
+    pub linked_issues: Vec<LinkedIssue>,
     pub gate: GateState,
     pub steps: Vec<StepRow>,
 }
@@ -488,8 +495,9 @@ impl Store {
         let db = self.db();
         let tx = db.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO runs (repo, number, head_sha, base, base_sha, pipeline, started_at, files)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO runs (repo, number, head_sha, base, base_sha, pipeline, started_at, files,
+                               linked_issues)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 run.repo.to_string(),
                 run.number as i64,
@@ -499,6 +507,7 @@ impl Store {
                 run.pipeline,
                 now,
                 serde_json::to_string(run.files).expect("paths always serialize"),
+                serde_json::to_string(run.linked_issues).expect("issues always serialize"),
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -739,7 +748,8 @@ impl Store {
         let db = self.db();
         let mut runs = db
             .prepare(&format!(
-                "SELECT id, repo, number, head_sha, base, base_sha, pipeline, gate, files
+                "SELECT id, repo, number, head_sha, base, base_sha, pipeline, gate, files,
+                        linked_issues
                  FROM runs WHERE {filter} ORDER BY id"
             ))?
             .query_map(args, |row| {
@@ -753,6 +763,8 @@ impl Store {
                     pipeline: row.get(6)?,
                     gate: parse_gate(&row.get::<_, String>(7)?),
                     files: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+                    linked_issues: serde_json::from_str(&row.get::<_, String>(9)?)
+                        .unwrap_or_default(),
                     steps: Vec::new(),
                 })
             })?
@@ -1707,6 +1719,7 @@ mod tests {
             base_sha: "base",
             pipeline: "version: 1",
             files: &[],
+            linked_issues: &[],
             steps: vec![NewStep {
                 id: "ci".into(),
                 plugin: "ci".into(),

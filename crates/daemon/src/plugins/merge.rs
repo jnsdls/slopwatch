@@ -389,6 +389,8 @@ mod tests {
             labels: vec![],
             checks: Checks::default(),
             merge,
+            diff: None,
+            linked_issues: vec![],
         }
     }
 

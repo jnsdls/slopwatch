@@ -17,6 +17,8 @@ pub struct PrFacts {
     pub base: String,
     pub draft: bool,
     pub author: String,
+    /// The PR links an issue it closes.
+    pub linked_issue: bool,
 }
 
 /// What a Run knows right now.

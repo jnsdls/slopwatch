@@ -495,8 +495,17 @@ pub fn run_tone(run: &RunSummary) -> Tone {
     }
 }
 
-/// A Step's status as its row in the Step list says it.
+/// A Step's status as its row in the Step list says it, with what it cost
+/// once it reported usage.
 pub fn step_line(step: &StepView) -> String {
+    let line = status_line(step);
+    match step.cost {
+        Some(cost) => format!("{line} · {cost}"),
+        None => line,
+    }
+}
+
+fn status_line(step: &StepView) -> String {
     match &step.status {
         StepStatus::Pending => "pending".to_owned(),
         StepStatus::Running => match &step.progress {
@@ -578,7 +587,7 @@ fn capitalized(text: &str) -> String {
 mod tests {
     use super::*;
     use slopwatch_protocol::step::Outputs;
-    use slopwatch_protocol::{PrStatus, RunEvent, StepInfo};
+    use slopwatch_protocol::{Cost, PrStatus, RunEvent, StepInfo};
 
     fn summary(id: u64, end: Option<EndReason>) -> RunSummary {
         RunSummary {
@@ -842,6 +851,7 @@ mod tests {
                 reason: "docs-only PR".into(),
                 actor: slopwatch_protocol::Actor::Developer { via: "gui".into() },
             }),
+            cost: None,
         };
         assert_eq!(
             waiver_line(&step).as_deref(),
@@ -906,6 +916,7 @@ mod tests {
             attempt: 1,
             progress: None,
             waiver: None,
+            cost: None,
         };
         assert_eq!(step_line(&step), "cancelled: the Run ended superseded");
         assert_eq!(step_state(&step), "cancelled");
@@ -927,6 +938,37 @@ mod tests {
             "pass: 1 check passed (reused from Run 3)"
         );
         assert_eq!(step_state(&reused), "pass (reused)");
+
+        let judged = StepView {
+            status: StepStatus::Settled {
+                verdict: Verdict::Pass,
+                reason: None,
+                outputs: Outputs {
+                    note: Some("3 of 3 questions passed".into()),
+                    ..Outputs::default()
+                },
+                reused_from: None,
+            },
+            cost: Some(Cost {
+                usd: 0.0013,
+                unknown: false,
+            }),
+            ..reused.clone()
+        };
+        assert_eq!(
+            step_line(&judged),
+            "pass: 3 of 3 questions passed · $0.0013"
+        );
+        let running = StepView {
+            status: StepStatus::Running,
+            progress: Some("Asking Jev 3 questions".into()),
+            cost: Some(Cost {
+                usd: 0.0,
+                unknown: true,
+            }),
+            ..judged
+        };
+        assert_eq!(step_line(&running), "running: Asking Jev 3 questions · +?");
     }
 
     fn event(id: u64, seq: u64, event: RunEvent) -> TopicUpdate {
