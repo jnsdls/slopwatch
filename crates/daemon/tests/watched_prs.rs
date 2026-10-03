@@ -7,7 +7,7 @@ use slopwatch_daemon::github::fake::FakeGitHub;
 use slopwatch_daemon::github::{GitHub, GitHubError};
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::in_process::InProcessClient;
-use slopwatch_daemon::{Daemon, Watching};
+use slopwatch_daemon::{Daemon, Library, Watching};
 use slopwatch_protocol::{
     ClientFrame, ClientHello, Command, ErrorCode, PollState, PrStatus, Reply, RepoName,
     ResponseBody, ServerFrame, Topic, TopicUpdate, WatchedPrs, WatchedPrsUpdate,
@@ -30,9 +30,12 @@ fn github() -> Arc<FakeGitHub> {
 
 fn daemon(github: Arc<FakeGitHub>, store: Store) -> Arc<Daemon> {
     let github: Arc<dyn GitHub> = github;
+    // These tests never touch the Library, so its temp dir can outlive them.
+    let library = Library::open(tempfile::tempdir().unwrap().keep()).unwrap();
     Arc::new(Daemon::with_build_id(
         "test",
         Arc::new(Watching::new(store, github).unwrap()),
+        Arc::new(library),
     ))
 }
 

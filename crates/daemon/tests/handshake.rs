@@ -6,7 +6,7 @@ use std::time::Duration;
 use slopwatch_daemon::github::fake::FakeGitHub;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::in_process::InProcessClient;
-use slopwatch_daemon::{Daemon, Peer, Watching};
+use slopwatch_daemon::{Daemon, Library, Peer, Watching};
 use slopwatch_protocol::{
     Auth, ClientFrame, ClientHello, Command, DIALECT, ErrorCode, Refusal, RefusalReason, Reply,
     RequestId, Response, ResponseBody, ServerFrame, ServerHello,
@@ -15,7 +15,13 @@ use slopwatch_protocol::{
 fn daemon() -> Arc<Daemon> {
     let github = Arc::new(FakeGitHub::new("me"));
     let watching = Arc::new(Watching::new(Store::in_memory(), github).unwrap());
-    Arc::new(Daemon::with_build_id("0123abcd+dirty.feed", watching))
+    // These tests never touch the Library, so its temp dir can outlive them.
+    let library = Library::open(tempfile::tempdir().unwrap().keep()).unwrap();
+    Arc::new(Daemon::with_build_id(
+        "0123abcd+dirty.feed",
+        watching,
+        Arc::new(library),
+    ))
 }
 
 async fn hello(client: &mut InProcessClient, hello: ClientHello) -> ServerFrame {
@@ -58,7 +64,7 @@ async fn a_matching_hello_is_answered_with_the_daemons_build_id() {
         answer,
         ServerFrame::Hello(ServerHello {
             dialect: DIALECT,
-            features: vec!["watched_prs".into(), "restart".into()],
+            features: vec!["watched_prs".into(), "restart".into(), "library".into()],
             build_id: "0123abcd+dirty.feed".into(),
         })
     );

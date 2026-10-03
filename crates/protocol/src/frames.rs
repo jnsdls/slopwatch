@@ -153,6 +153,20 @@ pub enum Command {
     /// Kill every Step process group and exit, so launchd starts the binary
     /// the bundle now holds (ADR 0009). The daemon replies before it exits.
     Restart,
+    /// Every Step in the developer's Library, by name.
+    ListLibrarySteps,
+    /// Creates or replaces the Library Step `step` with `text`, the whole
+    /// file. The daemon refuses text that wouldn't load. The next Run of
+    /// every Pipeline that uses the Step reads the new text.
+    SaveLibraryStep {
+        step: String,
+        text: String,
+    },
+    /// Removes the Library Step `step`. Pipelines that use it stop loading
+    /// until it's back.
+    DeleteLibraryStep {
+        step: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +193,23 @@ pub enum Reply {
     },
     /// The daemon exits right after sending this.
     Restarting,
+    LibrarySteps {
+        /// Sorted by name.
+        steps: Vec<LibraryStep>,
+    },
+}
+
+/// One Step in the developer's Library.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryStep {
+    /// What a Pipeline writes after `lib/`.
+    pub name: String,
+    /// The file as it stands, comments included.
+    pub text: String,
+    /// Why the file wouldn't load, if it wouldn't, such as after a hand
+    /// edit. A Pipeline that uses it fails to load with the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +227,9 @@ pub enum ErrorCode {
     NotFound,
     /// GitHub couldn't be reached or refused the call.
     GitHub,
+    /// The command was well formed, but what it carried can't be accepted,
+    /// such as a Library Step that wouldn't load. The message says why.
+    Invalid,
     /// The daemon failed on its side, such as its database.
     Internal,
 }
@@ -324,6 +358,48 @@ mod tests {
                 "result": { "error": { "code": "bad_request", "message": "unknown command" } },
             }),
         );
+    }
+
+    #[test]
+    fn library_commands_name_the_step_they_touch() {
+        let save = Command::SaveLibraryStep {
+            step: "claude-review".into(),
+            text: "uses: claude\n".into(),
+        };
+        let listed = Reply::LibrarySteps {
+            steps: vec![
+                LibraryStep {
+                    name: "broken".into(),
+                    text: "uses: lib/x\n".into(),
+                    problem: Some("it uses `lib/x`".into()),
+                },
+                LibraryStep {
+                    name: "claude-review".into(),
+                    text: "uses: claude\n".into(),
+                    problem: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            wire(&save),
+            json!({ "name": "save_library_step", "step": "claude-review", "text": "uses: claude\n" }),
+        );
+        assert_eq!(
+            wire(&Command::DeleteLibraryStep { step: "x".into() }),
+            json!({ "name": "delete_library_step", "step": "x" }),
+        );
+        assert_eq!(
+            wire(&listed),
+            json!({
+                "reply": "library_steps",
+                "steps": [
+                    { "name": "broken", "text": "uses: lib/x\n", "problem": "it uses `lib/x`" },
+                    { "name": "claude-review", "text": "uses: claude\n" },
+                ],
+            }),
+        );
+        assert_eq!(parse::<Reply>(wire(&listed)), listed);
     }
 
     #[test]

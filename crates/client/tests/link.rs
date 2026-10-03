@@ -10,7 +10,7 @@ use slopwatch_client::link::{self, ConnectError, Controls, LinkEvent, LinkState,
 use slopwatch_daemon::github::fake::FakeGitHub;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::unix::Listener;
-use slopwatch_daemon::{Daemon, DataDir, Watching};
+use slopwatch_daemon::{Daemon, DataDir, Library, Watching};
 use slopwatch_protocol::{
     BUILD_ID, ClientHello, Command, DIALECT, PrStatus, RefusalReason, Reply, RepoName,
     ResponseBody, TopicUpdate, WatchedPrsUpdate, socket_path,
@@ -50,7 +50,8 @@ impl RunningDaemon {
             .block_on(async { Listener::bind(&data_dir) })
             .unwrap();
         let watching = Arc::new(Watching::new(store, github).unwrap());
-        let daemon = Arc::new(Daemon::with_build_id(build_id, watching));
+        let library = Library::open(dir.join("steps")).unwrap();
+        let daemon = Arc::new(Daemon::with_build_id(build_id, watching, Arc::new(library)));
         runtime.spawn(async move {
             tokio::select! {
                 () = listener.run(Arc::clone(&daemon)) => {}

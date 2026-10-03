@@ -7,7 +7,7 @@ use slopwatch_daemon::auth::GhToken;
 use slopwatch_daemon::github::api::Api;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::unix::Listener;
-use slopwatch_daemon::{Daemon, DataDir, Watching};
+use slopwatch_daemon::{Daemon, DataDir, Library, Watching};
 use slopwatch_protocol::Flavor;
 
 /// A log past this size starts over when the daemon starts.
@@ -51,7 +51,18 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let daemon = Arc::new(Daemon::new(Arc::clone(&watching)));
+    let steps = Library::default_dir();
+    let library = match Library::open(&steps) {
+        Ok(library) => Arc::new(library),
+        Err(error) => {
+            eprintln!(
+                "slopwatchd: can't open the Library at {}: {error}",
+                steps.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let daemon = Arc::new(Daemon::new(Arc::clone(&watching), library));
     eprintln!(
         "slopwatchd: build {} listening on {}",
         daemon.build_id(),
