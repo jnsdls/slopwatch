@@ -131,6 +131,18 @@ pub enum Effect {
     /// `check` on the Run's head commit (see [`Check::actions_job`]). Each
     /// check gets one rerun per head SHA (ADR 0008).
     Rerun { check: String, job: u64 },
+    /// Brings the PR's branch up to date with its base through GitHub's
+    /// `updatePullRequestBranch`, expecting the Run's head SHA (ADR 0004).
+    /// The push it makes ends the Run as pushed.
+    Rebase { method: UpdateMethod },
+    /// Lands the PR through GitHub's async merge API, directly or through
+    /// the base's merge queue (ADR 0011). The daemon sends the Run's head
+    /// SHA with it, so only the SHA the Gate judged can land. `method`
+    /// applies to a direct merge; a merge queue uses its own.
+    Merge {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method: Option<MergeMethod>,
+    },
 }
 
 impl Effect {
@@ -139,7 +151,38 @@ impl Effect {
             Effect::Comment { .. } => EffectKind::Comment,
             Effect::Label { .. } => EffectKind::Label,
             Effect::Rerun { .. } => EffectKind::Rerun,
+            Effect::Rebase { .. } => EffectKind::Rebase,
+            Effect::Merge { .. } => EffectKind::Merge,
         }
+    }
+}
+
+/// How the `rebase` Effect brings a branch up to date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMethod {
+    /// Replays the PR's commits onto the base. GitHub can't sign them.
+    Rebase,
+    /// Merges the base into the PR, in a commit GitHub signs.
+    Merge,
+}
+
+/// How a direct merge lands the PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl std::fmt::Display for MergeMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MergeMethod::Merge => "merge",
+            MergeMethod::Squash => "squash",
+            MergeMethod::Rebase => "rebase",
+        })
     }
 }
 
@@ -150,6 +193,8 @@ pub enum EffectKind {
     Comment,
     Label,
     Rerun,
+    Rebase,
+    Merge,
 }
 
 impl std::fmt::Display for EffectKind {
@@ -158,6 +203,8 @@ impl std::fmt::Display for EffectKind {
             EffectKind::Comment => "comment",
             EffectKind::Label => "label",
             EffectKind::Rerun => "rerun",
+            EffectKind::Rebase => "rebase",
+            EffectKind::Merge => "merge",
         })
     }
 }
@@ -166,8 +213,12 @@ impl std::fmt::Display for EffectKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum EffectResult {
-    /// GitHub has it.
+    /// GitHub has it. For `merge`, the PR is merged.
     Done,
+    /// For `merge`: the base's merge queue took the PR, and GitHub merges
+    /// it once the queue's checks pass. The snapshot's [`MergeState`]
+    /// follows it from there.
+    Enqueued,
     /// The Step's Run had ended, or the Step had settled, so the daemon
     /// didn't carry it out.
     Dropped { reason: String },
@@ -246,6 +297,65 @@ pub struct PrSnapshot {
     pub draft: bool,
     pub labels: Vec<String>,
     pub checks: Checks,
+    /// Where the PR stands for merging. The daemon asks GitHub for it only
+    /// while a Step whose manifest lists [`MERGE_STATE`] runs, so it's
+    /// `None` until then, and for a while after such a Step starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeState>,
+}
+
+/// The manifest feature that asks for [`PrSnapshot::merge`].
+pub const MERGE_STATE: &str = "merge_state";
+
+/// What GitHub says about merging the PR at the Run's head SHA.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeState {
+    /// The PR is merged. A merged PR leaves the poll, so this is how a
+    /// Step hears that the merge queue landed it.
+    #[serde(default)]
+    pub merged: bool,
+    /// GitHub's `mergeStateStatus`.
+    pub status: MergeStatus,
+    /// The head conflicts with the base.
+    #[serde(default)]
+    pub conflicts: bool,
+    /// Commits on the base that the head doesn't have. `None` when GitHub
+    /// couldn't compare them, as after the base branch was deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub behind_by: Option<u64>,
+    /// The base branch has a merge queue.
+    #[serde(default)]
+    pub merge_queue: bool,
+    #[serde(default)]
+    pub in_merge_queue: bool,
+    /// The base branch only takes signed commits.
+    #[serde(default)]
+    pub requires_signatures: bool,
+    /// The direct merge methods the repo allows.
+    #[serde(default)]
+    pub methods: Vec<MergeMethod>,
+}
+
+/// GitHub's `mergeStateStatus` for a PR.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStatus {
+    /// Mergeable, and every requirement is met.
+    Clean,
+    /// Mergeable, with a check outside the requirements failing.
+    Unstable,
+    /// Mergeable, with pre-receive hooks.
+    HasHooks,
+    /// Out of date, on a branch that requires an up-to-date head.
+    Behind,
+    /// Something outside the Run holds it, such as a missing review.
+    Blocked,
+    /// Conflicts with the base.
+    Dirty,
+    Draft,
+    /// GitHub hasn't worked it out yet.
+    #[default]
+    Unknown,
 }
 
 /// The checks GitHub reports on the head commit.
@@ -315,6 +425,7 @@ mod tests {
                 draft: false,
                 labels: vec![],
                 checks: Checks::default(),
+                merge: None,
             },
             upstream: BTreeMap::new(),
         });
@@ -386,6 +497,64 @@ mod tests {
                 "result": { "status": "refused", "reason": "no" },
             })
         );
+    }
+
+    #[test]
+    fn merge_and_rebase_are_effects_and_a_merge_can_come_back_enqueued() {
+        let merge: FromStep = serde_json::from_str(
+            r#"{"type":"effect","id":"merge","effect":{"kind":"merge","method":"squash"}}"#,
+        )
+        .unwrap();
+        let rebase: FromStep = serde_json::from_str(
+            r#"{"type":"effect","id":"rebase","effect":{"kind":"rebase","method":"merge"}}"#,
+        )
+        .unwrap();
+
+        let FromStep::Effect { effect: merge, .. } = merge else {
+            panic!("expected an Effect");
+        };
+        assert_eq!(
+            merge,
+            Effect::Merge {
+                method: Some(MergeMethod::Squash)
+            }
+        );
+        assert_eq!(merge.kind(), EffectKind::Merge);
+        let FromStep::Effect { effect: rebase, .. } = rebase else {
+            panic!("expected an Effect");
+        };
+        assert_eq!(
+            rebase,
+            Effect::Rebase {
+                method: UpdateMethod::Merge
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(EffectResult::Enqueued).unwrap(),
+            json!({ "status": "enqueued" })
+        );
+    }
+
+    #[test]
+    fn a_snapshot_without_a_merge_state_reads_and_writes_without_one() {
+        let snapshot: PrSnapshot = serde_json::from_value(json!({
+            "repo": "o/r", "number": 1, "title": "", "body": "", "url": "",
+            "author": "me", "head_sha": "abc", "base": "main", "draft": false,
+            "labels": [], "checks": { "state": "none", "runs": [] },
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.merge, None);
+        assert!(
+            serde_json::to_value(&snapshot)
+                .unwrap()
+                .get("merge")
+                .is_none()
+        );
+        let state: MergeState =
+            serde_json::from_value(json!({ "status": "blocked", "behind_by": 2 })).unwrap();
+        assert_eq!(state.status, MergeStatus::Blocked);
+        assert_eq!(state.behind_by, Some(2));
     }
 
     #[test]

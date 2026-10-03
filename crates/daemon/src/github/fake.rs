@@ -13,11 +13,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use slopwatch_protocol::RepoName;
-use slopwatch_protocol::step::{CheckState, Checks, ChecksState};
+use slopwatch_protocol::step::{
+    CheckState, Checks, ChecksState, MergeMethod, MergeState, MergeStatus, UpdateMethod,
+};
 
 use super::{
-    GitHub, GitHubError, GitRemote, OpenPr, PIPELINE_PATH, Poll, PrDetail, RateLimit, RepoPoll,
-    WATCH_LABEL,
+    GitHub, GitHubError, GitRemote, Merged, OpenPr, PIPELINE_PATH, Poll, PrDetail, RateLimit,
+    RepoPoll, WATCH_LABEL,
 };
 
 /// The Pipeline [`FakeGitHub::add_pipeline`] commits: one CI Step and a
@@ -45,6 +47,10 @@ struct State {
     reruns: Vec<u64>,
     /// The id the next Actions job gets.
     next_job: u64,
+    /// Every merge call, as `(PR, sha, method)`, in order.
+    merges: Vec<(u64, String, Option<MergeMethod>)>,
+    /// Every branch update, as `(PR, method)`, in order.
+    updates: Vec<(u64, UpdateMethod)>,
 }
 
 /// Where a comment call stops and never returns, the way a daemon killed
@@ -61,6 +67,10 @@ struct Repo {
     label_exists: bool,
     label_creations: usize,
     prs: BTreeMap<u64, Pr>,
+    /// Every base branch has a merge queue.
+    merge_queue: bool,
+    /// Every base branch only takes signed commits.
+    requires_signatures: bool,
 }
 
 struct Pr {
@@ -72,6 +82,13 @@ struct Pr {
     labels: BTreeSet<String>,
     checks: Checks,
     comments: Vec<String>,
+    draft: bool,
+    merged: bool,
+    in_merge_queue: bool,
+    /// The head conflicts with the base.
+    conflicts: bool,
+    /// Something outside the Run, such as a missing review, blocks it.
+    blocked: bool,
 }
 
 const LIMIT: u32 = 5000;
@@ -92,6 +109,8 @@ impl FakeGitHub {
                 comment_calls: 0,
                 reruns: Vec::new(),
                 next_job: 1_000,
+                merges: Vec::new(),
+                updates: Vec::new(),
             }),
             origins: tempfile::tempdir().expect("create a directory for the fake's git repos"),
         }
@@ -139,6 +158,8 @@ impl FakeGitHub {
                     label_exists: false,
                     label_creations: 0,
                     prs: BTreeMap::new(),
+                    merge_queue: false,
+                    requires_signatures: false,
                 },
             );
         });
@@ -168,6 +189,11 @@ impl FakeGitHub {
                     labels: BTreeSet::new(),
                     checks: Checks::default(),
                     comments: Vec::new(),
+                    draft: false,
+                    merged: false,
+                    in_merge_queue: false,
+                    conflicts: false,
+                    blocked: false,
                 },
             );
         });
@@ -302,6 +328,71 @@ impl FakeGitHub {
     pub fn reruns(&self) -> Vec<u64> {
         self.with(|state| state.reruns.clone())
     }
+
+    pub fn set_draft(&self, repo: &RepoName, number: u64, draft: bool) {
+        self.with(|state| state.pr(repo, number).draft = draft);
+    }
+
+    /// Makes the PR conflict with its base, or stop conflicting.
+    pub fn set_conflicts(&self, repo: &RepoName, number: u64, conflicts: bool) {
+        self.with(|state| state.pr(repo, number).conflicts = conflicts);
+    }
+
+    /// Makes GitHub block the PR's merge, as a missing review would.
+    pub fn set_blocked(&self, repo: &RepoName, number: u64, blocked: bool) {
+        self.with(|state| state.pr(repo, number).blocked = blocked);
+    }
+
+    /// Gives every base branch in `repo` a merge queue, or takes it away.
+    pub fn set_merge_queue(&self, repo: &RepoName, on: bool) {
+        self.with(|state| state.repo(repo).merge_queue = on);
+    }
+
+    /// Makes every base branch in `repo` require signed commits.
+    pub fn set_requires_signatures(&self, repo: &RepoName, on: bool) {
+        self.with(|state| state.repo(repo).requires_signatures = on);
+    }
+
+    /// Commits a file to `branch`, as someone landing other work on the
+    /// base would, and returns the commit's SHA.
+    pub fn commit_to(&self, repo: &RepoName, branch: &str, path: &str, text: &str) -> String {
+        self.with(|state| {
+            let git = state.repo(repo).git.clone();
+            state.commit(&git, branch, None, &[(path, Some(text))])
+        })
+    }
+
+    /// The merge queue lands the PR: its change goes onto its base, and
+    /// the PR closes as merged.
+    pub fn land_from_queue(&self, repo: &RepoName, number: u64) {
+        self.with(|state| {
+            assert!(state.pr(repo, number).in_merge_queue, "the PR isn't queued");
+            state.land(repo, number);
+        });
+    }
+
+    /// The merge queue drops the PR, which stays open.
+    pub fn eject_from_queue(&self, repo: &RepoName, number: u64) {
+        self.with(|state| state.pr(repo, number).in_merge_queue = false);
+    }
+
+    pub fn is_merged(&self, repo: &RepoName, number: u64) -> bool {
+        self.with(|state| state.pr(repo, number).merged)
+    }
+
+    pub fn is_in_merge_queue(&self, repo: &RepoName, number: u64) -> bool {
+        self.with(|state| state.pr(repo, number).in_merge_queue)
+    }
+
+    /// Every merge call so far, as `(PR, sha, method)`.
+    pub fn merges(&self) -> Vec<(u64, String, Option<MergeMethod>)> {
+        self.with(|state| state.merges.clone())
+    }
+
+    /// Every branch update so far, as `(PR, method)`.
+    pub fn updates(&self) -> Vec<(u64, UpdateMethod)> {
+        self.with(|state| state.updates.clone())
+    }
 }
 
 fn head_branch(number: u64) -> String {
@@ -328,6 +419,24 @@ impl State {
             .prs
             .get_mut(&number)
             .unwrap_or_else(|| panic!("the fake has no PR {repo}#{number}"))
+    }
+
+    /// Puts the PR's head tree on its base, in one commit as a squash
+    /// would, and closes the PR as merged.
+    fn land(&mut self, repo: &RepoName, number: u64) {
+        let git = self.repo(repo).git.clone();
+        let (base, head) = {
+            let pr = self.pr(repo, number);
+            (pr.base.clone(), pr.head_sha.clone())
+        };
+        let parent = tip(&git, &base).expect("the base exists");
+        let tree = run_git(&git, &["rev-parse", &format!("{head}^{{tree}}")]);
+        let sha = run_git(&git, &["commit-tree", &tree, "-p", &parent, "-m", "Squash"]);
+        run_git(&git, &["update-ref", &format!("refs/heads/{base}"), &sha]);
+        let pr = self.pr(repo, number);
+        pr.open = false;
+        pr.merged = true;
+        pr.in_merge_queue = false;
     }
 
     /// Commits `files` (a `None` text deletes the path) on top of
@@ -483,7 +592,7 @@ impl GitHub for FakeGitHub {
                                 number,
                                 title: pr.title.clone(),
                                 url: format!("https://github.com/{name}/pull/{number}"),
-                                draft: false,
+                                draft: pr.draft,
                                 head_sha: pr.head_sha.clone(),
                                 base: pr.base.clone(),
                                 labeled: pr.labels.contains(WATCH_LABEL),
@@ -609,6 +718,140 @@ impl GitHub for FakeGitHub {
             check.ok_or_else(|| GitHubError::NotFound(format!("job {job} in {repo}")))?;
             state.next_job += 1;
             state.reruns.push(job);
+            Ok(())
+        })
+    }
+
+    async fn merge_state(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        head_sha: &str,
+    ) -> Result<MergeState, GitHubError> {
+        self.with(|state| {
+            let not_found = || GitHubError::NotFound(format!("{repo}#{number}"));
+            let fake = state.repos.get(repo).ok_or_else(not_found)?;
+            let pr = fake.prs.get(&number).ok_or_else(not_found)?;
+            let behind_by = tip(&fake.git, &pr.base).map(|base| {
+                run_git(
+                    &fake.git,
+                    &["rev-list", "--count", &format!("{head_sha}..{base}")],
+                )
+                .parse()
+                .expect("git counts in digits")
+            });
+            Ok(MergeState {
+                merged: pr.merged,
+                status: if pr.draft {
+                    MergeStatus::Draft
+                } else if pr.conflicts {
+                    MergeStatus::Dirty
+                } else if pr.blocked {
+                    MergeStatus::Blocked
+                } else {
+                    MergeStatus::Clean
+                },
+                conflicts: pr.conflicts,
+                behind_by,
+                merge_queue: fake.merge_queue,
+                in_merge_queue: pr.in_merge_queue,
+                requires_signatures: fake.requires_signatures,
+                methods: vec![MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase],
+            })
+        })
+    }
+
+    /// Like GitHub's async merge API: refuses a moved head, conflicts and
+    /// blocks, queues the PR when the base has a merge queue, and merges
+    /// it otherwise.
+    async fn merge(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        sha: &str,
+        method: Option<MergeMethod>,
+    ) -> Result<Merged, GitHubError> {
+        self.with(|state| {
+            state.merges.push((number, sha.to_owned(), method));
+            let queue = state.repo(repo).merge_queue;
+            let pr = state.pr(repo, number);
+            let refused = |message: &str| Err(GitHubError::Unprocessable(message.to_owned()));
+            if pr.merged {
+                return Ok(Merged::Merged);
+            }
+            if pr.head_sha != sha {
+                return refused("Pull request head branch was modified.");
+            }
+            if pr.in_merge_queue {
+                return Ok(Merged::Enqueued);
+            }
+            if pr.conflicts {
+                return refused("Pull Request has merge conflicts");
+            }
+            if pr.blocked || pr.draft {
+                return refused("Pull request is not mergeable");
+            }
+            if queue {
+                pr.in_merge_queue = true;
+                return Ok(Merged::Enqueued);
+            }
+            state.land(repo, number);
+            Ok(Merged::Merged)
+        })
+    }
+
+    /// Like `updatePullRequestBranch`, but with a merge commit whichever
+    /// method: the head ends up with the base in its history, as either
+    /// method leaves it, and has no checks yet.
+    async fn update_branch(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        expected_head: &str,
+        method: UpdateMethod,
+    ) -> Result<(), GitHubError> {
+        self.with(|state| {
+            let git = state.repo(repo).git.clone();
+            let pr = state.pr(repo, number);
+            if pr.head_sha != expected_head {
+                return Err(GitHubError::Unprocessable(
+                    "head sha didn't match the current head ref.".into(),
+                ));
+            }
+            if pr.conflicts {
+                return Err(GitHubError::Unprocessable(
+                    "merge conflict between base and head".into(),
+                ));
+            }
+            let head = pr.head_sha.clone();
+            let base = tip(&git, &pr.base.clone()).expect("the base exists");
+            let tree = run_git(&git, &["merge-tree", "--write-tree", &head, &base]);
+            let sha = run_git(
+                &git,
+                &[
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &head,
+                    "-p",
+                    &base,
+                    "-m",
+                    "Update branch",
+                ],
+            );
+            run_git(
+                &git,
+                &[
+                    "update-ref",
+                    &format!("refs/heads/{}", head_branch(number)),
+                    &sha,
+                ],
+            );
+            pull_ref(&git, number, &sha);
+            state.updates.push((number, method));
+            let pr = state.pr(repo, number);
+            pr.head_sha = sha;
+            pr.checks = Checks::default();
             Ok(())
         })
     }

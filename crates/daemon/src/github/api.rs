@@ -9,11 +9,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use slopwatch_protocol::RepoName;
 
-use slopwatch_protocol::step::{Check, CheckState, Checks, ChecksState};
+use slopwatch_protocol::step::{
+    Check, CheckState, Checks, ChecksState, MergeMethod, MergeState, MergeStatus, UpdateMethod,
+};
 
 use super::{
-    GitHub, GitHubError, GitRemote, OpenPr, PIPELINE_PATH, Poll, PrDetail, RateLimit, RepoPoll,
-    WATCH_LABEL,
+    GitHub, GitHubError, GitRemote, Merged, OpenPr, PIPELINE_PATH, Poll, PrDetail, RateLimit,
+    RepoPoll, WATCH_LABEL,
 };
 use crate::auth::Credentials;
 
@@ -27,6 +29,10 @@ const PAGE: usize = 100;
 const MAX_REPO_PAGES: usize = 10;
 /// Pages of a PR's comments to search for an Effect's marker.
 const MAX_COMMENT_PAGES: usize = 30;
+/// How often, and how many times, to ask after a merge GitHub is still
+/// working on.
+const MERGE_POLL_EVERY: Duration = Duration::from_secs(2);
+const MERGE_POLLS: u32 = 90;
 const LABEL_COLOR: &str = "6f42c1";
 const LABEL_DESCRIPTION: &str = "Watched by slopwatch";
 
@@ -51,6 +57,15 @@ impl Api {
         &self,
         build: impl Fn(&reqwest::Client) -> RequestBuilder,
     ) -> Result<Response, GitHubError> {
+        check_status(self.send_unchecked(build).await?).await
+    }
+
+    /// [`Api::send`], but an error status comes back as the response, for
+    /// calls whose error bodies say something.
+    async fn send_unchecked(
+        &self,
+        build: impl Fn(&reqwest::Client) -> RequestBuilder,
+    ) -> Result<Response, GitHubError> {
         for attempt in 0..2 {
             let token = self.credentials.token().await?;
             let response = build(&self.http)
@@ -64,20 +79,13 @@ impl Api {
                 self.credentials.forget();
                 continue;
             }
-            return check_status(response).await;
+            return Ok(response);
         }
         Err(GitHubError::Auth("GitHub rejected the token".into()))
     }
 
     async fn graphql(&self, query: &str, variables: Value) -> Result<Value, GitHubError> {
-        let body = json!({ "query": query, "variables": variables });
-        let response = self
-            .send(|http| http.post(format!("{API}/graphql")).json(&body))
-            .await?;
-        let mut answer: Value = response
-            .json()
-            .await
-            .map_err(|error| GitHubError::Other(format!("unreadable GraphQL answer: {error}")))?;
+        let mut answer = self.graphql_answer(query, variables).await?;
         let data = answer
             .get_mut("data")
             .map(Value::take)
@@ -86,6 +94,18 @@ impl Api {
             return Err(graphql_error(&answer));
         }
         Ok(data)
+    }
+
+    /// GraphQL's whole answer, `data` and `errors` both.
+    async fn graphql_answer(&self, query: &str, variables: Value) -> Result<Value, GitHubError> {
+        let body = json!({ "query": query, "variables": variables });
+        let response = self
+            .send(|http| http.post(format!("{API}/graphql")).json(&body))
+            .await?;
+        response
+            .json()
+            .await
+            .map_err(|error| GitHubError::Other(format!("unreadable GraphQL answer: {error}")))
     }
 
     async fn rest(
@@ -213,6 +233,105 @@ impl GitHub for Api {
         self.rest(Method::POST, &path, None).await
     }
 
+    async fn merge_state(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        head_sha: &str,
+    ) -> Result<MergeState, GitHubError> {
+        let variables = json!({
+            "owner": repo.owner, "name": repo.name, "number": number, "head": head_sha,
+        });
+        let data = self.graphql(MERGE_STATE, variables).await?;
+        read_merge_state(repo, number, data)
+    }
+
+    async fn merge(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        sha: &str,
+        method: Option<MergeMethod>,
+    ) -> Result<Merged, GitHubError> {
+        let path = format!("{API}/repos/{repo}/pulls/{number}/merge-async");
+        let mut body = json!({ "sha": sha, "merge_action": "default" });
+        if let Some(method) = method {
+            body["merge_method"] = method.to_string().into();
+        }
+        let mut uuid: Option<String> = None;
+        for _ in 0..MERGE_POLLS {
+            let response = match &uuid {
+                None => {
+                    self.send_unchecked(|http| http.put(&path).json(&body))
+                        .await?
+                }
+                Some(uuid) => {
+                    self.send_unchecked(|http| http.get(format!("{path}/{uuid}")))
+                        .await?
+                }
+            };
+            // A merge request already under way, as when a crash cut the
+            // first call short: ask again once it's done.
+            if uuid.is_none() && response.status() == StatusCode::CONFLICT {
+                tokio::time::sleep(MERGE_POLL_EVERY).await;
+                continue;
+            }
+            // GitHub answers a merge it won't make with 400 and a body
+            // that says why.
+            let answer = if response.status() == StatusCode::BAD_REQUEST {
+                response
+            } else {
+                check_status(response).await?
+            };
+            let answer: MergeAnswer = answer
+                .json()
+                .await
+                .map_err(|error| GitHubError::Other(format!("unreadable merge answer: {error}")))?;
+            match answer.status.as_str() {
+                "merged" => return Ok(Merged::Merged),
+                "enqueued" => return Ok(Merged::Enqueued),
+                "failed" => return Err(GitHubError::Unprocessable(answer.details.message)),
+                _ => {
+                    if let Some(id) = answer.details.uuid {
+                        uuid = Some(id);
+                    }
+                    tokio::time::sleep(MERGE_POLL_EVERY).await;
+                }
+            }
+        }
+        Err(GitHubError::Other(format!(
+            "GitHub hadn't finished merging {repo}#{number} after {}s",
+            (MERGE_POLL_EVERY * MERGE_POLLS).as_secs()
+        )))
+    }
+
+    async fn update_branch(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        expected_head: &str,
+        method: UpdateMethod,
+    ) -> Result<(), GitHubError> {
+        let variables = json!({ "owner": repo.owner, "name": repo.name, "number": number });
+        let data = self.graphql(PR_ID, variables).await?;
+        let id = data["repository"]["pullRequest"]["id"]
+            .as_str()
+            .ok_or_else(|| GitHubError::NotFound(format!("{repo}#{number}")))?
+            .to_owned();
+        let method = match method {
+            UpdateMethod::Rebase => "REBASE",
+            UpdateMethod::Merge => "MERGE",
+        };
+        let variables = json!({ "id": id, "head": expected_head, "method": method });
+        // A refused update, such as one that conflicts, still answers with
+        // data, holding a null payload next to the error.
+        let answer = self.graphql_answer(UPDATE_BRANCH, variables).await?;
+        if answer["data"]["updatePullRequestBranch"].is_null() {
+            return Err(graphql_error(&answer));
+        }
+        Ok(())
+    }
+
     async fn git_remote(&self, repo: &RepoName) -> Result<GitRemote, GitHubError> {
         let token = self.credentials.token().await?;
         // git reads config from these variables, so the token stays off
@@ -286,6 +405,7 @@ fn graphql_error(answer: &Value) -> GitHubError {
             retry_after: DEFAULT_RETRY_AFTER,
         },
         Some("NOT_FOUND") => GitHubError::NotFound(message),
+        Some("UNPROCESSABLE") => GitHubError::Unprocessable(message),
         _ => GitHubError::Other(message),
     }
 }
@@ -358,6 +478,146 @@ fn read_available_repos(data: Value) -> Result<RepoPage, GitHubError> {
             .has_next_page
             .then_some(page_info.end_cursor)
             .flatten(),
+    })
+}
+
+/// What a PR needs for merging. `compare` takes the Run's head SHA, which
+/// the batched poll can't pass per PR, so this is a query of its own. A
+/// branch can require signed commits through branch protection
+/// (`refUpdateRule`) or a ruleset (`rules`).
+const MERGE_STATE: &str = "
+query($owner: String!, $name: String!, $number: Int!, $head: String!) {
+  repository(owner: $owner, name: $name) {
+    mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed
+    pullRequest(number: $number) {
+      merged mergeStateStatus mergeable isMergeQueueEnabled isInMergeQueue
+      baseRef {
+        refUpdateRule { requiresSignatures }
+        rules(first: 100) { nodes { type } }
+        compare(headRef: $head) { behindBy }
+      }
+    }
+  }
+}";
+
+const PR_ID: &str = "
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) { id } }
+}";
+
+const UPDATE_BRANCH: &str = "
+mutation($id: ID!, $head: GitObjectID!, $method: PullRequestBranchUpdateMethod!) {
+  updatePullRequestBranch(input: { pullRequestId: $id, expectedHeadOid: $head, updateMethod: $method }) {
+    pullRequest { id }
+  }
+}";
+
+/// The async merge API's answer, from the call or from asking after it.
+#[derive(Deserialize)]
+struct MergeAnswer {
+    status: String,
+    details: MergeDetails,
+}
+
+#[derive(Deserialize)]
+struct MergeDetails {
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    uuid: Option<String>,
+}
+
+fn read_merge_state(repo: &RepoName, number: u64, data: Value) -> Result<MergeState, GitHubError> {
+    #[derive(Deserialize)]
+    struct Data {
+        repository: Option<Repo>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Repo {
+        merge_commit_allowed: bool,
+        squash_merge_allowed: bool,
+        rebase_merge_allowed: bool,
+        pull_request: Option<Pr>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Pr {
+        merged: bool,
+        merge_state_status: String,
+        mergeable: String,
+        is_merge_queue_enabled: bool,
+        is_in_merge_queue: bool,
+        base_ref: Option<BaseRef>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct BaseRef {
+        ref_update_rule: Option<RefUpdateRule>,
+        rules: Option<Nodes<Rule>>,
+        compare: Option<Compare>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RefUpdateRule {
+        requires_signatures: Option<bool>,
+    }
+    #[derive(Deserialize)]
+    struct Rule {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Compare {
+        behind_by: u64,
+    }
+
+    let Data { repository } = parse(data)?;
+    let not_found = || GitHubError::NotFound(format!("{repo}#{number}"));
+    let repository = repository.ok_or_else(not_found)?;
+    let pr = repository.pull_request.ok_or_else(not_found)?;
+    let base = pr.base_ref.as_ref();
+    let methods = [
+        (repository.merge_commit_allowed, MergeMethod::Merge),
+        (repository.squash_merge_allowed, MergeMethod::Squash),
+        (repository.rebase_merge_allowed, MergeMethod::Rebase),
+    ];
+    Ok(MergeState {
+        merged: pr.merged,
+        status: match pr.merge_state_status.as_str() {
+            "CLEAN" => MergeStatus::Clean,
+            "UNSTABLE" => MergeStatus::Unstable,
+            "HAS_HOOKS" => MergeStatus::HasHooks,
+            "BEHIND" => MergeStatus::Behind,
+            "BLOCKED" => MergeStatus::Blocked,
+            "DIRTY" => MergeStatus::Dirty,
+            "DRAFT" => MergeStatus::Draft,
+            _ => MergeStatus::Unknown,
+        },
+        conflicts: pr.mergeable == "CONFLICTING",
+        behind_by: base
+            .and_then(|base| base.compare.as_ref())
+            .map(|compare| compare.behind_by),
+        merge_queue: pr.is_merge_queue_enabled,
+        in_merge_queue: pr.is_in_merge_queue,
+        requires_signatures: base.is_some_and(|base| {
+            base.ref_update_rule
+                .as_ref()
+                .and_then(|rule| rule.requires_signatures)
+                .unwrap_or(false)
+                || base.rules.as_ref().is_some_and(|rules| {
+                    rules
+                        .nodes
+                        .iter()
+                        .any(|rule| rule.kind == "REQUIRED_SIGNATURES")
+                })
+        }),
+        methods: methods
+            .into_iter()
+            .filter(|(allowed, _)| *allowed)
+            .map(|(_, method)| method)
+            .collect(),
     })
 }
 
@@ -874,6 +1134,67 @@ mod tests {
         assert_eq!(parse_utc("2000-03-01T00:00:00Z"), Some(951_868_800));
         assert_eq!(parse_utc("2026-10-03T03:19:55Z"), Some(1_790_997_595));
         assert_eq!(parse_utc("not a time"), None);
+    }
+
+    #[test]
+    fn a_merge_state_reads_status_queue_signatures_and_how_far_behind() {
+        let data = json!({ "repository": {
+            "mergeCommitAllowed": false, "squashMergeAllowed": true, "rebaseMergeAllowed": true,
+            "pullRequest": {
+                "merged": false, "mergeStateStatus": "BLOCKED", "mergeable": "CONFLICTING",
+                "isMergeQueueEnabled": true, "isInMergeQueue": false,
+                "baseRef": {
+                    "refUpdateRule": null,
+                    "rules": { "nodes": [{ "type": "REQUIRED_SIGNATURES" }] },
+                    "compare": { "behindBy": 3 },
+                },
+            },
+        } });
+
+        let state = read_merge_state(&RepoName::new("o", "r"), 1, data).unwrap();
+
+        assert_eq!(
+            state,
+            MergeState {
+                merged: false,
+                status: MergeStatus::Blocked,
+                conflicts: true,
+                behind_by: Some(3),
+                merge_queue: true,
+                in_merge_queue: false,
+                requires_signatures: true,
+                methods: vec![MergeMethod::Squash, MergeMethod::Rebase],
+            }
+        );
+    }
+
+    #[test]
+    fn a_merge_state_without_a_base_branch_cant_say_how_far_behind() {
+        let data = json!({ "repository": {
+            "mergeCommitAllowed": true, "squashMergeAllowed": true, "rebaseMergeAllowed": true,
+            "pullRequest": {
+                "merged": true, "mergeStateStatus": "UNKNOWN", "mergeable": "UNKNOWN",
+                "isMergeQueueEnabled": false, "isInMergeQueue": false, "baseRef": null,
+            },
+        } });
+
+        let state = read_merge_state(&RepoName::new("o", "r"), 1, data).unwrap();
+
+        assert!(state.merged);
+        assert_eq!(state.behind_by, None);
+        assert!(!state.requires_signatures);
+    }
+
+    #[test]
+    fn a_refused_branch_update_is_unprocessable() {
+        let answer = json!({ "data": { "updatePullRequestBranch": null }, "errors": [
+            { "type": "UNPROCESSABLE", "message": "merge conflict between base and head" },
+        ] });
+
+        assert_eq!(
+            graphql_error(&answer),
+            GitHubError::Unprocessable("merge conflict between base and head".into())
+        );
     }
 
     #[test]

@@ -15,16 +15,23 @@
 //! On the first sync after a start, every intent still open is reconciled:
 //! a comment is looked up by the hidden marker it carries, and whatever
 //! isn't on GitHub yet is done again if its Run is still going, or dropped
-//! if not. Labels and reruns are redone.
+//! if not. Labels, reruns, rebases and merges are redone. A rebase or a
+//! merge carries the head SHA its Run judged, so GitHub refuses it once
+//! the PR has moved on, and a merge GitHub already made answers merged.
 
 use std::sync::Arc;
 
+use slopwatch_core::GateState;
 use slopwatch_protocol::step::{CheckState, Effect, EffectResult, ToStep};
 use slopwatch_protocol::{RunEvent, RunId};
 
 use super::{Engine, Input, PrKey};
-use crate::github::{GitHub, WATCH_LABEL};
+use crate::github::{GitHub, Merged, WATCH_LABEL};
 use crate::store::{EffectRow, NewEffect, StoreError};
+
+/// How many rebase-started Runs in a row a PR gets before the daemon
+/// stops rebasing it and asks the developer instead (ADR 0004).
+pub(super) const REBASE_STARTED_RUNS: u32 = 3;
 
 /// The hidden line a comment Effect carries, so the daemon can find the
 /// comment after a crash before posting it again.
@@ -165,7 +172,27 @@ impl Engine {
                     None
                 }
             }
-            Effect::Comment { .. } | Effect::Label { .. } => None,
+            Effect::Rebase { .. } | Effect::Merge { .. } if run.gate != GateState::Pass => {
+                Some("the Gate hasn't passed".to_owned())
+            }
+            Effect::Merge { .. }
+                if run.snapshot.as_ref().is_some_and(|snapshot| snapshot.draft) =>
+            {
+                Some("the PR is a draft".to_owned())
+            }
+            Effect::Rebase { .. }
+                if self.store.rebase_streak(&run.repo, run.number, run.id)?
+                    >= REBASE_STARTED_RUNS =>
+            {
+                Some(format!(
+                    "the base moved under {REBASE_STARTED_RUNS} rebase-started Runs in a row; \
+                     a merge queue would land the PR without rebasing it each time"
+                ))
+            }
+            Effect::Comment { .. }
+            | Effect::Label { .. }
+            | Effect::Rebase { .. }
+            | Effect::Merge { .. } => None,
         })
     }
 
@@ -299,6 +326,25 @@ async fn perform(github: &dyn GitHub, row: &EffectRow, call: Call) -> EffectResu
             github.set_label(&row.repo, row.number, name, !remove).await
         }
         Effect::Rerun { job, .. } => github.rerun_job(&row.repo, *job).await,
+        // Both carry the head the Run judged, so GitHub refuses them once
+        // the PR has moved on.
+        Effect::Rebase { method } => {
+            github
+                .update_branch(&row.repo, row.number, &row.head_sha, *method)
+                .await
+        }
+        Effect::Merge { method } => {
+            return match github
+                .merge(&row.repo, row.number, &row.head_sha, *method)
+                .await
+            {
+                Ok(Merged::Merged) => EffectResult::Done,
+                Ok(Merged::Enqueued) => EffectResult::Enqueued,
+                Err(error) => EffectResult::Failed {
+                    reason: error.to_string(),
+                },
+            };
+        }
     };
     match done {
         Ok(()) => EffectResult::Done,

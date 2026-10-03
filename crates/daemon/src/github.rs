@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use slopwatch_protocol::RepoName;
-use slopwatch_protocol::step::Checks;
+use slopwatch_protocol::step::{Checks, MergeMethod, MergeState, UpdateMethod};
 
 /// The label that makes a PR a Watched PR.
 pub const WATCH_LABEL: &str = "slopwatch";
@@ -53,8 +53,49 @@ pub trait GitHub: Send + Sync {
     /// Reruns a GitHub Actions job.
     async fn rerun_job(&self, repo: &RepoName, job: u64) -> Result<(), GitHubError>;
 
+    /// Where the PR stands for merging, with `head_sha` compared against
+    /// its base.
+    async fn merge_state(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        head_sha: &str,
+    ) -> Result<MergeState, GitHubError>;
+
+    /// Merges the PR through the async merge API, directly or through the
+    /// base's merge queue, and waits until GitHub says which (ADR 0011).
+    /// Nothing lands unless the head is still `sha`. A merge GitHub
+    /// declines, such as one with conflicts, is `Unprocessable`.
+    async fn merge(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        sha: &str,
+        method: Option<MergeMethod>,
+    ) -> Result<Merged, GitHubError>;
+
+    /// Brings the PR's branch up to date with its base through
+    /// `updatePullRequestBranch`, only if its head is still
+    /// `expected_head` (ADR 0004). GitHub pushes the result a moment
+    /// later, so the new head shows up in a later poll.
+    async fn update_branch(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        expected_head: &str,
+        method: UpdateMethod,
+    ) -> Result<(), GitHubError>;
+
     /// Where git fetches `repo` from, with what authenticates it.
     async fn git_remote(&self, repo: &RepoName) -> Result<GitRemote, GitHubError>;
+}
+
+/// What became of a merge GitHub accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Merged {
+    Merged,
+    /// The base's merge queue has it.
+    Enqueued,
 }
 
 /// A git remote and the environment a git process needs to reach it.
