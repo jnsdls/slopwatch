@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 /// An amount in US cents, as Budgets cross the wire. Whole cents keep the
 /// commands and entries that carry them comparable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct Cents(pub u64);
 

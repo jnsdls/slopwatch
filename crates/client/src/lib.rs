@@ -20,4 +20,6 @@ pub mod run_graph_view;
 pub mod run_pane;
 pub mod secrets;
 pub mod secrets_view;
+pub mod settings;
+pub mod settings_view;
 pub mod step_log;

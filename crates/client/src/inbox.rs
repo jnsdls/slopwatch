@@ -56,23 +56,47 @@ pub fn badge(count: usize) -> Option<String> {
 
 /// The buttons an open entry offers, with the command each sends. A Run
 /// entry about a Step is answered by retrying it, and only a PR entry can
-/// be dismissed. A cause offers nothing: it clears when its cause does. A
-/// Human Step's answers need a note, so they come from [`answer`].
-pub fn actions(entry: &InboxEntry) -> Vec<(&'static str, Command)> {
-    match &entry.scope {
+/// be dismissed. A spent Budget's entry offers to raise the Budget or run
+/// anyway once. Any other cause offers nothing: it clears when its cause
+/// does. A Human Step's answers need a note, so they come from [`answer`].
+pub fn actions(entry: &InboxEntry) -> Vec<(String, Command)> {
+    let mut actions = match &entry.scope {
         Scope::Run {
             run,
             step: Some(step),
         } => vec![(
-            "Retry",
+            "Retry".to_owned(),
             Command::RetryStep {
                 run: *run,
                 step: step.clone(),
             },
         )],
-        Scope::Pr => vec![("Dismiss", Command::DismissEntry { entry: entry.id })],
+        Scope::Pr => vec![(
+            "Dismiss".to_owned(),
+            Command::DismissEntry { entry: entry.id },
+        )],
         Scope::Run { step: None, .. } | Scope::Cause { .. } | Scope::Human { .. } => Vec::new(),
+    };
+    if let Some(hit) = &entry.budget {
+        let to = hit.raise_to();
+        actions.splice(
+            0..0,
+            [
+                (
+                    format!("Raise to {to}"),
+                    Command::RaiseBudget {
+                        entry: entry.id,
+                        to,
+                    },
+                ),
+                (
+                    "Run anyway once".to_owned(),
+                    Command::RunAnywayOnce { entry: entry.id },
+                ),
+            ],
+        );
     }
+    actions
 }
 
 /// The ways a Human Step can be answered, with their button labels.
@@ -110,7 +134,10 @@ pub fn history_line(entry: &InboxEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slopwatch_protocol::{Actor, Cause, Closed, Closing, EntryId, InboxDelta, PrRef, RunId};
+    use slopwatch_protocol::{
+        Actor, BudgetHit, BudgetKind, Cause, Cents, Closed, Closing, EntryId, InboxDelta, PrRef,
+        RunId,
+    };
 
     fn entry(id: u64, scope: Scope, prs: &[u64]) -> InboxEntry {
         InboxEntry {
@@ -198,7 +225,7 @@ mod tests {
         assert_eq!(
             actions(&run),
             [(
-                "Retry",
+                "Retry".to_owned(),
                 Command::RetryStep {
                     run: RunId(4),
                     step: "ci".into()
@@ -207,10 +234,60 @@ mod tests {
         );
         assert_eq!(
             actions(&entry(2, Scope::Pr, &[1])),
-            [("Dismiss", Command::DismissEntry { entry: EntryId(2) })]
+            [(
+                "Dismiss".to_owned(),
+                Command::DismissEntry { entry: EntryId(2) }
+            )]
         );
         assert!(actions(&cause).is_empty());
         assert_eq!(held_line(&cause), "o/r#1, o/r#2");
+    }
+
+    #[test]
+    fn a_spent_budget_offers_a_raise_and_one_more_run() {
+        let hit = |kind| {
+            Some(BudgetHit {
+                kind,
+                spent: Cents(1040),
+                budget: Cents(1000),
+            })
+        };
+        let mut pr = entry(2, Scope::Pr, &[1]);
+        pr.budget = hit(BudgetKind::Pr);
+        let mut daily = entry(
+            3,
+            Scope::Cause {
+                cause: Cause::DailyBudget,
+            },
+            &[1, 2],
+        );
+        daily.budget = hit(BudgetKind::Daily);
+
+        assert_eq!(
+            actions(&pr),
+            [
+                (
+                    "Raise to $21".to_owned(),
+                    Command::RaiseBudget {
+                        entry: EntryId(2),
+                        to: Cents(2100),
+                    }
+                ),
+                (
+                    "Run anyway once".to_owned(),
+                    Command::RunAnywayOnce { entry: EntryId(2) }
+                ),
+                (
+                    "Dismiss".to_owned(),
+                    Command::DismissEntry { entry: EntryId(2) }
+                ),
+            ]
+        );
+        let labels: Vec<String> = actions(&daily)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels, ["Raise to $21", "Run anyway once"]);
     }
 
     #[test]

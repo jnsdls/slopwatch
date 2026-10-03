@@ -14,7 +14,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_core::WaiverCategory;
 use slopwatch_protocol::{
-    Command, Flavor, InboxEntry, LogLevel, LogSource, PrRef, PrStatus, PullRequest, Reply,
+    Cause, Command, Flavor, InboxEntry, LogLevel, LogSource, PrRef, PrStatus, PullRequest, Reply,
     RepoName, ResponseBody, RunView, Scope, StackParent, StepStatus, StepView, TopicUpdate,
 };
 
@@ -41,6 +41,7 @@ use crate::run_pane::{
 };
 use crate::secrets::missing_secret;
 use crate::secrets_view::SecretsView;
+use crate::settings_view::SettingsView;
 use crate::step_log::{self, LogViewer, Row};
 
 /// How see-through a PR list row is when it doesn't open.
@@ -62,6 +63,8 @@ enum Pane {
     /// The Pipeline editor, on the repo it has open.
     Pipeline,
     Plugins,
+    /// The daemon's own settings, such as the daily Budget.
+    Settings,
 }
 
 pub struct MainView {
@@ -78,6 +81,7 @@ pub struct MainView {
     secrets: Entity<SecretsView>,
     pipeline: Entity<PipelineEditorView>,
     plugins: Entity<PluginsView>,
+    settings: Entity<SettingsView>,
     run_pane: RunPane,
     /// Repos the developer can add, while the picker is open.
     picker: Option<Vec<RepoName>>,
@@ -157,6 +161,7 @@ impl MainView {
             secrets: cx.new(|cx| SecretsView::new(commands.clone(), window, cx)),
             pipeline: cx.new(|cx| PipelineEditorView::new(commands.clone(), window, cx)),
             plugins: cx.new(|cx| PluginsView::new(commands.clone(), window, cx)),
+            settings: cx.new(|cx| SettingsView::new(commands.clone(), window, cx)),
             run_pane: RunPane::default(),
             picker: None,
             onboarding: None,
@@ -177,6 +182,7 @@ impl MainView {
                     }
                     self.secrets.read(cx).refresh();
                     self.plugins.read(cx).refresh();
+                    self.settings.read(cx).refresh();
                 }
                 if connected && !matches!(self.link, LinkState::Connected { .. }) {
                     // The new connection subscribes to its topics itself.
@@ -193,9 +199,11 @@ impl MainView {
                 self.inbox.apply(update);
                 dock::set_badge(badge(self.inbox.count()).as_deref());
                 // A missing Secret's or an unapproved Plugin's entry
-                // opening or closing changes those lists.
+                // opening or closing changes those lists, and a spent
+                // Budget's entry what today's spend reads.
                 self.secrets.read(cx).refresh();
                 self.plugins.read(cx).refresh();
+                self.settings.read(cx).refresh();
             }
             LinkEvent::Topic(update @ TopicUpdate::Notifications { .. }) => {
                 let center = SystemCenter::new(cx);
@@ -262,6 +270,13 @@ impl MainView {
                 }
                 ResponseBody::Ok(Reply::Plugins { plugins }) => {
                     self.plugins.update(cx, |view, cx| view.listed(plugins, cx));
+                }
+                ResponseBody::Ok(Reply::Settings {
+                    settings,
+                    spent_today,
+                }) => {
+                    self.settings
+                        .update(cx, |view, cx| view.listed(settings, spent_today, cx));
                 }
                 ResponseBody::Ok(Reply::StepLog(page)) => {
                     self.error = None;
@@ -355,6 +370,13 @@ impl MainView {
         if let Some(command) = self.run_pane.viewer_mut().and_then(change) {
             self.send(command);
         }
+    }
+
+    /// Opens the daemon settings screen, with the settings as they are.
+    fn show_settings(&mut self, cx: &mut Context<Self>) {
+        self.pane = Pane::Settings;
+        self.settings.update(cx, |view, _| view.reload());
+        cx.notify();
     }
 
     fn show_prs(&mut self, source: Source) {
@@ -460,6 +482,17 @@ impl MainView {
                     this.pane = Pane::Plugins;
                     this.plugins.read(cx).refresh();
                     cx.notify();
+                })),
+            )
+            .child(
+                entry(
+                    "source-settings".into(),
+                    "Settings".to_owned(),
+                    None,
+                    self.pane == Pane::Settings,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.show_settings(cx);
                 })),
             )
             .child(
@@ -834,6 +867,19 @@ impl MainView {
             buttons = buttons.child(Button::new(id).label(label).small().ghost().on_click(
                 cx.listener(move |this, _: &ClickEvent, _, _| {
                     this.send(command.clone());
+                }),
+            ));
+        }
+        if matches!(
+            entry.scope,
+            Scope::Cause {
+                cause: Cause::DailyBudget
+            }
+        ) {
+            let id = SharedString::from(format!("{prefix}-budget-settings-{}", entry.id));
+            buttons = buttons.child(Button::new(id).label("Settings").small().ghost().on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.show_settings(cx);
                 }),
             ));
         }
@@ -1655,7 +1701,7 @@ impl MainView {
     /// column away.
     fn sources_shown(&self) -> bool {
         match self.pane {
-            Pane::Library | Pane::Secrets | Pane::Plugins => true,
+            Pane::Library | Pane::Secrets | Pane::Plugins | Pane::Settings => true,
             Pane::Pipeline => false,
             Pane::Prs | Pane::Inbox => !self.run_pane.graph_shown(),
         }
@@ -1746,6 +1792,7 @@ impl Render for MainView {
                         Pane::Secrets => this.child(self.secrets.clone()),
                         Pane::Pipeline => this.child(self.pipeline_pane(cx)),
                         Pane::Plugins => this.child(self.plugins.clone()),
+                        Pane::Settings => this.child(self.settings.clone()),
                     }),
             )
             .children(self.footer(cx))
