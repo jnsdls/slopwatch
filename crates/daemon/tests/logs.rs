@@ -77,6 +77,7 @@ fn pending(n: usize) -> Checks {
                 name: format!("check {i}"),
                 state: CheckState::Pending,
                 url: None,
+                actions_job: None,
             })
             .collect(),
     }
@@ -551,6 +552,7 @@ async fn a_run_whose_outcome_is_reused_keeps_its_log() {
                     name: "test".into(),
                     state: CheckState::Success,
                     url: None,
+                    actions_job: None,
                 }],
             },
         )

@@ -52,8 +52,8 @@ impl Journal {
     }
 
     /// Prunes an ended Run's journal down to the events that rebuild its
-    /// record: the start, each Step's last settle, the last Gate and the
-    /// end. Then appends [`RunEvent::Pruned`], so a client that already
+    /// record: the start, each Step's last settle, the last Gate, the
+    /// Effects and the end. Then appends [`RunEvent::Pruned`], so a client that already
     /// had the Run learns its detail is gone. Folding what's left still
     /// gives the Run's final state, for a client starting from scratch or
     /// from any sequence number it had.
@@ -64,7 +64,10 @@ impl Journal {
         let mut gate = None;
         for Journalled { seq, event, .. } in self.replay(run, 0)? {
             match event {
-                RunEvent::Started { .. } | RunEvent::Ended { .. } => keep.push(seq),
+                // What a Step did on GitHub stays on record.
+                RunEvent::Started { .. } | RunEvent::Ended { .. } | RunEvent::Effect { .. } => {
+                    keep.push(seq)
+                }
                 RunEvent::StepSettled { step, .. } => {
                     settled.insert(step, seq);
                 }

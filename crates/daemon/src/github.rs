@@ -29,8 +29,29 @@ pub trait GitHub: Send + Sync {
     /// counts as created.
     async fn create_label(&self, repo: &RepoName) -> Result<(), GitHubError>;
 
-    /// Adds the `slopwatch` label to a PR, or removes it when `on` is false.
-    async fn set_label(&self, repo: &RepoName, number: u64, on: bool) -> Result<(), GitHubError>;
+    /// Adds `label` to a PR, or removes it when `on` is false. Removing a
+    /// label the PR doesn't carry succeeds.
+    async fn set_label(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        label: &str,
+        on: bool,
+    ) -> Result<(), GitHubError>;
+
+    /// Posts a comment on a PR.
+    async fn comment(&self, repo: &RepoName, number: u64, body: &str) -> Result<(), GitHubError>;
+
+    /// Whether any comment on the PR contains `marker`.
+    async fn has_comment(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        marker: &str,
+    ) -> Result<bool, GitHubError>;
+
+    /// Reruns a GitHub Actions job.
+    async fn rerun_job(&self, repo: &RepoName, job: u64) -> Result<(), GitHubError>;
 
     /// Where git fetches `repo` from, with what authenticates it.
     async fn git_remote(&self, repo: &RepoName) -> Result<GitRemote, GitHubError>;
