@@ -26,6 +26,7 @@ objc2-foundation.workspace = true
 objc2-service-management.workspace = true
 
 [dev-dependencies]
+slopwatch-core.workspace = true
 slopwatch-daemon.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
