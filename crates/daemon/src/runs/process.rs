@@ -64,6 +64,8 @@ pub struct StepHandle {
     /// When the kernel says the process started, in microseconds since the
     /// Unix epoch.
     pub started_us: i64,
+    /// The session the Step runs in: the daemon's.
+    pub sid: i32,
 }
 
 impl StepHandle {
@@ -108,6 +110,7 @@ pub fn spawn(spawn: Spawn, report: impl Fn(Report) + Send + 'static) -> io::Resu
         .spawn()?;
     let pid = child.id().expect("a just-spawned child has a pid") as i32;
     let started_us = process_start_us(pid);
+    let sid = session_of(pid);
     let stdin = child.stdin.take().expect("stdin is piped");
     let stdout = child.stdout.take().expect("stdout is piped");
     let (control, controls) = mpsc::unbounded_channel();
@@ -127,6 +130,7 @@ pub fn spawn(spawn: Spawn, report: impl Fn(Report) + Send + 'static) -> io::Resu
         exited,
         pgid: pid,
         started_us,
+        sid,
     })
 }
 
@@ -281,17 +285,86 @@ pub(crate) fn kernel_start_us(pid: i32) -> Option<i64> {
     None
 }
 
-/// Kills a Step's group left over from before a restart, if its leader is
-/// still the process that started at `started_us` and not a later one
-/// that reused the pid (ADR 0009).
-pub(crate) fn kill_leftover(pgid: i32, started_us: i64) {
-    if pgid > 0 && kernel_start_us(pgid) == Some(started_us) {
+/// A Step's process group as the store recorded it at spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Leftover {
+    pub pgid: i32,
+    pub started_us: i64,
+    pub sid: i32,
+}
+
+/// Kills a Step's group left over from before a restart (ADR 0009), once
+/// it's clear the group is still the Step's and not a later one that
+/// reused the pid. With the leader still running, its start time decides.
+/// A leader that exited, as one may when the daemon's end closes its
+/// stdin, can leave children in the group. Then every member must sit in
+/// the session the Step ran in and have started no earlier than its
+/// leader.
+pub(crate) fn kill_leftover(leftover: &Leftover) {
+    let Leftover {
+        pgid,
+        started_us,
+        sid,
+    } = *leftover;
+    if pgid <= 0 {
+        return;
+    }
+    let ours = match kernel_start_us(pgid) {
+        Some(leader_started) => leader_started == started_us,
+        None => {
+            // Members that exited in the meantime have nothing to say.
+            let members: Vec<(i64, i32)> = group_members(pgid)
+                .into_iter()
+                .filter_map(|pid| Some((kernel_start_us(pid)?, session_of(pid))))
+                .collect();
+            !members.is_empty()
+                && members
+                    .iter()
+                    .all(|&(started, session)| started >= started_us && session == sid)
+        }
+    };
+    if ours {
         signal_group(pgid, libc::SIGKILL);
+    }
+}
+
+/// The session `pid` belongs to, or -1 if it's gone.
+pub(crate) fn session_of(pid: i32) -> i32 {
+    // SAFETY: getsid takes a plain integer and touches no memory.
+    unsafe { libc::getsid(pid) }
+}
+
+/// The pids in process group `pgid`.
+fn group_members(pgid: i32) -> Vec<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut pids = vec![0_i32; 256];
+        loop {
+            let size = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
+            // SAFETY: the buffer holds exactly `size` bytes of pids.
+            let count = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), size) };
+            if count < 0 {
+                return Vec::new();
+            }
+            let count = count as usize;
+            if count < pids.len() {
+                pids.truncate(count);
+                return pids.into_iter().filter(|&pid| pid > 0).collect();
+            }
+            pids.resize(pids.len() * 2, 0);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pgid;
+        Vec::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::CommandExt as _;
+
     use super::*;
 
     fn sh(script: &str, dir: &tempfile::TempDir) -> Spawn {
@@ -398,12 +471,94 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (handle, mut reports) = reports(sh("read line; sleep 600", &dir)).await;
 
-        kill_leftover(handle.pgid, handle.started_us + 1);
+        kill_leftover(&leftover(&handle, |l| l.started_us += 1));
         let early = tokio::time::timeout(Duration::from_millis(300), reports.recv()).await;
         assert!(early.is_err(), "a different start time spares it");
 
-        kill_leftover(handle.pgid, handle.started_us);
+        kill_leftover(&leftover(&handle, |_| {}));
         assert!(matches!(reports.recv().await, Some(Report::Exited(None))));
+    }
+
+    fn leftover(handle: &StepHandle, change: impl FnOnce(&mut Leftover)) -> Leftover {
+        let mut leftover = Leftover {
+            pgid: handle.pgid,
+            started_us: handle.started_us,
+            sid: handle.sid,
+        };
+        change(&mut leftover);
+        leftover
+    }
+
+    /// A Step whose leader exited, as a Step might once a crashed daemon
+    /// closes its stdin, leaving a child behind in its group. Returns the
+    /// group as recorded at spawn and the child's pid.
+    fn leaderless_group() -> (Leftover, i32) {
+        let mut leader = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 600 & echo $!; read line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = leader.id() as i32;
+        let recorded = Leftover {
+            pgid,
+            started_us: kernel_start_us(pgid).unwrap(),
+            sid: session_of(pgid),
+        };
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(leader.stdout.take().unwrap()),
+            &mut line,
+        )
+        .unwrap();
+        let child: i32 = line.trim().parse().unwrap();
+        drop(leader.stdin.take());
+        leader.wait().unwrap();
+        (recorded, child)
+    }
+
+    fn alive(pid: i32) -> bool {
+        kernel_start_us(pid).is_some()
+    }
+
+    async fn until_gone(pid: i32) -> bool {
+        for _ in 0..100 {
+            if !alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_leftover_group_whose_leader_exited_still_dies() {
+        let (recorded, child) = leaderless_group();
+        assert!(alive(child), "the child outlives its leader");
+
+        kill_leftover(&recorded);
+
+        assert!(until_gone(child).await, "the leftover child was killed");
+    }
+
+    #[tokio::test]
+    async fn a_leaderless_group_from_another_session_or_an_earlier_time_is_spared() {
+        let (recorded, child) = leaderless_group();
+
+        kill_leftover(&Leftover {
+            sid: recorded.sid + 1,
+            ..recorded
+        });
+        kill_leftover(&Leftover {
+            started_us: kernel_start_us(child).unwrap() + 1,
+            ..recorded
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let spared = alive(child);
+        signal_group(recorded.pgid, libc::SIGKILL);
+
+        assert!(spared, "nothing proves the group is the Step's");
     }
 
     #[tokio::test(start_paused = true)]
