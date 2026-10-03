@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use slopwatch_protocol::{
-    Actor, Cause, Closed, Closing, EntryId, InboxDelta, InboxEntry, PrRef, RunEvent, RunId, Scope,
+    Actor, BudgetHit, BudgetKind, Cause, Closed, Closing, EntryId, InboxDelta, InboxEntry, PrRef,
+    RunEvent, RunId, Scope,
 };
 use tokio::sync::broadcast;
 
@@ -23,6 +24,12 @@ use crate::notifications::Notifications;
 use crate::runs::journal::Journal;
 use crate::runs::{RunError, now};
 use crate::store::{Store, StoreError};
+
+/// The title of the PR entry a spent PR Budget raises.
+pub const OVER_BUDGET: &str = "Over budget";
+
+/// The title of the shared entry a spent daily Budget raises.
+pub const DAILY_BUDGET_SPENT: &str = "Daily Budget spent";
 
 /// Deltas a slow subscriber may fall behind by before it gets a fresh
 /// snapshot instead.
@@ -139,6 +146,7 @@ impl Inbox {
             vec![reason.to_owned()],
             pr,
             vec![run],
+            None,
         )
     }
 
@@ -186,7 +194,7 @@ impl Inbox {
             return Ok(());
         }
         let reasons = vec![format!("`{step}` waits for you to approve or reject")];
-        state.raise(scope, prompt.to_owned(), reasons, pr, vec![run])
+        state.raise(scope, prompt.to_owned(), reasons, pr, vec![run], None)
     }
 
     /// Closes the open Human Step entry for `step` in `run` as `how`: the
@@ -243,7 +251,7 @@ impl Inbox {
         let Some(id) = state.find(|entry| entry.scope == Scope::Pr && entry.prs.contains(&pr))
         else {
             let runs = run.into_iter().collect();
-            return state.raise(Scope::Pr, title.to_owned(), reasons, pr, runs);
+            return state.raise(Scope::Pr, title.to_owned(), reasons, pr, runs, None);
         };
         let open = state.open.get_mut(&id).expect("found above");
         for reason in reasons {
@@ -284,6 +292,7 @@ impl Inbox {
                 reasons,
                 pr,
                 latest.into_iter().collect(),
+                None,
             );
         };
         let open = state.open.get_mut(&id).expect("found above");
@@ -295,6 +304,74 @@ impl Inbox {
         }
         open.entry.reasons = reasons;
         state.changed(id, latest)
+    }
+
+    /// Raises the entry a spent Budget asks for, or brings the open one up
+    /// to date: the PR's own entry for its Budget, the shared entry for
+    /// the day's, which holds `pr` back from then on. `run` is the Run
+    /// that ran out, or the PR's latest Run when a Run couldn't start.
+    pub(crate) fn over_budget(
+        &self,
+        pr: PrRef,
+        run: Option<RunId>,
+        hit: BudgetHit,
+    ) -> Result<(), StoreError> {
+        let (scope, title, advice) = match hit.kind {
+            BudgetKind::Pr => (
+                Scope::Pr,
+                OVER_BUDGET,
+                "Its next Run waits for an outside push, a raise, or \"run anyway once\".",
+            ),
+            BudgetKind::Daily => (
+                Scope::Cause {
+                    cause: Cause::DailyBudget,
+                },
+                DAILY_BUDGET_SPENT,
+                "Every PR's next Run waits for local midnight, a raise, or \"run anyway once\".",
+            ),
+        };
+        let reasons = vec![hit.to_string(), advice.to_owned()];
+        let mut state = self.state();
+        let found = state.find(|entry| {
+            entry.scope == scope && (hit.kind == BudgetKind::Daily || entry.prs.contains(&pr))
+        });
+        let Some(id) = found else {
+            let runs = run.into_iter().collect();
+            return state.raise(scope, title.to_owned(), reasons, pr, runs, Some(hit));
+        };
+        let open = state.open.get_mut(&id).expect("found above");
+        open.entry.title = title.to_owned();
+        open.entry.reasons = reasons;
+        open.entry.budget = Some(hit);
+        if let Err(index) = open.entry.prs.binary_search(&pr) {
+            open.entry.prs.insert(index, pr);
+        }
+        state.changed(id, run)
+    }
+
+    /// The open entry `id`.
+    pub fn entry(&self, id: EntryId) -> Option<InboxEntry> {
+        self.state().open.get(&id).map(|open| open.entry.clone())
+    }
+
+    /// Closes the open entry `id`, which the developer answered with
+    /// `action`.
+    pub(crate) fn answer_entry(
+        &self,
+        id: EntryId,
+        action: &str,
+        actor: &Actor,
+    ) -> Result<(), StoreError> {
+        let mut state = self.state();
+        if !state.open.contains_key(&id) {
+            return Ok(());
+        }
+        let how = Closing::Answered {
+            action: action.to_owned(),
+            actor: actor.clone(),
+            note: None,
+        };
+        state.close(id, how)
     }
 
     /// The PRs `cause`'s open entry holds back, if one is open.
@@ -406,6 +483,7 @@ impl State {
         reasons: Vec<String>,
         pr: PrRef,
         runs: Vec<RunId>,
+        budget: Option<BudgetHit>,
     ) -> Result<(), StoreError> {
         let entry = InboxEntry {
             id: EntryId(0),
@@ -414,6 +492,7 @@ impl State {
             reasons,
             prs: vec![pr],
             raised_at: now(),
+            budget,
             closed: None,
         };
         let id = self.store.insert_entry(&entry, &runs)?;

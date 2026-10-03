@@ -10,7 +10,8 @@ use crate::error::LoadError;
 use crate::expr::{Context, Expr, RESERVED_IDS};
 use crate::library::{self, LibraryFile, is_library_step_name};
 use crate::pipeline::{
-    BUILTIN_PLUGINS, FIX_ROUNDS_CEILING, FIX_ROUNDS_DEFAULT, Pipeline, Step, Uses, Workspace,
+    BUILTIN_PLUGINS, FIX_ROUNDS_CEILING, FIX_ROUNDS_DEFAULT, PR_BUDGET_DEFAULT, Pipeline, Step,
+    Uses, Workspace,
 };
 use crate::validate;
 
@@ -39,6 +40,8 @@ struct PipelineFile {
     version: u32,
     #[serde(default)]
     fix_rounds: Option<u32>,
+    #[serde(default)]
+    budget_usd: Option<f64>,
     steps: BTreeMap<String, StepEntry>,
     #[serde(default)]
     gate: Vec<Value>,
@@ -58,6 +61,8 @@ struct StepEntry {
     timeout: Option<String>,
     #[serde(default)]
     stall_after: Option<String>,
+    #[serde(default)]
+    budget_usd: Option<f64>,
 }
 
 /// Loads and validates a Pipeline. On failure, returns the errors found.
@@ -73,6 +78,7 @@ pub fn load(text: &str, resolver: &dyn Resolver) -> Result<Pipeline, Vec<LoadErr
         steps: read.steps,
         gate: read.gate,
         fix_rounds: read.fix_rounds,
+        budget_usd: read.budget_usd,
         order,
     })
 }
@@ -103,6 +109,7 @@ struct Read {
     stand_ins: BTreeMap<String, Step>,
     gate: Vec<Expr>,
     fix_rounds: u32,
+    budget_usd: f64,
     errors: Vec<LoadError>,
 }
 
@@ -119,6 +126,10 @@ fn read(text: &str, resolver: &dyn Resolver) -> Result<Read, Vec<LoadError>> {
     let fix_rounds = file.fix_rounds.unwrap_or(FIX_ROUNDS_DEFAULT);
     if fix_rounds > FIX_ROUNDS_CEILING {
         errors.push(LoadError::FixRoundsCeiling(fix_rounds));
+    }
+    let budget_usd = file.budget_usd.unwrap_or(PR_BUDGET_DEFAULT);
+    if !is_budget(budget_usd) {
+        errors.push(LoadError::InvalidPrBudget(budget_usd.to_string()));
     }
 
     let mut steps = BTreeMap::new();
@@ -159,6 +170,7 @@ fn read(text: &str, resolver: &dyn Resolver) -> Result<Read, Vec<LoadError>> {
         stand_ins,
         gate,
         fix_rounds,
+        budget_usd,
         errors,
     })
 }
@@ -183,6 +195,7 @@ fn stand_in(id: &str, node: &StepEntry) -> Option<Step> {
         config: Map::new(),
         timeout: None,
         stall_after: None,
+        budget_usd: None,
         needs: node.needs.clone(),
         when,
         default_condition: Step::default_condition_for(&node.needs, Workspace::None),
@@ -218,13 +231,20 @@ fn resolve_step(
     }
 
     let mut errors = Vec::new();
-    let (mut config, mut timeout, mut stall_after) = match library {
-        Some(lib) => (lib.with, lib.timeout, lib.stall_after),
-        None => (Map::new(), None, None),
+    let (mut config, mut timeout, mut stall_after, mut budget_usd) = match library {
+        Some(lib) => (lib.with, lib.timeout, lib.stall_after, lib.budget_usd),
+        None => (Map::new(), None, None, None),
     };
     config.extend(node.with);
     timeout = node.timeout.or(timeout);
     stall_after = node.stall_after.or(stall_after);
+    budget_usd = node.budget_usd.or(budget_usd);
+    if let Some(value) = budget_usd.filter(|&usd| !is_budget(usd)) {
+        errors.push(LoadError::InvalidStepBudget {
+            step: step.clone(),
+            value: value.to_string(),
+        });
+    }
     let timeout = duration(id, "timeout", timeout, &mut errors);
     let stall_after = duration(id, "stall_after", stall_after, &mut errors);
 
@@ -255,6 +275,7 @@ fn resolve_step(
         config,
         timeout,
         stall_after,
+        budget_usd,
         needs: node.needs,
         when,
         default_condition,
@@ -315,6 +336,11 @@ fn duration(
         });
     }
     parsed
+}
+
+/// Whether `usd` can be a Budget: a finite amount above zero.
+pub(crate) fn is_budget(usd: f64) -> bool {
+    usd.is_finite() && usd > 0.0
 }
 
 /// A duration written as `90s`, `30m` or `2h`, as Pipelines and Plugin

@@ -4,7 +4,7 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::load::parse_duration;
+use crate::load::{is_budget, parse_duration};
 
 /// A Library Step that ships with slopwatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,8 @@ pub(crate) struct LibraryFile {
     pub timeout: Option<String>,
     #[serde(default)]
     pub stall_after: Option<String>,
+    #[serde(default)]
+    pub budget_usd: Option<f64>,
 }
 
 /// Parses a Library Step file. The error says what's wrong, without naming
@@ -81,6 +83,11 @@ pub fn check_library_step(text: &str) -> Result<(), String> {
                 "it sets `{key}: {value}`; write a duration such as 90s, 30m or 2h"
             ));
         }
+    }
+    if let Some(usd) = library.budget_usd.filter(|&usd| !is_budget(usd)) {
+        return Err(format!(
+            "it sets `budget_usd: {usd}`; write an amount in US dollars above 0, such as 2"
+        ));
     }
     Ok(())
 }

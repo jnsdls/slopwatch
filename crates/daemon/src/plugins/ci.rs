@@ -36,6 +36,7 @@ pub fn manifest() -> Manifest {
         timeout: Some("90m".into()),
         stall_after: None,
         // Waiting on GitHub costs nothing, so only the global cap applies.
+        budget_usd: None,
         concurrency: None,
     }
 }

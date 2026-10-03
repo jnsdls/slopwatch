@@ -10,7 +10,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Actor, RepoName, RunId};
+use crate::{Actor, BudgetHit, RepoName, RunId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -37,6 +37,10 @@ pub struct InboxEntry {
     pub prs: Vec<PrRef>,
     /// Seconds since the Unix epoch.
     pub raised_at: i64,
+    /// The spent Budget behind an over budget entry, which offers to
+    /// raise it or run anyway once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetHit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<Closed>,
 }
@@ -121,6 +125,9 @@ pub enum Cause {
     /// than its Approval covers (ADR 0012). It clears once the developer
     /// approves it.
     UnapprovedPlugin { plugin: String },
+    /// Steps spent the day's Budget. It clears at local midnight, or once
+    /// the developer raises the Budget or turns it off.
+    DailyBudget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -260,6 +267,7 @@ mod tests {
                 number: 7,
             }],
             raised_at: 100,
+            budget: None,
             closed: None,
         }
     }

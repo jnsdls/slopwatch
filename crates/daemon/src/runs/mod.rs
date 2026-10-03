@@ -42,6 +42,7 @@
 //! One lock serializes the engine: a sync and the reports from Step
 //! processes take turns. Reading a Pipeline from git happens outside it.
 
+mod budgets;
 mod effects;
 pub(crate) mod journal;
 pub mod log;
@@ -66,9 +67,9 @@ use slopwatch_protocol::step::{
     Outputs, PR_DIFF, PrSnapshot, Start, ToStep,
 };
 use slopwatch_protocol::{
-    Actor, Answer, Cause, Closing, GateTerm, LogFilter, LogKey, LogPage, LogRecord, PluginListing,
-    PluginSettings, PrRef, RepoName, RunEvent, RunId, SecretInfo, SecretValue, StepInfo,
-    StepLogPage, Waiver,
+    Actor, Answer, BudgetHit, BudgetKind, Cause, Cents, Closing, DaemonSettings, EntryId, GateTerm,
+    LogFilter, LogKey, LogPage, LogRecord, PluginListing, PluginSettings, PrRef, RepoName,
+    RunEvent, RunId, SecretInfo, SecretValue, StepInfo, StepLogPage, Waiver,
 };
 use tokio::sync::mpsc;
 
@@ -247,7 +248,10 @@ impl Runs {
             let secrets = Arc::clone(&secrets);
             tokio::task::spawn_blocking(move || secrets.warm());
         }
+        let settings = store.daemon_settings()?;
         let mut engine = Engine {
+            settings,
+            budget_held: HashMap::new(),
             clones: Arc::clone(&clones),
             secrets: Arc::clone(&secrets),
             inbox: Arc::clone(&inbox),
@@ -513,6 +517,43 @@ impl Runs {
         engine.schedule();
         self.live
             .store(!engine.active.is_empty(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Answers the over budget entry `entry` by raising the Budget it ran
+    /// out of to `to`. The PRs it held start again.
+    pub async fn raise_budget(
+        &self,
+        entry: EntryId,
+        to: Cents,
+        actor: &Actor,
+    ) -> Result<(), RunError> {
+        self.command(|engine| engine.raise_budget(entry, to, actor))
+            .await?;
+        // A held PR whose head moved starts from a sync.
+        self.sync().await;
+        Ok(())
+    }
+
+    /// Answers the over budget entry `entry` by letting the next Run of
+    /// each PR it holds past the Budget it ran out of.
+    pub async fn run_anyway_once(&self, entry: EntryId, actor: &Actor) -> Result<(), RunError> {
+        self.command(|engine| engine.run_anyway_once(entry, actor))
+            .await?;
+        self.sync().await;
+        Ok(())
+    }
+
+    /// The daemon's own settings, and what Steps spent today.
+    pub async fn settings(&self) -> Result<(DaemonSettings, Cents), StoreError> {
+        let engine = self.engine.lock().await;
+        Ok((engine.settings, Cents::from_usd(engine.spent_today()?)))
+    }
+
+    /// Replaces the daemon's own settings.
+    pub async fn set_settings(&self, settings: DaemonSettings) -> Result<(), RunError> {
+        self.command(|engine| engine.set_settings(settings)).await?;
+        self.sync().await;
         Ok(())
     }
 
@@ -874,6 +915,10 @@ struct Engine {
     reconciled: bool,
     /// The daemon is about to exit: nothing more changes.
     stopped: bool,
+    /// The developer's settings in the daemon, such as the daily Budget.
+    settings: DaemonSettings,
+    /// PRs a spent Budget holds back from a new Run ([`budgets`]).
+    budget_held: HashMap<PrKey, budgets::BudgetHold>,
 }
 
 /// When a PR the sync picked gets its new Run.
@@ -982,6 +1027,14 @@ struct Active {
     /// How many merges the Run asked for have finished. A merge state
     /// read before the latest one doesn't count (see [`MergeRead`]).
     merge_epoch: u64,
+    /// The first Run since the PR's last outside push, whose Runs share
+    /// the PR's Budget.
+    budget_window: RunId,
+    /// The Budgets "run anyway once" lifted for this Run.
+    lifted: Vec<BudgetKind>,
+    /// The Budget the Run ran out of. Nothing more starts, and it ends
+    /// over budget once its running Steps settle.
+    over_budget: Option<BudgetHit>,
 }
 
 impl Active {
@@ -1079,6 +1132,13 @@ struct Running {
     awaiting: HashSet<String>,
     /// Where it stands with the developer, for a Step that asks.
     question: Question,
+    /// What the attempt may spend, its own Budget.
+    budget: Option<f64>,
+    /// What the attempt reported spending.
+    spent: f64,
+    /// It spends money: it has a Budget of its own or reported a priced
+    /// call. A spent PR or daily Budget stops it.
+    costed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1209,6 +1269,9 @@ impl Engine {
                 rerun: HashSet::new(),
                 merged: false,
                 merge_epoch: 0,
+                budget_window: stored.budget_window,
+                lifted: stored.lifted,
+                over_budget: None,
             };
             active.state.waived =
                 self.store
@@ -1463,6 +1526,7 @@ impl Engine {
         }
         self.clear_set_secrets()?;
         self.clear_approved_plugins()?;
+        self.clear_daily_budget()?;
 
         let gone: Vec<PrKey> = self
             .blocked
@@ -1475,7 +1539,11 @@ impl Engine {
         }
         let mut starts = Vec::new();
         for (key, (repo, pr)) in &open {
-            if !pr.labeled || self.active.contains_key(key) || held.contains(key) {
+            if !pr.labeled
+                || self.active.contains_key(key)
+                || held.contains(key)
+                || self.budget_holds(key, pr)
+            {
                 continue;
             }
             let root = pr.root();
@@ -1522,6 +1590,8 @@ impl Engine {
             starts.push((repo.clone(), pr.clone(), when));
         }
         self.checked_base
+            .retain(|key, _| open.get(key).is_some_and(|(_, pr)| pr.labeled));
+        self.budget_held
             .retain(|key, _| open.get(key).is_some_and(|(_, pr)| pr.labeled));
         self.watched = open
             .into_iter()
@@ -1647,6 +1717,12 @@ impl Engine {
         // start.
         self.inbox.clear(invalid_pipeline(repo, base))?;
         self.unblock(&key, Closing::NothingHeld)?;
+        let window = self.budget_window(repo, pr)?;
+        if self.hold_if_spent(&key, pr, window, &pipeline)? {
+            return Ok(());
+        }
+        self.budget_held.remove(&key);
+        let lifted = self.store.lifts(repo, pr.number)?;
 
         let steps: Vec<_> = pipeline.ordered_steps().collect();
         let id = self.store.insert_run(
@@ -1668,9 +1744,12 @@ impl Engine {
                         config_hash: step.config_hash(),
                     })
                     .collect(),
+                budget_window: window,
+                lifted: &lifted,
             },
             now(),
         )?;
+        self.store.clear_lifts(repo, pr.number)?;
         let started = RunEvent::Started {
             repo: repo.clone(),
             number: pr.number,
@@ -1720,6 +1799,9 @@ impl Engine {
                 rerun: HashSet::new(),
                 merged: false,
                 merge_epoch: 0,
+                budget_window: window.unwrap_or(id),
+                lifted,
+                over_budget: None,
             },
         );
         for (step, waiver) in self.store.waivers(repo, pr.number, &pr.head_sha)? {
@@ -1832,6 +1914,8 @@ impl Engine {
             return Ok(());
         }
         let id = run.id;
+        self.check_budgets(key)?;
+        let over_budget = self.active[key].over_budget.is_some();
         // A Step that settles as it starts, reused or unable to spawn, needs
         // another plan for the Steps after it. The rest wait in the queue.
         let mut starts = HashSet::new();
@@ -1842,6 +1926,8 @@ impl Engine {
             let plan = run.pipeline.plan(&run.state);
             for (step, decision) in plan.decisions {
                 match decision {
+                    // A spent Budget starts nothing more.
+                    Decision::Start if over_budget => {}
                     Decision::Start => {
                         if self.hold_unapproved(key, &step)? || self.reuse(key, &step)? {
                             replan = true;
@@ -1888,13 +1974,21 @@ impl Engine {
             .pipeline
             .steps()
             .all(|step| matches!(run.state.steps.get(&step.id), Some(StepState::Settled(_))));
-        if settled {
+        let stopped = over_budget
+            && run.preparing.is_empty()
+            && run.interrupted.is_empty()
+            && run.running.values().all(|running| running.reported);
+        if settled || stopped {
             let reason = end_reason(run);
             let run = self.active.remove(key).expect("checked above");
             return self.end_run(run, reason);
         }
         // An errored Step holds up a Run that goes on, until the developer
-        // retries it or the Run ends.
+        // retries it or the Run ends. A Run out of budget raises its one
+        // entry once it ends.
+        if over_budget {
+            return Ok(());
+        }
         let pr = pr_ref(&key.0, key.1);
         for step in run.pipeline.steps() {
             if run.state.steps.get(&step.id) == Some(&StepState::Settled(Verdict::Error)) {
@@ -2057,7 +2151,8 @@ impl Engine {
         let dir = step_dir(&self.data_dir, run, &step, attempt);
         let wanted = self.key_of(run).filter(|key| {
             let active = &self.active[key];
-            active.preparing.get(&step) == Some(&attempt)
+            active.over_budget.is_none()
+                && active.preparing.get(&step) == Some(&attempt)
                 && matches!(
                     active.state.steps.get(&step),
                     None | Some(StepState::Pending)
@@ -2071,6 +2166,10 @@ impl Engine {
         }
         let Some(key) = wanted else {
             let _ = std::fs::remove_dir_all(dir);
+            // A Run out of budget may have waited only for this Step.
+            if let Some(key) = self.key_of(run) {
+                self.advance(&key)?;
+            }
             return Ok(());
         };
         match result {
@@ -2159,6 +2258,13 @@ impl Engine {
             }
         };
         let mask = Mask::new(handed.iter().map(|(_, value)| value.expose()));
+        let own_budget = budgets::step_budget(step, manifest.as_ref());
+        let budget_usd = self.start_budget(key, own_budget)?;
+        let run = self.active.get_mut(key).expect("only active Runs advance");
+        let step = run
+            .pipeline
+            .step(step_id)
+            .expect("the plan names Pipeline Steps");
 
         // Taken before the spawn, so a rebuild in between makes the
         // Outcome harder to reuse, never easier.
@@ -2183,8 +2289,7 @@ impl Engine {
                 .into_iter()
                 .filter_map(|id| Some((id.clone(), run.outcomes.get(&id)?.clone())))
                 .collect(),
-            // Budgets (#73) set it.
-            budget_usd: None,
+            budget_usd,
         });
         let path = self.plugins.path(&step.plugin, &self.step_path);
         let mut env = step_env(run.id, step_id, &path);
@@ -2267,6 +2372,9 @@ impl Engine {
                 reported: false,
                 awaiting: HashSet::new(),
                 question: Question::NotAsked,
+                budget: own_budget,
+                spent: 0.0,
+                costed: own_budget.is_some(),
             },
         );
         self.journal.append(
@@ -2505,9 +2613,19 @@ impl Engine {
             // Usage counts even after a cancel: the call was made.
             Report::Message(FromStep::Usage(mut usage)) => {
                 usage.usd = prices::usd(&usage);
-                self.journal
-                    .append(report.run, RunEvent::StepUsage { step, usage })?;
-                return Ok(());
+                let usd = usage.usd;
+                self.journal.append(
+                    report.run,
+                    RunEvent::StepUsage {
+                        step: step.clone(),
+                        usage,
+                    },
+                )?;
+                // An unpriced call isn't budgeted.
+                return match usd {
+                    Some(usd) if usd > 0.0 => self.on_usage(&key, &step, usd),
+                    _ => Ok(()),
+                };
             }
             Report::Message(FromStep::Progress {
                 message: Some(message),
@@ -2678,6 +2796,10 @@ impl Engine {
                 self.inbox
                     .raise_pr(pr_ref(&run.repo, run.number), Some(run.id), title, reasons)?;
             }
+        }
+        if let (EndReason::OverBudget, Some(hit)) = (reason, run.over_budget) {
+            self.inbox
+                .over_budget(pr_ref(&run.repo, run.number), Some(run.id), hit)?;
         }
         if reason == EndReason::Shippable {
             let title = self.watching.title(&run.repo, run.number);
@@ -3010,10 +3132,11 @@ impl Engine {
         if let Some(message) = self
             .blocked
             .get(&key)
-            .map(|blocked| &blocked.message)
-            .or_else(|| self.held.get(&key))
+            .map(|blocked| blocked.message.clone())
+            .or_else(|| self.held.get(&key).cloned())
+            .or_else(|| self.budget_message(&key))
         {
-            return Err(RunError::Invalid(message.clone()));
+            return Err(RunError::Invalid(message));
         }
         Ok(pr)
     }
@@ -3085,7 +3208,8 @@ impl Engine {
                 .blocked
                 .get(&(repo.clone(), number))
                 .map(|blocked| blocked.message.clone())
-                .or_else(|| self.held.get(&(repo.clone(), number)).cloned()),
+                .or_else(|| self.held.get(&(repo.clone(), number)).cloned())
+                .or_else(|| self.budget_message(&(repo.clone(), number))),
         };
         self.watching.set_run_info(repo, number, info);
         Ok(())
@@ -3110,6 +3234,9 @@ fn end_reason(run: &Active) -> EndReason {
     };
     if run.merged || merge_verdicts().any(|verdict| verdict == Verdict::Pass) {
         return EndReason::Merged;
+    }
+    if run.over_budget.is_some() {
+        return EndReason::OverBudget;
     }
     match run.gate {
         GateState::Pass if !merge_verdicts().any(failed_to_land) => EndReason::Shippable,

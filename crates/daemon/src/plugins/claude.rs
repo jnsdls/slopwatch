@@ -47,6 +47,8 @@ pub fn manifest() -> Manifest {
         // Step contract: agent Steps get 30 minutes and a 5 minute stall.
         timeout: Some("30m".into()),
         stall_after: Some("5m".into()),
+        // Cost budgets: an agent Step may spend $2 a Run by default.
+        budget_usd: Some(2.0),
         concurrency: None,
     }
 }

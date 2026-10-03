@@ -110,6 +110,8 @@ pub fn manifest() -> Manifest {
         secrets: vec![SecretSpec::required(KEY_SECRET)],
         timeout: Some(TIMEOUT.into()),
         stall_after: None,
+        // Cost budgets: a Jev call costs about a tenth of a cent.
+        budget_usd: Some(0.05),
         concurrency: Some(CONCURRENCY),
     }
 }

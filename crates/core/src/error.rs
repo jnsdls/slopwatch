@@ -31,6 +31,14 @@ pub enum LoadError {
         key: &'static str,
         value: String,
     },
+    #[error(
+        "the Pipeline sets `budget_usd: {0}`; write an amount in US dollars above 0, such as 10"
+    )]
+    InvalidPrBudget(String),
+    #[error(
+        "Step `{step}` sets `budget_usd: {value}`; write an amount in US dollars above 0, such as 2"
+    )]
+    InvalidStepBudget { step: String, value: String },
     #[error("Step `{step}` has an invalid Condition: {message}")]
     InvalidCondition { step: String, message: String },
     #[error("the Gate is invalid: {0}")]

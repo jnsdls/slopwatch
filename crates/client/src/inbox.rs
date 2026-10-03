@@ -126,6 +126,7 @@ mod tests {
                 })
                 .collect(),
             raised_at: 0,
+            budget: None,
             closed: None,
         }
     }

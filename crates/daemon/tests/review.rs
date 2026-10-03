@@ -64,8 +64,11 @@ impl World {
         let mut with = with;
         with["cli"] = json!(cli.to_str().unwrap());
         with["prompt"] = json!("Find bugs.");
+        // Budgets well past what the fake CLIs report, so the reviews
+        // aren't stopped.
         let pipeline = format!(
-            "version: 1\nsteps:\n  review: {{ uses: {plugin}, with: {with} }}\ngate: [review]\n"
+            "version: 1\nbudget_usd: 20\nsteps:\n  review: {{ uses: {plugin}, budget_usd: 20, with: \
+             {with} }}\ngate: [review]\n"
         );
         let github = Arc::new(FakeGitHub::new("me"));
         github.add_repo(&repo());

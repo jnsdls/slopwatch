@@ -482,6 +482,7 @@ mod tests {
             secrets,
             timeout: None,
             stall_after: None,
+            budget_usd: None,
             concurrency: None,
         }
     }

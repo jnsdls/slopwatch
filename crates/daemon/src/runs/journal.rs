@@ -179,6 +179,8 @@ mod tests {
                     files: &[],
                     linked_issues: &[],
                     steps: vec![],
+                    budget_window: None,
+                    lifted: &[],
                 },
                 0,
             )

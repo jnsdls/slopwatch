@@ -645,6 +645,7 @@ mod tests {
                     number: 7,
                 }],
                 raised_at: 1,
+                budget: None,
                 closed: closed.map(|how| Closed { at: 2, how }),
             },
         };

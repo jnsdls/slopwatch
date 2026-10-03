@@ -10,6 +10,9 @@ use crate::expr::{Expr, StepTerm};
 pub const FIX_ROUNDS_DEFAULT: u32 = 3;
 /// The most `fix_rounds` a Pipeline may set.
 pub const FIX_ROUNDS_CEILING: u32 = 10;
+/// A Watched PR's Budget when the Pipeline doesn't set `budget_usd`, in
+/// list-price US dollars.
+pub const PR_BUDGET_DEFAULT: f64 = 10.0;
 /// Built-in Plugin names. A third-party Plugin can't take one.
 pub const BUILTIN_PLUGINS: &[&str] = &["jev", "ci", "claude", "codex", "fix", "human", "merge"];
 /// The id that names the Gate in `needs` and Conditions.
@@ -21,6 +24,9 @@ pub struct Pipeline {
     pub(crate) steps: BTreeMap<String, Step>,
     pub(crate) gate: Vec<Expr>,
     pub(crate) fix_rounds: u32,
+    /// What Steps may spend on one Watched PR since its last outside push,
+    /// in list-price US dollars.
+    pub(crate) budget_usd: f64,
     /// Every Step id plus [`GATE`], each after everything it reads.
     pub(crate) order: Vec<String>,
 }
@@ -60,6 +66,11 @@ impl Pipeline {
     pub fn fix_rounds(&self) -> u32 {
         self.fix_rounds
     }
+
+    /// The Watched PR's Budget, in list-price US dollars.
+    pub fn budget_usd(&self) -> f64 {
+        self.budget_usd
+    }
 }
 
 /// One Step of a Pipeline, with its Library Step and `with:` overrides
@@ -78,6 +89,10 @@ pub struct Step {
     pub config: Map<String, Value>,
     pub timeout: Option<Duration>,
     pub stall_after: Option<Duration>,
+    /// What the Step may spend in one attempt, in list-price US dollars,
+    /// as the Pipeline or its Library Step sets it. `None` leaves its
+    /// Plugin's default.
+    pub budget_usd: Option<f64>,
     /// Step ids, or [`GATE`], this Step reads and starts after.
     pub needs: Vec<String>,
     /// The Condition the file wrote, if any.

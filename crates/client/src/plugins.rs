@@ -325,6 +325,7 @@ mod tests {
             reasons: vec![],
             prs: vec![],
             raised_at: 0,
+            budget: None,
             closed: None,
         };
         assert_eq!(unapproved_plugin(&entry), Some("lint"));
