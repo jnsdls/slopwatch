@@ -316,6 +316,30 @@ pub enum Command {
         plugin: String,
         settings: PluginSettings,
     },
+    /// Publishes the repo's draft as a PR (ADR 0007). The daemon replays
+    /// the draft's edits onto the Pipeline file as it is now on the
+    /// default branch, commits the result to `slopwatch/pipeline`, and
+    /// opens a PR from it, or updates the one already open. A node changed
+    /// on both sides stops the publish, and the draft then carries both
+    /// versions in `conflicts`. A Pipeline that wouldn't load is refused
+    /// with the loader's reasons.
+    /// `edits_seen` is how many edits the draft held when the developer
+    /// chose to publish, so edits made since aren't published unseen.
+    PublishPipeline {
+        repo: RepoName,
+        edits_seen: usize,
+    },
+    /// Merges the repo's open Pipeline PR at the head publishing left, as
+    /// "Merge it now" asks. Once it lands, the draft starts over from the
+    /// default branch, and Watched PRs on that branch get same-SHA Runs.
+    MergePipeline {
+        repo: RepoName,
+    },
+    /// Drops the draft's edits and starts it over from the default branch
+    /// as it is now. An open Pipeline PR stays open.
+    DiscardPipelineDraft {
+        repo: RepoName,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

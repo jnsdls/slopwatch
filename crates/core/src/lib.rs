@@ -13,6 +13,7 @@ mod expr;
 mod library;
 mod load;
 mod pipeline;
+mod replay;
 mod reuse;
 mod run;
 mod validate;
@@ -29,6 +30,7 @@ pub use load::{PluginInfo, Resolver, check, load, parse_duration, resolve_uses};
 pub use pipeline::{
     BUILTIN_PLUGINS, FIX_ROUNDS_CEILING, FIX_ROUNDS_DEFAULT, GATE, Pipeline, Step, Uses, Workspace,
 };
+pub use replay::{Conflict, Node, ReplayError, Replayed, replay};
 pub use reuse::ReuseKey;
 pub use run::{Decision, Plan, PrFacts, RunState, SkipReason};
 pub use verdict::{EndReason, GateState, StepState, Verdict, WaiverCategory};

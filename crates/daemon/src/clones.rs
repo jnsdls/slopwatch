@@ -234,6 +234,60 @@ impl Clones {
         fetch_branch(&path, remote, branch).await
     }
 
+    /// The commit at the tip of `branch` on the remote, or `None` if the
+    /// remote has no such branch. Fetches nothing.
+    pub async fn tip(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        branch: &str,
+    ) -> Result<Option<String>, GitError> {
+        let path = {
+            let _turn = self.turn(repo).await;
+            self.cloned(repo, remote).await?
+        };
+        let listed = git(
+            &path,
+            remote,
+            &["ls-remote", &remote.url, &format!("refs/heads/{branch}")],
+        )
+        .await?;
+        Ok(listed.split_whitespace().next().map(str::to_owned))
+    }
+
+    /// Whether the Pipeline file at `base_sha` differs from the one at the
+    /// commit where `head_sha` branched from it. Both commits must have
+    /// been fetched, as [`Clones::pipeline_at`] does.
+    pub async fn pipeline_moved_since_fork(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        head_sha: &str,
+        base_sha: &str,
+    ) -> Result<bool, GitError> {
+        let _turn = self.turn(repo).await;
+        let path = self.cloned(repo, remote).await?;
+        let fork = git(&path, remote, &["merge-base", head_sha, base_sha]).await?;
+        let blob = async |commit: &str| {
+            let listed = git(&path, remote, &["ls-tree", commit, "--", PIPELINE_PATH]).await?;
+            Ok::<_, GitError>(listed.split_whitespace().nth(2).map(str::to_owned))
+        };
+        Ok(blob(&fork).await? != blob(base_sha).await?)
+    }
+
+    /// The parents of `sha`, a commit the clone has fetched.
+    pub async fn parents(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        sha: &str,
+    ) -> Result<Vec<String>, GitError> {
+        let _turn = self.turn(repo).await;
+        let path = self.cloned(repo, remote).await?;
+        let listed = git(&path, remote, &["log", "-1", "--format=%P", sha]).await?;
+        Ok(listed.split_whitespace().map(str::to_owned).collect())
+    }
+
     /// Waits for the repo's turn: one git operation per repo at a time.
     async fn turn(&self, repo: &RepoName) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = self

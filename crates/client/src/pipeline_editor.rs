@@ -44,6 +44,9 @@ pub struct PipelineEditor {
     notice: Option<String>,
     /// Nodes dropped somewhere new, until the daemon's draft has them.
     moved: BTreeMap<String, Point>,
+    /// What the editor is waiting on GitHub for, such as "Publishing…",
+    /// until the daemon answers.
+    busy: Option<&'static str>,
 }
 
 impl PipelineEditor {
@@ -114,12 +117,14 @@ impl PipelineEditor {
             let exists = node == GATE || draft.step(node).is_some();
             !kept && exists
         });
+        self.busy = None;
         self.draft = Some(draft);
     }
 
     /// Shows why the daemon refused the last gesture.
     pub fn refused(&mut self, message: String) {
         self.notice = Some(message);
+        self.busy = None;
     }
 
     pub fn select(&mut self, selection: Option<Selection>) {
@@ -239,6 +244,61 @@ impl PipelineEditor {
         self.repo
             .iter()
             .map(|repo| Command::TidyPipeline { repo: repo.clone() })
+            .collect()
+    }
+
+    /// What the editor waits on GitHub for, such as "Publishing…".
+    pub fn busy(&self) -> Option<&'static str> {
+        self.busy
+    }
+
+    /// Whether the draft has edits to publish, and nothing is under way.
+    pub fn can_publish(&self) -> bool {
+        self.busy.is_none() && self.draft.as_ref().is_some_and(|d| !d.edits.is_empty())
+    }
+
+    /// Publishes the draft as it stands as a PR (ADR 0007).
+    pub fn publish(&mut self) -> Vec<Command> {
+        let (Some(repo), Some(draft)) = (&self.repo, &self.draft) else {
+            return Vec::new();
+        };
+        if !self.can_publish() {
+            return Vec::new();
+        }
+        let command = Command::PublishPipeline {
+            repo: repo.clone(),
+            edits_seen: draft.edits.len(),
+        };
+        self.notice = None;
+        self.busy = Some("Publishing…");
+        vec![command]
+    }
+
+    /// Merges the draft's Pipeline PR, as "Merge it now" asks.
+    pub fn merge_now(&mut self) -> Vec<Command> {
+        let Some(repo) = &self.repo else {
+            return Vec::new();
+        };
+        let published = self.draft.as_ref().and_then(|d| d.published.as_ref());
+        if published.is_none() || self.busy.is_some() {
+            return Vec::new();
+        }
+        let command = Command::MergePipeline { repo: repo.clone() };
+        self.notice = None;
+        self.busy = Some("Merging…");
+        vec![command]
+    }
+
+    /// Drops the draft's edits, so it starts over from the default branch.
+    pub fn discard(&mut self) -> Vec<Command> {
+        if self.busy.is_some() {
+            return Vec::new();
+        }
+        self.notice = None;
+        self.selected = None;
+        self.repo
+            .iter()
+            .map(|repo| Command::DiscardPipelineDraft { repo: repo.clone() })
             .collect()
     }
 
@@ -452,6 +512,8 @@ mod tests {
                     summary: None,
                 },
             ],
+            published: None,
+            conflicts: Vec::new(),
         }
     }
 
@@ -696,5 +758,58 @@ mod tests {
         editor.apply(without);
 
         assert_eq!(editor.selected(), None);
+    }
+
+    #[test]
+    fn publishing_sends_the_draft_as_seen_and_waits_for_the_daemon() {
+        let mut editor = opened();
+        assert!(!editor.can_publish(), "nothing to publish yet");
+        assert!(editor.publish().is_empty());
+
+        let mut edited = draft();
+        edited.edits = vec![Edit::SetFixRounds(Some(2))];
+        editor.apply(edited.clone());
+        editor.refused("an older refusal".into());
+
+        assert_eq!(
+            editor.publish(),
+            [Command::PublishPipeline {
+                repo: repo(),
+                edits_seen: 1
+            }]
+        );
+        assert_eq!(editor.busy(), Some("Publishing…"));
+        assert_eq!(editor.notice(), None);
+        assert!(editor.publish().is_empty(), "one at a time");
+
+        editor.refused("Publishing stopped: the Gate changed".into());
+        assert_eq!(editor.busy(), None);
+        editor.publish();
+        editor.apply(edited);
+        assert_eq!(editor.busy(), None, "the daemon's new draft ends the wait");
+    }
+
+    #[test]
+    fn merge_it_now_needs_a_published_pr() {
+        let mut editor = opened();
+        assert!(editor.merge_now().is_empty());
+
+        let mut published = draft();
+        published.published = Some(slopwatch_protocol::pipeline::PipelinePr {
+            number: 4,
+            url: "https://github.com/o/r/pull/4".into(),
+            head: "abc".into(),
+        });
+        editor.apply(published);
+
+        assert_eq!(
+            editor.merge_now(),
+            [Command::MergePipeline { repo: repo() }]
+        );
+        assert_eq!(editor.busy(), Some("Merging…"));
+        assert_eq!(
+            opened().discard(),
+            [Command::DiscardPipelineDraft { repo: repo() }]
+        );
     }
 }
