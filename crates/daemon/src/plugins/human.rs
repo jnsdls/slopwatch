@@ -40,6 +40,7 @@ pub fn manifest() -> Manifest {
         // Step contract: a Human Step has neither.
         timeout: None,
         stall_after: None,
+        budget_usd: None,
         concurrency: None,
     }
 }

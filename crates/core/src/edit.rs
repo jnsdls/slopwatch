@@ -516,7 +516,15 @@ fn splice(text: &str, range: Range<usize>, with: &str) -> String {
 }
 
 /// The order a new Step's keys are written in. Any other key follows them.
-const STEP_KEYS: &[&str] = &["uses", "needs", "with", "when", "timeout", "stall_after"];
+const STEP_KEYS: &[&str] = &[
+    "uses",
+    "needs",
+    "with",
+    "when",
+    "timeout",
+    "stall_after",
+    "budget_usd",
+];
 
 /// A new Step as one line of flow YAML, `uses` first.
 fn new_step_yaml(step: &Map<String, Value>) -> String {

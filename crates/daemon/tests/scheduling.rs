@@ -89,6 +89,7 @@ fn manifest(id: &str, concurrency: Option<u32>) -> Manifest {
         secrets: vec![],
         timeout: None,
         stall_after: None,
+        budget_usd: None,
         concurrency,
     }
 }

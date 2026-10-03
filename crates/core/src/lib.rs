@@ -29,7 +29,8 @@ pub use expr::{Expr, Fact, Glob, StepTerm};
 pub use library::{PRESETS, Preset, check_library_step, is_library_step_name, library_step_plugin};
 pub use load::{PluginInfo, Resolver, check, load, parse_duration, resolve_uses};
 pub use pipeline::{
-    BUILTIN_PLUGINS, FIX_ROUNDS_CEILING, FIX_ROUNDS_DEFAULT, GATE, Pipeline, Step, Uses, Workspace,
+    BUILTIN_PLUGINS, FIX_ROUNDS_CEILING, FIX_ROUNDS_DEFAULT, GATE, PR_BUDGET_DEFAULT, Pipeline,
+    Step, Uses, Workspace,
 };
 pub use replay::{Conflict, Node, ReplayError, Replayed, replay};
 pub use reuse::ReuseKey;

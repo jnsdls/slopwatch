@@ -44,6 +44,8 @@ pub fn manifest() -> Manifest {
         secrets: vec![SecretSpec::optional(API_KEY)],
         timeout: Some("30m".into()),
         stall_after: Some("5m".into()),
+        // Cost budgets: an agent Step may spend $2 a Run by default.
+        budget_usd: Some(2.0),
         concurrency: Some(1),
     }
 }

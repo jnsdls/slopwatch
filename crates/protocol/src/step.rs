@@ -56,6 +56,11 @@ pub struct Manifest {
     pub timeout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_after: Option<String>,
+    /// What one of its Steps may spend in one attempt, in list-price US
+    /// dollars, unless the Pipeline sets `budget_usd`. `None` leaves its
+    /// Steps without a Budget of their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
     /// At most this many of the Plugin's Steps run at once, across every
     /// Run. `None` leaves only the daemon's global cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,9 +150,11 @@ pub struct Start {
     pub snapshot: PrSnapshot,
     /// The Outcomes of every Step upstream of this one, by Step id.
     pub upstream: BTreeMap<String, Outcome>,
-    /// The most the Step may spend, in list-price USD. A Step that can
-    /// cap its own spend, as `claude --max-budget-usd` does, should. `None`
-    /// sets no cap.
+    /// The most the Step may spend, in list-price USD: the tightest of its
+    /// own Budget and what's left of the PR's and the day's. A Step that
+    /// can cap its own spend, as `claude --max-budget-usd` does, should.
+    /// The daemon stops it once its reported usage crosses the line
+    /// anyway. `None` sets no cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_usd: Option<f64>,
 }

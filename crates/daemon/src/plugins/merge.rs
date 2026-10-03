@@ -50,6 +50,7 @@ pub fn manifest() -> Manifest {
         secrets: vec![],
         timeout: Some(TIMEOUT.into()),
         stall_after: None,
+        budget_usd: None,
         concurrency: None,
     }
 }

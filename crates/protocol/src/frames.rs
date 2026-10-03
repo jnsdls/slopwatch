@@ -6,8 +6,8 @@ use slopwatch_core::{Edit, WaiverCategory};
 use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
 use crate::pipeline::NodePosition;
 use crate::{
-    Answer, EntryId, Grant, Notification, PluginListing, PluginSettings, RepoName, RunId,
-    SecretInfo, SecretValue, Topic, TopicUpdate,
+    Answer, Cents, DaemonSettings, EntryId, Grant, Notification, PluginListing, PluginSettings,
+    RepoName, RunId, SecretInfo, SecretValue, Topic, TopicUpdate,
 };
 
 /// A frame a client sends to the daemon.
@@ -349,6 +349,28 @@ pub enum Command {
         edits_seen: usize,
         starter: String,
     },
+    /// Answers an over budget entry by raising the Budget it hit to `to`.
+    /// On a PR entry that's the PR's Budget until its next outside push;
+    /// on the daily Budget's entry, the daily Budget in the daemon's
+    /// settings. Either way the PRs it held start again.
+    RaiseBudget {
+        entry: EntryId,
+        to: Cents,
+    },
+    /// Answers an over budget entry by letting one more Run through: the
+    /// PR's next Run, or on the daily Budget's entry, the next Run of each
+    /// PR it held, ignores the Budget that ran out. Step Budgets, and on a
+    /// PR entry the daily Budget, still apply.
+    RunAnywayOnce {
+        entry: EntryId,
+    },
+    /// The daemon's own settings, with what Steps spent today.
+    GetSettings,
+    /// Replaces the daemon's own settings. A daily Budget raised past
+    /// today's spend, or turned off, starts the PRs it held.
+    SetSettings {
+        settings: DaemonSettings,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +410,12 @@ pub enum Reply {
     Plugins {
         /// Sorted by name, a built-in before a file that took its name.
         plugins: Vec<PluginListing>,
+    },
+    Settings {
+        settings: DaemonSettings,
+        /// What Steps reported spending since local midnight, at list
+        /// price.
+        spent_today: Cents,
     },
 }
 

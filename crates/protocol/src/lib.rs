@@ -6,6 +6,7 @@
 //! one with a response carrying the same id. A client that subscribes to a
 //! topic also gets topic updates: a snapshot, then ordered deltas.
 
+mod budgets;
 mod flavor;
 mod frames;
 mod inbox;
@@ -18,6 +19,7 @@ mod secrets;
 pub mod step;
 mod topics;
 
+pub use budgets::{BudgetHit, BudgetKind, Cents, DAILY_BUDGET_DEFAULT, DaemonSettings};
 pub use flavor::{DATA_DIR_ENV, Flavor, socket_path};
 pub use frames::{
     Actor, Auth, ClientFrame, ClientHello, Command, ErrorBody, ErrorCode, LibraryStep, Refusal,
@@ -98,6 +100,10 @@ pub const DIALECT: u32 = 1;
 ///
 /// `onboarding`: the `apply_starter` command, and `missing_secrets` and
 /// `missing_plugin` on a draft's Steps.
+///
+/// `budgets`: the `raise_budget`, `run_anyway_once`, `get_settings` and
+/// `set_settings` commands, the `daily_budget` Inbox cause, and `budget`
+/// on an entry a spent Budget raised.
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -115,6 +121,7 @@ pub const FEATURES: &[&str] = &[
     "stacks",
     "pipeline_publish",
     "onboarding",
+    "budgets",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

@@ -426,3 +426,61 @@ fn steps_list_after_what_they_need_and_the_gate_names_what_it_reads() {
     assert!(pipeline.gate_reads("ci"), "nested in or:");
     assert!(!pipeline.gate_reads("notes"), "advisory");
 }
+
+#[test]
+fn a_prs_budget_defaults_to_ten_dollars_and_the_file_can_set_it() {
+    let pipeline = load_ok("version: 1\nsteps:\n  ci: { uses: ci }\ngate: [ci]\n");
+    assert_eq!(pipeline.budget_usd(), 10.0);
+    let pipeline = load_ok("version: 1\nbudget_usd: 4.5\nsteps:\n  ci: { uses: ci }\ngate: [ci]\n");
+    assert_eq!(pipeline.budget_usd(), 4.5);
+}
+
+#[test]
+fn a_budget_must_be_more_than_zero() {
+    let errors = load_err("version: 1\nbudget_usd: 0\nsteps:\n  ci: { uses: ci }\ngate: [ci]\n");
+    assert_eq!(
+        errors,
+        ["the Pipeline sets `budget_usd: 0`; write an amount in US dollars above 0, such as 10"]
+    );
+    let errors = load_err("version: 1\nsteps:\n  ci: { uses: ci, budget_usd: -1 }\ngate: [ci]\n");
+    assert_eq!(
+        errors,
+        ["Step `ci` sets `budget_usd: -1`; write an amount in US dollars above 0, such as 2"]
+    );
+}
+
+#[test]
+fn a_steps_budget_comes_from_the_pipeline_then_its_library_step() {
+    let resolver = TestResolver::default()
+        .with_library("review", "uses: claude\nbudget_usd: 3\n")
+        .with_library("broke", "uses: claude\nbudget_usd: 0\n");
+    let pipeline = load(
+        "version: 1
+steps:
+  ci: { uses: ci }
+  review: { uses: lib/review }
+  tight: { uses: lib/review, budget_usd: 0.5 }
+gate: [ci, review, tight]
+",
+        &resolver,
+    )
+    .unwrap();
+
+    assert_eq!(pipeline.step("ci").unwrap().budget_usd, None);
+    assert_eq!(pipeline.step("review").unwrap().budget_usd, Some(3.0));
+    assert_eq!(pipeline.step("tight").unwrap().budget_usd, Some(0.5));
+    assert!(
+        slopwatch_core::check_library_step("uses: claude\nbudget_usd: 0\n")
+            .unwrap_err()
+            .contains("budget_usd"),
+        "a Library Step can't save a budget that wouldn't load"
+    );
+    let errors = load_err_with(
+        "version: 1\nsteps:\n  a: { uses: lib/broke }\ngate: [a]\n",
+        &resolver,
+    );
+    assert_eq!(
+        errors,
+        ["Step `a` sets `budget_usd: 0`; write an amount in US dollars above 0, such as 2"]
+    );
+}

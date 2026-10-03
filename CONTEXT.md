@@ -93,7 +93,7 @@ A Run started by a commit from one of slopwatch's own Steps, such as Fix. The Pi
 _Avoid_: retry, iteration, attempt
 
 **Budget**:
-A cap, in list-price US dollars, on what Steps may spend: per Step in one Run, per Watched PR since its last outside push, and per day across all repos. Usage is priced at list price whatever the developer is actually billed, so Steps on a subscription login spend against it too. A Step that reports no cost isn't budgeted.
+A cap, in list-price US dollars, on what Steps may spend: per Step in one Run, afresh each time it is retried, per Watched PR since its last outside push, and per day across all repos. Usage is priced at list price whatever the developer is actually billed, so Steps on a subscription login spend against it too. A Step that reports no cost isn't budgeted.
 _Avoid_: quota, limit, spend cap
 
 **Guarded path**:

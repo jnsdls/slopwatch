@@ -678,6 +678,43 @@ impl Daemon {
                     Err(error) => Err(error),
                 });
             }
+            Command::RaiseBudget { entry, to } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs
+                        .raise_budget(entry, to, &actor)
+                        .await
+                        .map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
+            Command::RunAnywayOnce { entry } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs
+                        .run_anyway_once(entry, &actor)
+                        .await
+                        .map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
+            Command::GetSettings => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs
+                        .settings()
+                        .await
+                        .map(|(settings, spent_today)| Reply::Settings {
+                            settings,
+                            spent_today,
+                        })
+                        .map_err(RunError::Store),
+                    Err(error) => Err(error),
+                });
+            }
+            Command::SetSettings { settings } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs.set_settings(settings).await.map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
         };
         if changes_prs {
             // What changed, even with a failed poll, may start or end a Run.

@@ -104,6 +104,7 @@ fn manifest(id: &str, secrets: Vec<SecretSpec>) -> Manifest {
         secrets,
         timeout: None,
         stall_after: None,
+        budget_usd: None,
         concurrency: None,
     }
 }

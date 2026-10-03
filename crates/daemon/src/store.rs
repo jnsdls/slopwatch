@@ -12,8 +12,8 @@ use slopwatch_protocol::step::{
     Effect, EffectKind, EffectResult, LinkedIssue, Outputs, UpdateMethod,
 };
 use slopwatch_protocol::{
-    EntryId, InboxEntry, Notification, NotificationId, PluginSettings, RepoName, RunId, RunSummary,
-    Waiver,
+    BudgetKind, EntryId, InboxEntry, Notification, NotificationId, PluginSettings, RepoName, RunId,
+    RunSummary, Waiver,
 };
 
 use crate::approvals::Approval;
@@ -277,8 +277,47 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX pipeline_commits_open ON pipeline_commits (repo, finished);
 ",
+    // Budgets. `runs.budget_window` is the first Run since the PR's last
+    // outside push, whose Runs share the PR's Budget; NULL for Runs from
+    // before Budgets. `runs.lifted` lists, as JSON, the Budgets "run
+    // anyway once" lifted for the Run. `step_usage` keeps each priced
+    // model call, for the PR's and the day's spend. `pr_budgets` holds a
+    // PR's raised Budget for one window, `budget_lifts` the lifts waiting
+    // for a PR's next Run, and `settings` the daemon's own settings.
+    "
+    ALTER TABLE runs ADD COLUMN budget_window INTEGER;
+    ALTER TABLE runs ADD COLUMN lifted TEXT NOT NULL DEFAULT '[]';
+    CREATE INDEX runs_by_budget_window ON runs (budget_window);
+    CREATE TABLE step_usage (
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        step TEXT NOT NULL,
+        usd REAL NOT NULL,
+        at INTEGER NOT NULL
+    );
+    CREATE INDEX step_usage_by_run ON step_usage (run_id);
+    CREATE INDEX step_usage_by_at ON step_usage (at);
+    CREATE TABLE pr_budgets (
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        window INTEGER NOT NULL,
+        usd REAL NOT NULL,
+        PRIMARY KEY (repo, number)
+    );
+    CREATE TABLE budget_lifts (
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        PRIMARY KEY (repo, number, kind)
+    );
+    CREATE TABLE settings (
+        name TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+",
 ];
 
+mod budgets;
 mod drafts;
 
 pub use drafts::{OpenPipelineCommit, StoredDraft};
@@ -392,6 +431,11 @@ pub struct NewRun<'a> {
     pub files: &'a [String],
     pub linked_issues: &'a [LinkedIssue],
     pub steps: Vec<NewStep>,
+    /// The first Run of the PR's Budget window, or `None` when this Run
+    /// opens a new one.
+    pub budget_window: Option<RunId>,
+    /// The Budgets "run anyway once" lifted for this Run.
+    pub lifted: &'a [BudgetKind],
 }
 
 /// A Run's Step as it starts.
@@ -411,6 +455,11 @@ pub struct LatestRun {
     /// Stacks.
     pub pr_base: Option<String>,
     pub pipeline: String,
+    /// `None` while it's going.
+    pub end: Option<EndReason>,
+    /// The first Run of its Budget window. `None` for Runs from before
+    /// Budgets.
+    pub budget_window: Option<RunId>,
 }
 
 /// A settled Outcome a later Run may take instead of running its Step.
@@ -496,6 +545,11 @@ pub struct ActiveRun {
     pub linked_issues: Vec<LinkedIssue>,
     pub gate: GateState,
     pub steps: Vec<StepRow>,
+    /// The first Run of its Budget window: itself for a Run from before
+    /// Budgets.
+    pub budget_window: RunId,
+    /// The Budgets "run anyway once" lifted for it.
+    pub lifted: Vec<BudgetKind>,
 }
 
 /// One Step of a Run.
@@ -681,6 +735,14 @@ impl Store {
             ],
         )?;
         let id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE runs SET budget_window = COALESCE(?2, id), lifted = ?3 WHERE id = ?1",
+            params![
+                id,
+                run.budget_window.map(|window| window.0 as i64),
+                serde_json::to_string(run.lifted).expect("kinds always serialize"),
+            ],
+        )?;
         for NewStep {
             id: step,
             plugin,
@@ -919,7 +981,7 @@ impl Store {
         let mut runs = db
             .prepare(&format!(
                 "SELECT id, repo, number, head_sha, base, base_sha, pipeline, gate, files,
-                        linked_issues, pr_base
+                        linked_issues, pr_base, budget_window, lifted
                  FROM runs WHERE {filter} ORDER BY id"
             ))?
             .query_map(args, |row| {
@@ -937,6 +999,11 @@ impl Store {
                     linked_issues: serde_json::from_str(&row.get::<_, String>(9)?)
                         .unwrap_or_default(),
                     steps: Vec::new(),
+                    budget_window: RunId(
+                        row.get::<_, Option<i64>>(11)?
+                            .unwrap_or(row.get::<_, i64>(0)?) as u64,
+                    ),
+                    lifted: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1018,8 +1085,8 @@ impl Store {
     ) -> Result<Option<LatestRun>, StoreError> {
         self.db()
             .query_row(
-                "SELECT id, head_sha, base_sha, pipeline, pr_base FROM runs
-                 WHERE repo = ?1 AND number = ?2 ORDER BY id DESC LIMIT 1",
+                "SELECT id, head_sha, base_sha, pipeline, pr_base, end_reason, budget_window
+                 FROM runs WHERE repo = ?1 AND number = ?2 ORDER BY id DESC LIMIT 1",
                 params![repo.to_string(), number as i64],
                 |row| {
                     Ok(LatestRun {
@@ -1028,6 +1095,12 @@ impl Store {
                         base_sha: row.get(2)?,
                         pr_base: row.get(4)?,
                         pipeline: row.get(3)?,
+                        end: row
+                            .get::<_, Option<String>>(5)?
+                            .and_then(|reason| serde_json::from_value(reason.into()).ok()),
+                        budget_window: row
+                            .get::<_, Option<i64>>(6)?
+                            .map(|window| RunId(window as u64)),
                     })
                 },
             )
@@ -2093,6 +2166,8 @@ mod tests {
                 plugin: "ci".into(),
                 config_hash: "hash".into(),
             }],
+            budget_window: None,
+            lifted: &[],
         }
     }
 

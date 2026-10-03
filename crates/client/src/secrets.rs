@@ -192,6 +192,7 @@ mod tests {
             reasons: vec![],
             prs: vec![],
             raised_at: 0,
+            budget: None,
             closed: None,
         };
         assert_eq!(missing_secret(&entry), Some("JEV_API_KEY"));
