@@ -4,7 +4,8 @@
 //! GUI acks it. [`Poster`] takes the `notifications` topic, posts or removes
 //! each banner through a [`NotificationCenter`], and returns the ack. With
 //! notifications turned off it acks without posting, so nothing piles up.
-//! No GPUI here: the real center lives in `system`, and tests fake it.
+//! [`SystemCenter`] is the real center, through GPUI and
+//! `UNUserNotificationCenter`; tests fake it.
 
 use slopwatch_protocol::{
     Command, Notification, NotificationId, NotificationsDelta, NotificationsUpdate, PrRef,
@@ -27,11 +28,13 @@ pub enum Permission {
 /// Notification Center as the GUI uses it. Identifiers are notification
 /// ids, so a repost replaces a banner.
 pub trait NotificationCenter {
+    /// The permission as last read. Never blocks.
     fn permission(&self) -> Permission;
 
     /// Asks the developer for permission, if they haven't been asked.
     fn ask(&self);
 
+    /// Posts a banner under identifier `id`.
     fn post(&self, id: &str, title: &str, body: &str);
 
     /// Removes the banner `id` from Notification Center.
@@ -78,20 +81,16 @@ impl Poster {
             center.permission(),
             Permission::Allowed | Permission::NotAsked
         );
-        let ids = todo
-            .into_iter()
-            .map(|notification| {
-                match &notification {
-                    Notification::Post { id, title, body } if posting => {
-                        center.post(&id.to_string(), title, body);
-                    }
-                    Notification::Post { .. } => {}
-                    Notification::Retract { id } => center.remove(&id.to_string()),
+        for notification in &todo {
+            match notification {
+                Notification::Post { id, title, body } if posting => {
+                    center.post(&id.to_string(), title, body);
                 }
-                notification.id().clone()
-            })
-            .collect();
-        Some(Command::AckNotifications { ids })
+                Notification::Post { .. } => {}
+                Notification::Retract { id } => center.remove(&id.to_string()),
+            }
+        }
+        Some(Command::AckNotifications { done: todo })
     }
 }
 
@@ -128,6 +127,8 @@ impl SystemCenter {
     pub fn new(_: &gpui_kit::App) -> Self {
         Self
     }
+
+    pub fn refresh(&self) {}
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -142,8 +143,7 @@ impl NotificationCenter for SystemCenter {
 
 #[cfg(target_os = "macos")]
 mod system {
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     use block2::RcBlock;
     use gpui_kit::{App, SharedString, SystemNotification};
@@ -156,8 +156,12 @@ mod system {
 
     use super::{NotificationCenter, Permission};
 
-    /// How long to wait for macOS to report the notification settings.
-    const SETTINGS_TIMEOUT: Duration = Duration::from_secs(2);
+    /// The permission as macOS last reported it. macOS answers on a queue
+    /// of its own, so it's kept here rather than waited for.
+    static PERMISSION: AtomicU8 = AtomicU8::new(NOT_ASKED);
+    const NOT_ASKED: u8 = 0;
+    const ALLOWED: u8 = 1;
+    const DENIED: u8 = 2;
 
     /// Notification Center through GPUI, which posts and removes banners
     /// and reports clicks, plus `UNUserNotificationCenter` for what GPUI
@@ -170,6 +174,24 @@ mod system {
         pub fn new(cx: &'a App) -> Self {
             Self { cx }
         }
+
+        /// Asks macOS for the permission again. [`Self::permission`] has
+        /// the answer once macOS gives it, in a few milliseconds.
+        pub fn refresh(&self) {
+            let Some(center) = center() else { return };
+            let handler =
+                RcBlock::new(move |settings: std::ptr::NonNull<UNNotificationSettings>| {
+                    // SAFETY: the framework passes valid settings for the call.
+                    let status = unsafe { settings.as_ref() }.authorizationStatus();
+                    let permission = match status {
+                        UNAuthorizationStatus::NotDetermined => NOT_ASKED,
+                        UNAuthorizationStatus::Denied => DENIED,
+                        _ => ALLOWED,
+                    };
+                    PERMISSION.store(permission, Ordering::Relaxed);
+                });
+            center.getNotificationSettingsWithCompletionHandler(&handler);
+        }
     }
 
     /// `UNUserNotificationCenter` aborts the process outside an app
@@ -181,31 +203,21 @@ mod system {
 
     impl NotificationCenter for SystemCenter<'_> {
         fn permission(&self) -> Permission {
-            let Some(center) = center() else {
+            if NSBundle::mainBundle().bundleIdentifier().is_none() {
                 return Permission::Unavailable;
-            };
-            let (sender, received) = mpsc::channel();
-            let handler =
-                RcBlock::new(move |settings: std::ptr::NonNull<UNNotificationSettings>| {
-                    // SAFETY: the framework passes valid settings for the call.
-                    let status = unsafe { settings.as_ref() }.authorizationStatus();
-                    let _ = sender.send(status);
-                });
-            center.getNotificationSettingsWithCompletionHandler(&handler);
-            // The handler runs on a queue of the framework's, not this
-            // thread, so waiting here can't deadlock.
-            match received.recv_timeout(SETTINGS_TIMEOUT) {
-                Ok(UNAuthorizationStatus::NotDetermined) => Permission::NotAsked,
-                Ok(UNAuthorizationStatus::Denied) => Permission::Denied,
-                Ok(_) => Permission::Allowed,
-                // Posting is a no-op if it turns out not to be allowed.
-                Err(_) => Permission::NotAsked,
+            }
+            match PERMISSION.load(Ordering::Relaxed) {
+                ALLOWED => Permission::Allowed,
+                DENIED => Permission::Denied,
+                _ => Permission::NotAsked,
             }
         }
 
         fn ask(&self) {
             let Some(center) = center() else { return };
-            let handler = RcBlock::new(|_: Bool, error: *mut NSError| {
+            let handler = RcBlock::new(|granted: Bool, error: *mut NSError| {
+                let permission = if granted.as_bool() { ALLOWED } else { DENIED };
+                PERMISSION.store(permission, Ordering::Relaxed);
                 // SAFETY: the framework passes null or a valid NSError.
                 if let Some(error) = unsafe { error.as_ref() } {
                     eprintln!(
@@ -316,10 +328,8 @@ mod tests {
         }
     }
 
-    fn ack(entries: &[u64]) -> Option<Command> {
-        Some(Command::AckNotifications {
-            ids: entries.iter().map(|&entry| id(entry)).collect(),
-        })
+    fn ack(done: Vec<Notification>) -> Option<Command> {
+        Some(Command::AckNotifications { done })
     }
 
     #[test]
@@ -328,9 +338,9 @@ mod tests {
         let mut poster = Poster::default();
 
         let acked = poster.apply(snapshot(4, vec![post(1)]), &center);
-        assert_eq!(acked, ack(&[1]));
+        assert_eq!(acked, ack(vec![post(1)]));
         let acked = poster.apply(put(5, post(2)), &center);
-        assert_eq!(acked, ack(&[2]));
+        assert_eq!(acked, ack(vec![post(2)]));
 
         assert_eq!(
             center.calls(),
@@ -359,7 +369,11 @@ mod tests {
             &center,
         );
 
-        assert_eq!(acked, ack(&[1, 2]), "both are acked");
+        assert_eq!(
+            acked,
+            ack(vec![post(1), Notification::Retract { id: id(2) }]),
+            "both are acked"
+        );
         assert_eq!(
             center.calls(),
             [Call::Remove("inbox:2@o/r#7".into())],
@@ -384,7 +398,7 @@ mod tests {
 
         assert_eq!(
             poster.apply(put(5, post(3)), &center),
-            ack(&[3]),
+            ack(vec![post(3)]),
             "not asked yet still posts, which asks"
         );
         assert_eq!(center.calls().len(), 1);

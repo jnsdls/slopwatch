@@ -227,14 +227,13 @@ impl Client {
         }
     }
 
-    async fn ack(&mut self, ids: Vec<NotificationId>) {
-        self.ok(Command::AckNotifications { ids }).await;
+    async fn ack(&mut self, done: Vec<Notification>) {
+        self.ok(Command::AckNotifications { done }).await;
     }
 
     /// Acks everything pending, as a GUI does once it posted it.
     async fn ack_all(&mut self) {
-        let ids = self.pending.iter().map(|n| n.id().clone()).collect();
-        self.ack(ids).await;
+        self.ack(self.pending.clone()).await;
     }
 }
 
@@ -281,14 +280,15 @@ async fn a_new_inbox_entry_is_pending_until_the_gui_acks_it() {
     assert_eq!(body, "jnsdls/app#1: `check`: fail");
 
     let id = id.clone();
-    client.ack(vec![id.clone()]).await;
+    let post = client.pending[0].clone();
+    client.ack(vec![post.clone()]).await;
     assert!(client.pending.is_empty());
     assert_eq!(
         client.deltas.last(),
         Some(&NotificationsDelta::Done { id: id.clone() })
     );
 
-    client.ack(vec![id]).await;
+    client.ack(vec![post]).await;
     let again = Client::gui(&harness.daemon).await;
     assert!(
         again.pending.is_empty(),
@@ -322,7 +322,7 @@ async fn a_restart_sends_nothing_acked_again_and_keeps_what_wasnt() {
     client
         .until("both PR entries' notifications", |c| c.pending.len() == 2)
         .await;
-    let acked = client.pending[0].id().clone();
+    let acked = client.pending[0].clone();
     let kept = client.pending[1].clone();
     client.ack(vec![acked]).await;
     drop(client);
@@ -359,7 +359,9 @@ async fn closing_an_entry_retracts_its_posted_banner() {
         "{:#?}",
         client.pending
     );
-    client.ack(vec![id.clone()]).await;
+    client
+        .ack(vec![Notification::Retract { id: id.clone() }])
+        .await;
     client
         .until("the shippable notification", |c| {
             posts(&c.pending)
@@ -374,10 +376,11 @@ async fn closing_an_entry_retracts_its_posted_banner() {
 }
 
 #[tokio::test]
-async fn an_entry_that_closes_before_any_gui_posted_it_never_posts() {
+async fn an_entry_that_closes_with_no_gui_listening_never_posts() {
     let harness = Harness::new(FAILS, &[1]);
-    let mut client = not_shippable(&harness).await;
-    let id = client.pending[0].id().clone();
+    let mut client = Client::connect(&harness.daemon, &[Topic::Inbox]).await;
+    client.ok(Command::AddRepo { repo: repo() }).await;
+    client.until("the PR entry", |c| c.inbox.count() == 1).await;
 
     client
         .ok(Command::DismissEntry {
@@ -385,14 +388,35 @@ async fn an_entry_that_closes_before_any_gui_posted_it_never_posts() {
         })
         .await;
 
-    assert!(client.pending.is_empty(), "{:#?}", client.pending);
+    let gui = Client::gui(&harness.daemon).await;
+    assert!(gui.pending.is_empty(), "{:#?}", gui.pending);
+}
+
+#[tokio::test]
+async fn an_entry_that_closes_before_the_guis_ack_arrives_still_retracts() {
+    let harness = Harness::new(FAILS, &[1]);
+    let mut client = not_shippable(&harness).await;
+    let post = client.pending[0].clone();
+    let retract = Notification::Retract {
+        id: post.id().clone(),
+    };
+
+    // The GUI posted it, but the entry closes before its ack lands.
+    client
+        .ok(Command::DismissEntry {
+            entry: client.inbox.entries[0].id,
+        })
+        .await;
+    assert_eq!(client.pending, std::slice::from_ref(&retract));
+    client.ack(vec![post]).await;
+
     assert_eq!(
-        client.deltas.last(),
-        Some(&NotificationsDelta::Done { id: id.clone() })
+        client.pending,
+        std::slice::from_ref(&retract),
+        "the late ack for the Post doesn't cover the Retract"
     );
-    client.ack(vec![id]).await;
-    let again = Client::gui(&harness.daemon).await;
-    assert!(again.pending.is_empty());
+    client.ack(vec![retract]).await;
+    assert!(client.pending.is_empty());
 }
 
 #[derive(Default)]

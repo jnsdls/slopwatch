@@ -1950,18 +1950,12 @@ impl Engine {
             self.inbox
                 .raise_pr(pr_ref(&run.repo, run.number), run.id, title, reasons)?;
         }
-        if matches!(reason, EndReason::Shippable | EndReason::Merged) {
-            let title = self
-                .watching
-                .prs()
-                .into_iter()
-                .find(|(repo, pr)| *repo == run.repo && pr.number == run.number)
-                .map(|(_, pr)| pr.title);
-            self.notifications.run_ended(
+        if reason == EndReason::Shippable {
+            let title = self.watching.title(&run.repo, run.number);
+            self.notifications.shippable(
                 run.id,
                 pr_ref(&run.repo, run.number),
                 title.as_deref(),
-                reason,
             )?;
         }
         self.publish(&run.repo, run.number)

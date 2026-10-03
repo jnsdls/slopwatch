@@ -113,3 +113,7 @@ _Avoid_: alert, failure, incident
 **Inbox**:
 The one list, across repos, of open Human Steps and Escalations waiting on the developer, oldest first. An Escalation shared across PRs is one entry, however many PRs it holds back. Each Run's record keeps the entries that touched it and how each one closed.
 _Avoid_: queue, notifications, attention list
+
+**Notification**:
+A macOS banner for a new Inbox entry or a Run that ended shippable. The daemon decides on it and keeps it until the GUI acks it, and the GUI posts it. A click opens its PR. When its Inbox entry closes, the banner goes too. It points at the Inbox and doesn't replace it.
+_Avoid_: alert, Inbox (for the banner)

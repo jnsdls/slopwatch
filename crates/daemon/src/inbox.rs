@@ -354,9 +354,15 @@ impl State {
         };
         let id = self.store.insert_entry(&entry, &runs)?;
         let entry = InboxEntry { id, ..entry };
-        self.notifications.entry_opened(&entry)?;
-        self.open.insert(id, Open { entry, runs });
-        self.publish(id)
+        self.open.insert(
+            id,
+            Open {
+                entry: entry.clone(),
+                runs,
+            },
+        );
+        self.publish(id)?;
+        self.notifications.entry_opened(&entry)
     }
 
     /// Stores and announces what changed in an open entry, which now also

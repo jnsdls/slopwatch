@@ -425,13 +425,13 @@ impl Daemon {
                     Err(error) => Err(error),
                 });
             }
-            Command::AckNotifications { ids } => {
+            Command::AckNotifications { done } => {
                 let Some(runs) = &self.runs else {
                     return ResponseBody::Ok(Reply::Done);
                 };
                 return respond(
                     runs.notifications()
-                        .ack(&ids)
+                        .ack(&done)
                         .map(|()| Reply::Done)
                         .map_err(RunError::Store),
                 );

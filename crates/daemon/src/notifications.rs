@@ -15,7 +15,6 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use slopwatch_core::EndReason;
 use slopwatch_protocol::{
     About, DATA_DIR_ENV, EntryId, Flavor, InboxEntry, Notification, NotificationId,
     NotificationsDelta, PrRef, RunId,
@@ -28,6 +27,7 @@ use crate::store::{Store, StoreError};
 /// snapshot instead.
 const BACKLOG: usize = 256;
 
+/// What clients still have to post or remove, as the store keeps it.
 pub struct Notifications {
     state: Mutex<State>,
     /// Signalled whenever something new is pending.
@@ -71,6 +71,8 @@ impl Notifications {
             .expect("no panics while holding the notifications")
     }
 
+    /// Follows the `notifications` topic. While anyone does, the daemon
+    /// launches no GUI.
     pub fn subscribe(&self) -> NotificationsSubscription {
         let state = self.state();
         NotificationsSubscription {
@@ -87,20 +89,24 @@ impl Notifications {
         !state.pending.is_empty() && state.deltas.receiver_count() == 0
     }
 
-    /// A client posted these, or chose not to. An acked Post about an
+    /// A client acted on these, or chose not to. An acked Post about an
     /// Inbox entry is remembered, so the entry's closing can retract it.
-    pub fn ack(&self, ids: &[NotificationId]) -> Result<(), StoreError> {
+    pub fn ack(&self, done: &[Notification]) -> Result<(), StoreError> {
         let mut state = self.state();
-        for id in ids {
+        for acked in done {
+            let id = acked.id();
             let Some(row) = state.store.notification(id)? else {
                 continue;
             };
-            match (&row.pending, row.entry) {
-                (None, _) => continue,
-                (Some(Notification::Post { .. }), Some(_)) => {
+            // A Retract may have replaced the Post this acks.
+            if row.pending.as_ref() != Some(acked) {
+                continue;
+            }
+            match (acked, row.entry) {
+                (Notification::Post { .. }, Some(_)) => {
                     state.store.set_pending_notification(id, None)?;
                 }
-                (Some(_), _) => state.store.delete_notification(id)?,
+                _ => state.store.delete_notification(id)?,
             }
             state.done(id);
         }
@@ -129,20 +135,23 @@ impl Notifications {
         self.record(post, Some(entry.id))
     }
 
-    /// Inbox entry `entry` closed, so its banner goes: never posted if no
-    /// client acked it yet, removed from Notification Center otherwise.
+    /// Inbox entry `entry` closed, so its banner goes. A Post no client
+    /// could have seen is dropped and never posts. Otherwise a Retract
+    /// replaces it, since a subscribed GUI may have posted it without its
+    /// ack arriving yet.
     pub(crate) fn entry_closed(&self, entry: EntryId) -> Result<(), StoreError> {
         let mut state = self.state();
         let Some(row) = state.store.entry_notification(entry)? else {
             return Ok(());
         };
+        let heard = state.deltas.receiver_count() > 0;
         match row.pending {
-            Some(Notification::Post { .. }) => {
+            Some(Notification::Post { .. }) if !heard => {
                 state.store.delete_notification(&row.id)?;
                 state.done(&row.id);
             }
             Some(Notification::Retract { .. }) => {}
-            None => {
+            Some(Notification::Post { .. }) | None => {
                 let retract = Notification::Retract { id: row.id };
                 state
                     .store
@@ -154,27 +163,24 @@ impl Notifications {
         Ok(())
     }
 
-    /// Run `run` on `pr` ended. Shippable and merged deserve a banner.
-    /// `title` is the PR's, if the daemon knows it.
-    pub(crate) fn run_ended(
+    /// Run `run` on `pr` ended shippable. `title` is the PR's, if the
+    /// daemon knows it.
+    pub(crate) fn shippable(
         &self,
         run: RunId,
         pr: PrRef,
         title: Option<&str>,
-        reason: EndReason,
     ) -> Result<(), StoreError> {
-        let (about, headline) = match reason {
-            EndReason::Shippable => (About::Shippable(run), "Shippable"),
-            EndReason::Merged => (About::Merged(run), "Merged"),
-            _ => return Ok(()),
-        };
         let body = match title {
             Some(title) => format!("{pr}: {title}"),
             None => pr.to_string(),
         };
         let post = Notification::Post {
-            id: NotificationId { about, pr },
-            title: headline.to_owned(),
+            id: NotificationId {
+                about: About::Shippable(run),
+                pr,
+            },
+            title: "Shippable".to_owned(),
             body,
         };
         self.record(post, None)
@@ -211,6 +217,7 @@ impl State {
 
 /// Starts the GUI so it can post what's pending.
 pub trait Launcher: Send + Sync {
+    /// Starts the GUI in the background. Returns without waiting for it.
     fn launch(&self);
 }
 
@@ -218,11 +225,19 @@ pub trait Launcher: Send + Sync {
 /// hidden, and told by `--background` to open no window (ADR 0013). A
 /// daemon on an overridden data dir hands the override on, so the GUI
 /// finds this daemon's socket.
+///
+/// `open` on an app that's already running reopens it instead, which shows
+/// its window and takes focus. So a GUI that runs from this bundle but
+/// hasn't subscribed yet, such as one still handing off to a new daemon,
+/// is left to subscribe on its own.
 pub struct OpenApp;
 
 impl Launcher for OpenApp {
     fn launch(&self) {
         let bundle_id = Flavor::CURRENT.bundle_id();
+        if gui_running() {
+            return;
+        }
         eprintln!("slopwatchd: launching {bundle_id} to post notifications");
         let mut open = std::process::Command::new("/usr/bin/open");
         if let Some(dir) = std::env::var_os(DATA_DIR_ENV).filter(|dir| !dir.is_empty()) {
@@ -251,6 +266,36 @@ impl Launcher for OpenApp {
     }
 }
 
+/// Whether the GUI next to this daemon in `Contents/MacOS` is running.
+#[cfg(target_os = "macos")]
+fn gui_running() -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(gui) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("slopwatch")))
+    else {
+        return false;
+    };
+    let mut pids = vec![0 as libc::pid_t; 8192];
+    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: the buffer holds `bytes` bytes of pids.
+    let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    let count = usize::try_from(count).unwrap_or(0).min(pids.len());
+    pids[..count].iter().any(|&pid| {
+        let mut path = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: the buffer is PROC_PIDPATHINFO_MAXSIZE bytes, as passed.
+        let len = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+        let len = usize::try_from(len).unwrap_or(0);
+        len > 0 && std::path::Path::new(std::ffi::OsStr::from_bytes(&path[..len])) == gui
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn gui_running() -> bool {
+    false
+}
+
 /// How eagerly the daemon launches the GUI.
 #[derive(Debug, Clone, Copy)]
 pub struct LaunchPace {
@@ -271,10 +316,8 @@ impl LaunchPace {
 /// Launches the GUI whenever notifications are pending and no client is
 /// subscribed to them. Runs forever.
 ///
-/// `open` on an app that's already running reopens it, which shows its
-/// window, so the daemon waits out `pace.grace` after start before its
-/// first launch: a GUI that was connected before a restart reconnects
-/// within it.
+/// The daemon waits out `pace.grace` after start before its first launch,
+/// so a GUI that was connected before a restart reconnects first.
 pub async fn launch_gui_when_unheard(
     notifications: Arc<Notifications>,
     launcher: Arc<dyn Launcher>,

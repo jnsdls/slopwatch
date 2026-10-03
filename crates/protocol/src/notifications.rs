@@ -17,14 +17,12 @@ pub enum About {
     Entry(EntryId),
     /// A Run that ended shippable.
     Shippable(RunId),
-    /// A Run whose Merge Step merged the PR.
-    Merged(RunId),
 }
 
 /// A notification's id, which the GUI posts it under, so a repost replaces
 /// the banner. It names the PR a click opens, so a banner left over from an
-/// earlier GUI still finds its PR. On the wire: `inbox:12@owner/name#7`,
-/// `shippable:40@owner/name#7` or `merged:40@owner/name#7`.
+/// earlier GUI still finds its PR. On the wire: `inbox:12@owner/name#7` or
+/// `shippable:40@owner/name#7`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct NotificationId {
@@ -37,7 +35,6 @@ impl fmt::Display for NotificationId {
         match self.about {
             About::Entry(entry) => write!(f, "inbox:{entry}")?,
             About::Shippable(run) => write!(f, "shippable:{run}")?,
-            About::Merged(run) => write!(f, "merged:{run}")?,
         }
         write!(f, "@{}", self.pr)
     }
@@ -54,7 +51,6 @@ impl FromStr for NotificationId {
         let about = match kind {
             "inbox" => About::Entry(EntryId(n)),
             "shippable" => About::Shippable(RunId(n)),
-            "merged" => About::Merged(RunId(n)),
             _ => return Err(bad()),
         };
         let (repo, number) = pr.rsplit_once('#').ok_or_else(bad)?;
@@ -154,8 +150,8 @@ mod tests {
         );
         assert_eq!("inbox:12@o/r#7".parse::<NotificationId>().unwrap(), entry);
         assert_eq!(
-            "merged:3@o/r#7".parse::<NotificationId>().unwrap().about,
-            About::Merged(RunId(3))
+            "shippable:40@o/r#7".parse::<NotificationId>().unwrap(),
+            shippable
         );
         for bad in [
             "inbox:12",

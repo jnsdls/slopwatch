@@ -50,10 +50,8 @@ pub struct MainView {
     inbox: InboxModel,
     /// Posts the daemon's notifications.
     poster: Poster,
-    /// Whether macOS lets slopwatch post, as last read.
-    permission: Permission,
     /// A PR a clicked banner asked for before the PR list had it.
-    reveal: Option<PrRef>,
+    pending_reveal: Option<PrRef>,
     library: Entity<LibraryView>,
     run_pane: RunPane,
     /// Repos the developer can add, while the picker is open.
@@ -105,11 +103,11 @@ impl MainView {
             // The developer may have changed it in System Settings.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
-                    this.permission = SystemCenter::new(cx).permission();
-                    cx.notify();
+                    this.refresh_permission(cx);
                 }
             }),
         ];
+        SystemCenter::new(cx).refresh();
         Self {
             log_search,
             waiver_reason,
@@ -120,8 +118,7 @@ impl MainView {
             prs: Prs::default(),
             inbox: InboxModel::default(),
             poster: Poster::default(),
-            permission: SystemCenter::new(cx).permission(),
-            reveal: None,
+            pending_reveal: None,
             library: cx.new(|cx| LibraryView::new(commands.clone(), window, cx)),
             run_pane: RunPane::default(),
             picker: None,
@@ -156,8 +153,9 @@ impl MainView {
             LinkEvent::Topic(update @ TopicUpdate::Notifications { .. }) => {
                 let center = SystemCenter::new(cx);
                 if let Some(ack) = self.poster.apply(update, &center) {
-                    self.permission = center.permission();
                     self.send(ack);
+                    // Posting may have asked for permission.
+                    center.refresh();
                 }
             }
             LinkEvent::Topic(update @ (TopicUpdate::Run { .. } | TopicUpdate::StepLog { .. })) => {
@@ -167,7 +165,7 @@ impl MainView {
             }
             LinkEvent::Topic(update) => {
                 self.prs.apply(update);
-                if let Some(pr) = self.reveal.take() {
+                if let Some(pr) = self.pending_reveal.take() {
                     self.reveal(pr);
                 }
                 if let Some((repo, number)) = self.run_pane.selected().cloned() {
@@ -215,7 +213,7 @@ impl MainView {
                     self.send(command);
                 }
             }
-            None if !self.prs.loaded() => self.reveal = Some(pr),
+            None if !self.prs.loaded() => self.pending_reveal = Some(pr),
             // Gone since the banner posted, such as merged.
             None => {}
         }
@@ -224,9 +222,22 @@ impl MainView {
     /// Asks for notification permission when the developer adds a repo,
     /// if they haven't been asked, until onboarding asks instead.
     fn ask_permission(&self, cx: &App) {
-        if self.permission == Permission::NotAsked {
-            SystemCenter::new(cx).ask();
+        let center = SystemCenter::new(cx);
+        if center.permission() == Permission::NotAsked {
+            center.ask();
         }
+    }
+
+    /// Reads the permission again, and redraws once macOS has answered.
+    fn refresh_permission(&self, cx: &mut Context<Self>) {
+        SystemCenter::new(cx).refresh();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
     }
 
     /// Sends the Waiver form with the reason typed in, if it has one.
@@ -560,7 +571,7 @@ impl MainView {
             .gap_2()
             .p_4()
             .overflow_y_scroll();
-        if let Some(text) = notice(self.permission) {
+        if let Some(text) = notice(SystemCenter::new(cx).permission()) {
             list = list.child(
                 div()
                     .flex()
