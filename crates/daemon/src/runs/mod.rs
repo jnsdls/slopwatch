@@ -60,8 +60,8 @@ use slopwatch_core::{
 };
 use slopwatch_protocol::step::{FromStep, Manifest, Outcome, Outputs, PrSnapshot, Start, ToStep};
 use slopwatch_protocol::{
-    Actor, Cause, Closing, LogFilter, LogKey, LogPage, LogRecord, PrRef, RepoName, RunEvent, RunId,
-    StepInfo, StepLogPage, Waiver,
+    Actor, Cause, Closing, GateTerm, LogFilter, LogKey, LogPage, LogRecord, PrRef, RepoName,
+    RunEvent, RunId, StepInfo, StepLogPage, Waiver,
 };
 use tokio::sync::mpsc;
 
@@ -1097,14 +1097,10 @@ impl Engine {
             base_sha: read.sha,
             steps: steps
                 .iter()
-                .map(|step| StepInfo {
-                    id: step.id.clone(),
-                    plugin: step.plugin.clone(),
-                    needs: step.needs.clone(),
-                    gated: pipeline.gate_reads(&step.id),
-                })
+                .map(|step| step_info(&pipeline, step))
                 .collect(),
             gate: gate_text(&pipeline),
+            gate_terms: pipeline.gate_terms().iter().map(GateTerm::from).collect(),
         };
         self.journal.append(id, started)?;
         self.inbox
@@ -2182,6 +2178,17 @@ fn step_env(run: RunId, step: &str, path: &str) -> Vec<(String, String)> {
     env
 }
 
+fn step_info(pipeline: &Pipeline, step: &Step) -> StepInfo {
+    StepInfo {
+        id: step.id.clone(),
+        plugin: step.plugin.clone(),
+        needs: step.needs.clone(),
+        gated: pipeline.gate_reads(&step.id),
+        write: step.is_write(),
+        condition: step.when.as_ref().map(ToString::to_string),
+    }
+}
+
 fn gate_text(pipeline: &Pipeline) -> String {
     let terms: Vec<String> = pipeline
         .gate_terms()
@@ -2262,6 +2269,53 @@ gate: [review, lint]
         assert!(
             dependents(&pipeline, "notes").is_empty(),
             "the Gate doesn't read notes"
+        );
+    }
+
+    #[test]
+    fn a_runs_steps_carry_what_the_graph_draws() {
+        let pipeline = pipeline(
+            "version: 1
+steps:
+  ci: { uses: ci }
+  docs: { uses: jev, when: { files: [\"docs/**\"] } }
+  fix: { uses: fix, needs: [gate] }
+gate: [ci, { or: [docs, ci] }]
+",
+        );
+        let info = |id| step_info(&pipeline, pipeline.step(id).unwrap());
+
+        assert!(info("ci").gated && !info("ci").write);
+        assert_eq!(info("ci").condition, None);
+        assert_eq!(
+            info("docs").condition.as_deref(),
+            Some("{files: [docs/**]}")
+        );
+        assert!(info("fix").write && !info("fix").gated);
+        assert_eq!(
+            pipeline
+                .gate_terms()
+                .iter()
+                .map(GateTerm::from)
+                .collect::<Vec<_>>(),
+            [
+                GateTerm::Step {
+                    id: "ci".into(),
+                    accepts_skipped: false
+                },
+                GateTerm::AnyOf {
+                    terms: vec![
+                        GateTerm::Step {
+                            id: "docs".into(),
+                            accepts_skipped: false
+                        },
+                        GateTerm::Step {
+                            id: "ci".into(),
+                            accepts_skipped: false
+                        },
+                    ]
+                },
+            ]
         );
     }
 

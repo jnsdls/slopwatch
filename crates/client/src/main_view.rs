@@ -2,12 +2,13 @@
 //! the Inbox, each with the PR pane, or the Library editor, or the link
 //! state while the daemon isn't reachable.
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme, Sizable};
+use gpui_kit::component::{ActiveTheme, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_core::WaiverCategory;
@@ -23,9 +24,10 @@ use crate::library_view::LibraryView;
 use crate::link::{LinkEvent, LinkState};
 use crate::link_view::LinkView;
 use crate::prs::{Prs, Source, poll_line, status_line, storage_line};
+use crate::run_graph_view::{run_graph, tone_color};
 use crate::run_pane::{
-    RunPane, Tone, WaiveTarget, end_label, gate_tone, run_label, run_tone, step_line, step_tone,
-    waiver_line,
+    GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, end_label, gate_tone,
+    run_label, run_tone, step_line, step_tone, waiver_line,
 };
 use crate::step_log::{self, LogViewer, Row};
 
@@ -382,7 +384,13 @@ impl MainView {
         let theme = cx.theme();
         let mut list = div()
             .id("pr-list")
-            .flex_1()
+            .map(|this| {
+                if self.run_pane.graph_shown() {
+                    this.flex_none().w(px(GRAPH_MODE_LIST_WIDTH))
+                } else {
+                    this.flex_1()
+                }
+            })
             .h_full()
             .flex()
             .flex_col()
@@ -483,7 +491,13 @@ impl MainView {
         let theme = cx.theme().clone();
         let mut list = div()
             .id("inbox-list")
-            .flex_1()
+            .map(|this| {
+                if self.run_pane.graph_shown() {
+                    this.flex_none().w(px(GRAPH_MODE_LIST_WIDTH))
+                } else {
+                    this.flex_1()
+                }
+            })
             .h_full()
             .flex()
             .flex_col()
@@ -573,22 +587,24 @@ impl MainView {
     }
 
     /// The selected PR: its Run history chips, newest first, then the Run
-    /// shown as a Step list with the Gate as its last row.
+    /// shown as a Step list with the Gate as its last row, or as a graph.
     fn pr_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let color = |tone: Tone| match tone {
-            Tone::Good => theme.success,
-            Tone::Bad => theme.danger,
-            Tone::Neutral => theme.muted_foreground,
-        };
+        let color = |tone| tone_color(&theme, tone);
         let mut pane = div()
             .id("pr-pane")
-            .w(px(400.))
+            .map(|this| {
+                if self.run_pane.graph_shown() {
+                    this.flex_1().min_w_0()
+                } else {
+                    this.w(px(400.))
+                }
+            })
             .h_full()
             .flex()
             .flex_col()
             .gap_3()
-            .p_4()
+            .p(px(PANE_PADDING))
             .border_l_1()
             .border_color(theme.border)
             .overflow_y_scroll();
@@ -605,17 +621,43 @@ impl MainView {
             );
         };
 
+        let mode = self.run_pane.mode();
         pane = pane.child(
             div()
                 .flex()
-                .flex_col()
-                .gap_0p5()
-                .child(div().text_sm().child(pr.title.clone()))
+                .items_start()
+                .justify_between()
+                .gap_2()
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("{}#{}", pr.repo, pr.number)),
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .min_w_0()
+                        .child(div().text_sm().child(pr.title.clone()))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{}#{}", pr.repo, pr.number)),
+                        ),
+                )
+                .child(
+                    ButtonGroup::new("run-mode")
+                        .small()
+                        .outline()
+                        .children(RunMode::ALL.map(|each| {
+                            Button::new(SharedString::from(format!("run-mode-{}", each.label())))
+                                .label(each.label())
+                                .selected(mode == each)
+                        }))
+                        .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
+                            if let Some(&mode) = clicked.first().and_then(|&i| RunMode::ALL.get(i))
+                            {
+                                this.run_pane.set_mode(mode);
+                                cx.notify();
+                            }
+                        })),
                 ),
         );
         if let Some(blocked) = &pr.blocked {
@@ -704,6 +746,89 @@ impl MainView {
         if let Some(viewer) = self.run_pane.viewer() {
             return pane.child(self.log_viewer(viewer, view, cx));
         }
+        if mode == RunMode::Graph {
+            let pane_view = cx.entity().downgrade();
+            let on_select = Rc::new(move |step: &str, _: &mut Window, cx: &mut App| {
+                let _ = pane_view.update(cx, |this, cx| {
+                    for command in this.run_pane.toggle_step(step) {
+                        this.send(command);
+                    }
+                    cx.notify();
+                });
+            });
+            pane = pane
+                .child(run_graph(
+                    view,
+                    self.run_pane.open_step(),
+                    &theme,
+                    on_select,
+                ))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("Solid: needs · dashed: read by the Gate · dashed box: advisory"),
+                );
+            let open = self.run_pane.open_step().and_then(|id| view.step(id));
+            if let Some(step) = open {
+                pane = pane.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded_md()
+                        .child(self.step_row(step, view, cx)),
+                );
+            }
+            if self.run_pane.can_override() {
+                pane = pane.child(
+                    div().child(
+                        Button::new("override-gate")
+                            .label("Override Gate")
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.run_pane.start_waiver(WaiveTarget::Gate);
+                                cx.notify();
+                            })),
+                    ),
+                );
+            }
+        } else {
+            pane = pane.child(self.step_list(view, cx));
+        }
+        if self.run_pane.waiver_form().is_some() {
+            pane = pane.child(self.waiver_form(cx));
+        }
+        if let Some(end) = view.end {
+            pane = pane.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("Ended: {}", end_label(end, view.waived))),
+            );
+        }
+        if !view.inbox.is_empty() {
+            let mut history = div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Inbox history");
+            for entry in &view.inbox {
+                history = history.child(format!("• {}", history_line(entry)));
+            }
+            pane = pane.child(history);
+        }
+        pane
+    }
+
+    /// The Run as a Step list, with the Gate as its last row.
+    fn step_list(&self, view: &RunView, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme().clone();
+        let color = |tone| tone_color(&theme, tone);
         let mut steps = div()
             .flex()
             .flex_col()
@@ -711,99 +836,7 @@ impl MainView {
             .border_color(theme.border)
             .rounded_md();
         for step in &view.steps {
-            let open = self.run_pane.open_step() == Some(step.info.id.as_str());
-            let toggled = step.info.id.clone();
-            let mut row = div()
-                .id(SharedString::from(format!("step-{}", step.info.id)))
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(theme.border)
-                .hover(|this| this.bg(theme.list_hover))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    for command in this.run_pane.toggle_step(&toggled) {
-                        this.send(command);
-                    }
-                    cx.notify();
-                }))
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .gap_2()
-                        .text_sm()
-                        .child(if step.info.gated {
-                            step.info.id.clone()
-                        } else {
-                            format!("{} (advisory)", step.info.id)
-                        })
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(step.info.plugin.clone()),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(color(step_tone(step)))
-                                .child(step_line(step)),
-                        )
-                        .when_some(self.run_pane.retry(&step.info.id), |this, retry| {
-                            this.child(
-                                Button::new(SharedString::from(format!("retry-{}", step.info.id)))
-                                    .label("Retry")
-                                    .small()
-                                    .ghost()
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
-                                        this.send(retry.clone());
-                                    })),
-                            )
-                        })
-                        .when(self.run_pane.can_waive(&step.info.id), |this| {
-                            let target = WaiveTarget::Step(step.info.id.clone());
-                            this.child(
-                                Button::new(SharedString::from(format!("waive-{}", step.info.id)))
-                                    .label("Waive")
-                                    .small()
-                                    .ghost()
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.run_pane.start_waiver(target.clone());
-                                        cx.notify();
-                                    })),
-                            )
-                        }),
-                )
-                .children(waiver_line(step).map(|line| {
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(line)
-                }));
-            if let slopwatch_protocol::StepStatus::Settled { outputs, .. } = &step.status {
-                for finding in &outputs.findings {
-                    row = row.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("• {}", finding.message)),
-                    );
-                }
-            }
-            if open {
-                row = row.child(self.step_log_tail(step, view, cx));
-            }
-            steps = steps.child(row);
+            steps = steps.child(self.step_row(step, view, cx));
         }
         let gate = view.gate.unwrap_or(slopwatch_core::GateState::Pending);
         steps = steps.child(
@@ -840,32 +873,7 @@ impl MainView {
                         ),
                 ),
         );
-        pane = pane.child(steps);
-        if self.run_pane.waiver_form().is_some() {
-            pane = pane.child(self.waiver_form(cx));
-        }
-        if let Some(end) = view.end {
-            pane = pane.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("Ended: {}", end_label(end, view.waived))),
-            );
-        }
-        if !view.inbox.is_empty() {
-            let mut history = div()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("Inbox history");
-            for entry in &view.inbox {
-                history = history.child(format!("• {}", history_line(entry)));
-            }
-            pane = pane.child(history);
-        }
-        pane
+        steps
     }
 
     /// The Waiver being filled in: a category, a reason, and the buttons
@@ -928,6 +936,107 @@ impl MainView {
                             })),
                     ),
             )
+    }
+
+    /// A Step's row with its Verdict and reason, its Findings, and its log
+    /// tail while open. The list shows one per Step, and the graph shows the open
+    /// Step's below the canvas.
+    fn step_row(&self, step: &StepView, view: &RunView, cx: &mut Context<Self>) -> Stateful<Div> {
+        let theme = cx.theme().clone();
+        let color = |tone| tone_color(&theme, tone);
+        let open = self.run_pane.open_step() == Some(step.info.id.as_str());
+        let toggled = step.info.id.clone();
+        let mut row = div()
+            .id(SharedString::from(format!("step-{}", step.info.id)))
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .px_3()
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .hover(|this| this.bg(theme.list_hover))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                for command in this.run_pane.toggle_step(&toggled) {
+                    this.send(command);
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap_2()
+                    .text_sm()
+                    .child(if step.info.gated {
+                        step.info.id.clone()
+                    } else {
+                        format!("{} (advisory)", step.info.id)
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(step.info.plugin.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(color(step_tone(step)))
+                            .child(step_line(step)),
+                    )
+                    .when_some(self.run_pane.retry(&step.info.id), |this, retry| {
+                        this.child(
+                            Button::new(SharedString::from(format!("retry-{}", step.info.id)))
+                                .label("Retry")
+                                .small()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+                                    this.send(retry.clone());
+                                })),
+                        )
+                    })
+                    .when(self.run_pane.can_waive(&step.info.id), |this| {
+                        let target = WaiveTarget::Step(step.info.id.clone());
+                        this.child(
+                            Button::new(SharedString::from(format!("waive-{}", step.info.id)))
+                                .label("Waive")
+                                .small()
+                                .ghost()
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.run_pane.start_waiver(target.clone());
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .children(waiver_line(step).map(|line| {
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(line)
+            }));
+        if let slopwatch_protocol::StepStatus::Settled { outputs, .. } = &step.status {
+            for finding in &outputs.findings {
+                row = row.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("• {}", finding.message)),
+                );
+            }
+        }
+        if open {
+            row = row.child(self.step_log_tail(step, view, cx));
+        }
+        row
     }
 
     /// The open Step row's last lines, with the way into its full log.
@@ -1235,7 +1344,10 @@ impl Render for MainView {
                     .flex_1()
                     .flex()
                     .overflow_hidden()
-                    .child(self.sources(cx))
+                    .when(
+                        !(self.pane != Pane::Library && self.run_pane.graph_shown()),
+                        |this| this.child(self.sources(cx)),
+                    )
                     .map(|this| match self.pane {
                         Pane::Prs => this.child(self.pr_list(cx)).child(self.pr_pane(cx)),
                         Pane::Inbox => this.child(self.inbox_list(cx)).child(self.pr_pane(cx)),
