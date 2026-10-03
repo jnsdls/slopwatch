@@ -147,12 +147,7 @@ async fn publishing_a_draft_opens_the_pipeline_pr_and_then_updates_it() {
         },
     )
     .unwrap();
-    let drafts = Drafts::new(
-        store,
-        Arc::new(Plugins::new(exe, Arc::clone(&library))),
-        library,
-        runs,
-    );
+    let drafts = Drafts::new(store, Arc::clone(runs.plugins()) as _, library, runs);
     let seen = drafts.open(&repo).await.unwrap().edits.len();
     let step = serde_json::from_value(json!({ "uses": "ci" })).unwrap();
     let edits = [

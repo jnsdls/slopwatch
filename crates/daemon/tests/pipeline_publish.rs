@@ -84,7 +84,7 @@ fn daemon(github: Arc<FakeGitHub>) -> Harness {
     .unwrap();
     let drafts = Drafts::new(
         store.clone(),
-        Arc::new(Plugins::new(exe, Arc::clone(&library))),
+        Arc::clone(runs.plugins()) as _,
         Arc::clone(&library),
         Arc::clone(&runs) as _,
     );
