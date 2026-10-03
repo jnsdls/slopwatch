@@ -1,0 +1,8 @@
+# Shipped preset. The write Step that runs once the Gate fails: Claude acts
+# on the Findings behind failing, unwaived Gate terms. The daemon commits
+# its diff, and the Pipeline's `fix_rounds` caps the loop. Uses your own
+# Claude login unless `auth` names an API key Secret.
+uses: fix
+with:
+  agent: claude
+  auth: subscription

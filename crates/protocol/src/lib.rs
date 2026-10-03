@@ -12,8 +12,8 @@ mod topics;
 
 pub use flavor::{DATA_DIR_ENV, Flavor, socket_path};
 pub use frames::{
-    Actor, Auth, ClientFrame, ClientHello, Command, ErrorBody, ErrorCode, Refusal, RefusalReason,
-    Reply, Request, RequestId, Response, ResponseBody, ServerFrame, ServerHello,
+    Actor, Auth, ClientFrame, ClientHello, Command, ErrorBody, ErrorCode, LibraryStep, Refusal,
+    RefusalReason, Reply, Request, RequestId, Response, ResponseBody, ServerFrame, ServerHello,
 };
 pub use topics::{
     PollState, PrStatus, PullRequest, RepoName, Topic, TopicUpdate, WatchedPrs, WatchedPrsDelta,
@@ -33,7 +33,9 @@ pub const DIALECT: u32 = 1;
 ///
 /// `restart`: the `restart` command, which the GUI sends a daemon from
 /// another build (ADR 0009).
-pub const FEATURES: &[&str] = &["watched_prs", "restart"];
+///
+/// `library`: the commands that list, save and delete Library Steps.
+pub const FEATURES: &[&str] = &["watched_prs", "restart", "library"];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no
 /// host, so the host here is a placeholder the daemon ignores.

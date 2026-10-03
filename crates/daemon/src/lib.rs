@@ -8,11 +8,15 @@
 //!
 //! [`Watching`] keeps added repos and their PRs in step with GitHub, which
 //! it reaches only through the [`github::GitHub`] trait.
+//!
+//! [`Library`] holds the developer's Library Steps, which clients list and
+//! edit, and which a Pipeline's resolver reads live.
 
 pub mod auth;
 mod connection;
 mod data_dir;
 pub mod github;
+mod library;
 mod pace;
 pub mod store;
 pub mod transport;
@@ -27,6 +31,7 @@ use slopwatch_protocol::{
     ServerHello,
 };
 
+pub use library::{CONFIG_DIR_ENV, Library, LibraryError};
 pub use watching::{Subscription, WatchError, Watching};
 
 /// Who is on the other end of a connection, as the transport reports it.
@@ -40,21 +45,27 @@ pub struct Daemon {
     uid: u32,
     watching: Arc<Watching>,
     restart: tokio::sync::watch::Sender<bool>,
+    library: Arc<Library>,
 }
 
 impl Daemon {
     /// A daemon stamped with this binary's build id, serving peers that run
     /// as the current user.
-    pub fn new(watching: Arc<Watching>) -> Self {
-        Self::with_build_id(BUILD_ID, watching)
+    pub fn new(watching: Arc<Watching>, library: Arc<Library>) -> Self {
+        Self::with_build_id(BUILD_ID, watching, library)
     }
 
-    pub fn with_build_id(build_id: impl Into<String>, watching: Arc<Watching>) -> Self {
+    pub fn with_build_id(
+        build_id: impl Into<String>,
+        watching: Arc<Watching>,
+        library: Arc<Library>,
+    ) -> Self {
         Self {
             build_id: build_id.into(),
             uid: current_uid(),
             watching,
             restart: tokio::sync::watch::Sender::new(false),
+            library,
         }
     }
 

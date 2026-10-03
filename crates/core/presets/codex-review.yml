@@ -1,0 +1,12 @@
+# Shipped preset. The same review as claude-review, on `codex exec`. The
+# Starters leave it out of the Gate, so it only advises, and its Findings
+# still reach Fix. Uses your own Codex login unless `auth` names an API key
+# Secret.
+uses: codex
+with:
+  auth: subscription
+  fail_on: high
+  prompt: >-
+    Review this pull request. Report each problem you find as a Finding with
+    a severity (high, medium or low), and a file and line where one applies.
+    High means the change is wrong or unsafe to merge.

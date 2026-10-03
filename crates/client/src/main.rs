@@ -44,8 +44,8 @@ fn main() {
             }),
             ..Default::default()
         };
-        let (_, view) = gpui_kit::open_window(options, cx, |_, cx| {
-            cx.new(|cx| MainView::new(commands, agent, reregister, cx))
+        let (_, view) = gpui_kit::open_window(options, cx, |window, cx| {
+            cx.new(|cx| MainView::new(commands, agent, reregister, window, cx))
         })
         .expect("open the main window");
         cx.activate(true);

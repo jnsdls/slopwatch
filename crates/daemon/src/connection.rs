@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
-use crate::{Daemon, Peer, Subscription, WatchError};
+use crate::{Daemon, LibraryError, Peer, Subscription, WatchError};
 
 /// How long a client gets to send its hello before the daemon hangs up.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -154,11 +154,21 @@ impl Daemon {
             Command::Subscribe {
                 topic: Topic::WatchedPrs,
             } => Ok(Reply::Done),
+            Command::ListLibrarySteps => {
+                return respond(
+                    self.library
+                        .list()
+                        .map(|steps| Reply::LibrarySteps { steps }),
+                );
+            }
+            Command::SaveLibraryStep { step, text } => {
+                return respond(self.library.save(&step, &text).map(|()| Reply::Done));
+            }
+            Command::DeleteLibraryStep { step } => {
+                return respond(self.library.delete(&step).map(|()| Reply::Done));
+            }
         };
-        match result {
-            Ok(reply) => ResponseBody::Ok(reply),
-            Err(error) => ResponseBody::Error(error_body(error)),
-        }
+        respond(result)
     }
 }
 
@@ -195,13 +205,36 @@ async fn recv(deltas: &mut Option<Deltas>) -> Next {
     }
 }
 
-fn error_body(error: WatchError) -> ErrorBody {
-    let (code, message) = match error {
-        WatchError::NotFound(what) => (ErrorCode::NotFound, format!("Not found: {what}")),
-        WatchError::GitHub(error) => (ErrorCode::GitHub, error.to_string()),
-        WatchError::Store(error) => (ErrorCode::Internal, format!("Database error: {error}")),
-    };
-    ErrorBody { code, message }
+fn respond<E: Into<ErrorBody>>(result: Result<Reply, E>) -> ResponseBody {
+    match result {
+        Ok(reply) => ResponseBody::Ok(reply),
+        Err(error) => ResponseBody::Error(error.into()),
+    }
+}
+
+impl From<WatchError> for ErrorBody {
+    fn from(error: WatchError) -> Self {
+        let (code, message) = match error {
+            WatchError::NotFound(what) => (ErrorCode::NotFound, format!("Not found: {what}")),
+            WatchError::GitHub(error) => (ErrorCode::GitHub, error.to_string()),
+            WatchError::Store(error) => (ErrorCode::Internal, format!("Database error: {error}")),
+        };
+        ErrorBody { code, message }
+    }
+}
+
+impl From<LibraryError> for ErrorBody {
+    fn from(error: LibraryError) -> Self {
+        let code = match &error {
+            LibraryError::BadName(_) | LibraryError::Invalid(_) => ErrorCode::Invalid,
+            LibraryError::NotFound(_) => ErrorCode::NotFound,
+            LibraryError::Io(_) => ErrorCode::Internal,
+        };
+        ErrorBody {
+            code,
+            message: error.to_string(),
+        }
+    }
 }
 
 fn request_id(text: &str) -> Option<RequestId> {

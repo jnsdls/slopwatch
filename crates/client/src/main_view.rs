@@ -1,5 +1,5 @@
-//! The main window: the sources pane and the Watched PR list, or the link
-//! state while the daemon isn't reachable.
+//! The main window: the sources pane and either the Watched PR list or the
+//! Library editor, or the link state while the daemon isn't reachable.
 
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -11,14 +11,24 @@ use gpui_kit::*;
 use slopwatch_protocol::{Command, PrStatus, PullRequest, Reply, RepoName, ResponseBody};
 
 use crate::agent::Agent;
+use crate::library_view::LibraryView;
 use crate::link::{LinkEvent, LinkState};
 use crate::link_view::LinkView;
 use crate::prs::{Prs, Source, poll_line, status_line};
 
+/// What fills the window right of the sources pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Prs,
+    Library,
+}
+
 pub struct MainView {
     link: LinkState,
     link_view: Entity<LinkView>,
+    pane: Pane,
     prs: Prs,
+    library: Entity<LibraryView>,
     /// Repos the developer can add, while the picker is open.
     picker: Option<Vec<RepoName>>,
     /// The last command that failed, until the next one succeeds.
@@ -33,12 +43,15 @@ impl MainView {
         commands: Sender<Command>,
         agent: Option<Arc<dyn Agent>>,
         reregister: Sender<()>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
             link: LinkState::Connecting,
             link_view: cx.new(|_| LinkView::new(agent, reregister)),
+            pane: Pane::Prs,
             prs: Prs::default(),
+            library: cx.new(|cx| LibraryView::new(commands.clone(), window, cx)),
             picker: None,
             error: None,
             commands,
@@ -50,6 +63,8 @@ impl MainView {
             LinkEvent::State(state) => {
                 if !matches!(state, LinkState::Connected { .. }) {
                     self.picker = None;
+                } else if self.pane == Pane::Library {
+                    self.library.read(cx).refresh();
                 }
                 self.link = state.clone();
                 self.link_view
@@ -67,6 +82,10 @@ impl MainView {
                             .collect(),
                     );
                 }
+                ResponseBody::Ok(Reply::LibrarySteps { steps }) => {
+                    self.library
+                        .update(cx, |library, cx| library.listed(steps, cx));
+                }
                 ResponseBody::Ok(_) => self.error = None,
                 ResponseBody::Error(error) => self.error = Some(error.message),
             },
@@ -77,6 +96,15 @@ impl MainView {
     fn send(&self, command: Command) {
         // The link thread only stops when the app quits.
         let _ = self.commands.send(command);
+    }
+
+    fn show_prs(&mut self, source: Source) {
+        self.pane = Pane::Prs;
+        self.prs.source = source;
+    }
+
+    fn showing(&self, source: &Source) -> bool {
+        self.pane == Pane::Prs && &self.prs.source == source
     }
 
     fn sources(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -117,10 +145,23 @@ impl MainView {
                     "source-all".into(),
                     "All PRs".to_owned(),
                     None,
-                    self.prs.source == Source::All,
+                    self.showing(&Source::All),
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.prs.source = Source::All;
+                    this.show_prs(Source::All);
+                    cx.notify();
+                })),
+            )
+            .child(
+                entry(
+                    "source-library".into(),
+                    "Library".to_owned(),
+                    None,
+                    self.pane == Pane::Library,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.pane = Pane::Library;
+                    this.library.read(cx).refresh();
                     cx.notify();
                 })),
             )
@@ -134,7 +175,7 @@ impl MainView {
             );
 
         for repo in self.prs.repos() {
-            let selected = self.prs.source == Source::Repo(repo.clone());
+            let selected = self.showing(&Source::Repo(repo.clone()));
             let chosen = repo.clone();
             pane = pane.child(
                 entry(
@@ -144,7 +185,7 @@ impl MainView {
                     selected,
                 )
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.prs.source = Source::Repo(chosen.clone());
+                    this.show_prs(Source::Repo(chosen.clone()));
                     cx.notify();
                 })),
             );
@@ -198,7 +239,7 @@ impl MainView {
                                 this.send(Command::AddRepo {
                                     repo: chosen.clone(),
                                 });
-                                this.prs.source = Source::Repo(chosen.clone());
+                                this.show_prs(Source::Repo(chosen.clone()));
                                 this.picker = None;
                                 cx.notify();
                             })),
@@ -347,7 +388,10 @@ impl Render for MainView {
                     .flex()
                     .overflow_hidden()
                     .child(self.sources(cx))
-                    .child(self.pr_list(cx)),
+                    .map(|this| match self.pane {
+                        Pane::Prs => this.child(self.pr_list(cx)),
+                        Pane::Library => this.child(self.library.clone()),
+                    }),
             )
             .children(self.footer(cx))
     }
