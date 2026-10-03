@@ -13,7 +13,7 @@ crates=$(cargo metadata --no-deps --format-version 1 |
 
 for crate in $crates; do
   [[ "$crate" == "$client" ]] && continue
-  deps=$(cargo tree -p "$crate" -e normal,build,dev --prefix none --format '{p}')
+  deps=$(cargo tree -p "$crate" --target all -e normal,build,dev --prefix none --format '{p}')
   gpui=$(awk '{print $1}' <<<"$deps" | grep -E '^gpui' | sort -u || true)
   if [[ -n "$gpui" ]]; then
     echo "error: $crate depends on GPUI crates, and only $client may:" >&2

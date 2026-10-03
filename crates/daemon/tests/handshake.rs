@@ -77,6 +77,27 @@ async fn a_dialect_mismatch_is_refused_with_a_restart_hint_and_closed() {
 }
 
 #[tokio::test]
+async fn a_hello_from_another_dialect_gets_the_restart_hint_even_if_its_shape_changed() {
+    let mut client = InProcessClient::connect(daemon()).await.unwrap();
+
+    client
+        .send_text(format!(
+            r#"{{"type":"hello","dialect":{},"credentials":{{"kind":"new"}}}}"#,
+            DIALECT + 1
+        ))
+        .await
+        .unwrap();
+    let refused = refusal(client.recv().await.unwrap().unwrap());
+
+    assert_eq!(refused.reason, RefusalReason::DialectMismatch);
+    assert!(
+        refused.message.contains("Restart the daemon"),
+        "{}",
+        refused.message
+    );
+}
+
+#[tokio::test]
 async fn a_peer_with_another_uid_is_refused() {
     let daemon = daemon();
     let stranger = Peer {

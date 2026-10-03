@@ -1,13 +1,17 @@
+use std::time::Duration;
+
 use futures_util::{SinkExt, StreamExt};
 use slopwatch_protocol::{
-    ClientFrame, ErrorBody, ErrorCode, Refusal, RefusalReason, Request, RequestId, Response,
-    ResponseBody, ServerFrame,
+    ClientFrame, ErrorBody, ErrorCode, Request, RequestId, Response, ResponseBody, ServerFrame,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
 use crate::{Daemon, Peer};
+
+/// How long a client gets to send its hello before the daemon hangs up.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Daemon {
     /// Serves one client: the WebSocket handshake, the hello exchange, then
@@ -18,17 +22,13 @@ impl Daemon {
     {
         let mut ws = tokio_tungstenite::accept_async(stream).await?;
 
-        let hello = match next_text(&mut ws).await? {
-            Some(text) => match serde_json::from_str::<ClientFrame>(&text) {
-                Ok(ClientFrame::Hello(hello)) => Ok(hello),
-                _ => Err(Refusal {
-                    reason: RefusalReason::ExpectedHello,
-                    message: "The first frame must be a hello.".to_owned(),
-                }),
-            },
-            None => return Ok(()),
+        let hello = match tokio::time::timeout(HELLO_TIMEOUT, next_text(&mut ws)).await {
+            Ok(Ok(Some(text))) => text,
+            Ok(Ok(None)) => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return ws.close(None).await,
         };
-        match hello.and_then(|hello| self.admit(&hello, peer)) {
+        match self.admit(&hello, peer) {
             Ok(welcome) => send(&mut ws, &ServerFrame::Hello(welcome)).await?,
             Err(refusal) => {
                 send(&mut ws, &ServerFrame::Refused(refusal)).await?;
@@ -54,6 +54,7 @@ impl Daemon {
                 id,
                 result: ResponseBody::Ok(self.execute(command)),
             }),
+            // A connection says hello once. A second one has no id to answer.
             Ok(ClientFrame::Hello(_)) => None,
             // Answer a malformed request if it has an id to answer to.
             Err(error) => Some(Response {
@@ -78,7 +79,7 @@ fn request_id(text: &str) -> Option<RequestId> {
 /// The next text frame, or `None` once the client closed the connection.
 /// tungstenite answers pings itself, and binary frames carry nothing in this
 /// protocol.
-async fn next_text<S>(ws: &mut WebSocketStream<S>) -> Result<Option<String>, Error>
+pub(crate) async fn next_text<S>(ws: &mut WebSocketStream<S>) -> Result<Option<String>, Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

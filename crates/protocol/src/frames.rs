@@ -30,6 +30,19 @@ pub struct ClientHello {
 }
 
 impl ClientHello {
+    /// The dialect of a raw hello frame, read without parsing the rest, so a
+    /// peer can tell a hello from another dialect even if its shape changed.
+    /// `None` if the frame isn't a hello.
+    pub fn peek_dialect(text: &str) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct Peek {
+            r#type: String,
+            dialect: u32,
+        }
+        let peek: Peek = serde_json::from_str(text).ok()?;
+        (peek.r#type == "hello").then_some(peek.dialect)
+    }
+
     /// The hello a client of this build sends on the local socket.
     pub fn local() -> Self {
         Self {
@@ -187,6 +200,17 @@ mod tests {
             panic!("expected a hello, got {frame:?}");
         };
         assert_eq!(hello.auth, Auth::Unsupported);
+    }
+
+    #[test]
+    fn the_dialect_reads_from_a_hello_whose_other_fields_changed_shape() {
+        let future = r#"{"type":"hello","dialect":9,"auth":"something new"}"#;
+
+        assert_eq!(ClientHello::peek_dialect(future), Some(9));
+        assert_eq!(
+            ClientHello::peek_dialect(r#"{"type":"request","dialect":1}"#),
+            None
+        );
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The slopwatch daemon.
 //!
-//! [`Daemon`] serves one client connection at a time over any byte stream.
-//! The [`transport`] module feeds it streams: [`transport::unix`] from the
+//! [`Daemon::serve`] serves one client connection over any byte stream, and
+//! a transport runs one per connected client. The [`transport`] module feeds
+//! it streams: [`transport::unix`] from the
 //! Unix socket, and [`transport::in_process`] from an in-memory duplex that
 //! carries the same WebSocket frames, for tests.
 
@@ -9,7 +10,8 @@ mod connection;
 pub mod transport;
 
 use slopwatch_protocol::{
-    Auth, BUILD_ID, ClientHello, Command, DIALECT, Refusal, RefusalReason, Reply, ServerHello,
+    Auth, BUILD_ID, ClientFrame, ClientHello, Command, DIALECT, Refusal, RefusalReason, Reply,
+    ServerHello,
 };
 
 /// Who is on the other end of a connection, as the transport reports it.
@@ -47,40 +49,50 @@ impl Daemon {
         self.uid
     }
 
-    fn admit(&self, hello: &ClientHello, peer: Peer) -> Result<ServerHello, Refusal> {
-        if hello.dialect != DIALECT {
-            return Err(Refusal {
-                reason: RefusalReason::DialectMismatch,
-                message: format!(
-                    "The daemon speaks protocol dialect {DIALECT} and this client speaks {}. \
-                     Restart the daemon so both run the same build.",
-                    hello.dialect
-                ),
-            });
-        }
-        match hello.auth {
-            Auth::Local => {}
-            Auth::Unsupported => {
-                return Err(Refusal {
-                    reason: RefusalReason::UnsupportedAuth,
-                    message: "This daemon accepts only local auth.".to_owned(),
-                });
-            }
-        }
+    /// Answers a client's first frame. A stranger learns nothing about the
+    /// daemon, and the dialect is read before the rest of the hello, so a
+    /// client from another dialect gets the restart hint even if its hello
+    /// changed shape.
+    fn admit(&self, first_frame: &str, peer: Peer) -> Result<ServerHello, Refusal> {
         if peer.uid != self.uid {
             return Err(Refusal {
                 reason: RefusalReason::PeerUidMismatch,
+                message: "The daemon serves only the user it runs as.".to_owned(),
+            });
+        }
+        let not_a_hello = |detail: String| Refusal {
+            reason: RefusalReason::ExpectedHello,
+            message: format!("The first frame must be a hello. {detail}")
+                .trim_end()
+                .to_owned(),
+        };
+        let dialect =
+            ClientHello::peek_dialect(first_frame).ok_or_else(|| not_a_hello(String::new()))?;
+        if dialect != DIALECT {
+            return Err(Refusal {
+                reason: RefusalReason::DialectMismatch,
                 message: format!(
-                    "The daemon runs as uid {} and refuses clients running as uid {}.",
-                    self.uid, peer.uid
+                    "The daemon speaks protocol dialect {DIALECT} and this client speaks \
+                     {dialect}. Restart the daemon so both run the same build."
                 ),
             });
         }
-        Ok(ServerHello {
-            dialect: DIALECT,
-            features: Vec::new(),
-            build_id: self.build_id.clone(),
-        })
+        let hello = match serde_json::from_str(first_frame) {
+            Ok(ClientFrame::Hello(hello)) => hello,
+            Ok(ClientFrame::Request(_)) => return Err(not_a_hello(String::new())),
+            Err(error) => return Err(not_a_hello(error.to_string())),
+        };
+        match hello.auth {
+            Auth::Local => Ok(ServerHello {
+                dialect: DIALECT,
+                features: Vec::new(),
+                build_id: self.build_id.clone(),
+            }),
+            Auth::Unsupported => Err(Refusal {
+                reason: RefusalReason::UnsupportedAuth,
+                message: "This daemon accepts only local auth.".to_owned(),
+            }),
+        }
     }
 
     fn execute(&self, command: Command) -> Reply {

@@ -23,11 +23,6 @@ async fn main() -> ExitCode {
 
     // Crash-only (ADR 0009): no shutdown path. A signal kills the process,
     // and the next start replaces the stale socket.
-    match listener.run(daemon).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("slopwatchd: accept failed: {error}");
-            ExitCode::FAILURE
-        }
-    }
+    listener.run(daemon).await;
+    ExitCode::SUCCESS
 }

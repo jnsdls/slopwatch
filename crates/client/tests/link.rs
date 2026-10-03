@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use slopwatch_client::link::{self, ConnectError, Status};
+use slopwatch_client::link::{self, ConnectError, LinkState};
 use slopwatch_daemon::Daemon;
 use slopwatch_daemon::transport::unix::Listener;
 use slopwatch_protocol::{ClientHello, DIALECT, RefusalReason};
@@ -78,31 +78,31 @@ fn a_dialect_mismatch_reports_the_daemons_refusal() {
 #[test]
 fn watching_follows_the_daemon_going_away_and_coming_back() {
     let (_dir, path) = socket();
-    let (statuses, received) = mpsc::channel();
+    let (states, received) = mpsc::channel();
     let watched = path.clone();
     std::thread::spawn(move || {
-        link::watch(&watched, Duration::from_millis(20), |status| {
-            statuses.send(status).is_ok()
+        link::watch(&watched, Duration::from_millis(20), |state| {
+            states.send(state).is_ok()
         });
     });
 
-    assert_eq!(received.recv_timeout(WAIT).unwrap(), Status::NotRunning);
+    assert_eq!(received.recv_timeout(WAIT).unwrap(), LinkState::NotRunning);
 
     let daemon = RunningDaemon::start(&path, "first");
     assert_eq!(
         received.recv_timeout(WAIT).unwrap(),
-        Status::Connected {
+        LinkState::Connected {
             daemon_build_id: "first".into()
         }
     );
 
     drop(daemon);
-    assert_eq!(received.recv_timeout(WAIT).unwrap(), Status::NotRunning);
+    assert_eq!(received.recv_timeout(WAIT).unwrap(), LinkState::NotRunning);
 
     let _daemon = RunningDaemon::start(&path, "second");
     assert_eq!(
         received.recv_timeout(WAIT).unwrap(),
-        Status::Connected {
+        LinkState::Connected {
             daemon_build_id: "second".into()
         }
     );

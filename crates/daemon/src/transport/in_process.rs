@@ -3,14 +3,16 @@
 //! frames, so nothing skips serialization. Modelled on zeron's in-process
 //! RPC.
 
+use std::io;
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use slopwatch_protocol::{Actor, ClientFrame, Command, LOCAL_URL, Request, RequestId, ServerFrame};
 use tokio::io::DuplexStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
+use crate::connection::next_text;
 use crate::{Daemon, Peer};
 
 const BUFFER_BYTES: usize = 64 * 1024;
@@ -54,19 +56,12 @@ impl InProcessClient {
     /// The next frame from the daemon, or `None` once it closed the
     /// connection.
     pub async fn recv(&mut self) -> Result<Option<ServerFrame>, Error> {
-        while let Some(message) = self.ws.next().await {
-            match message {
-                Ok(Message::Text(text)) => {
-                    let frame = serde_json::from_str(&text).expect("daemon sent a valid frame");
-                    return Ok(Some(frame));
-                }
-                Ok(Message::Close(_)) => return Ok(None),
-                Ok(_) => continue,
-                Err(Error::ConnectionClosed | Error::AlreadyClosed) => return Ok(None),
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(None)
+        let Some(text) = next_text(&mut self.ws).await? else {
+            return Ok(None);
+        };
+        let frame = serde_json::from_str(&text)
+            .map_err(|error| Error::Io(io::Error::new(io::ErrorKind::InvalidData, error)))?;
+        Ok(Some(frame))
     }
 
     /// Sends `command` as the developer through this client and waits for

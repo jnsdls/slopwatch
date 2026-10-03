@@ -5,10 +5,13 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::UnixListener;
 
 use crate::{Daemon, Peer};
+
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// A bound socket. It holds an exclusive lock next to the socket file, so a
 /// second daemon refuses to start instead of stealing the socket.
@@ -56,12 +59,19 @@ impl Listener {
         &self.path
     }
 
-    /// Accepts clients until the listener fails, serving each on its own
-    /// task. The peer's uid comes from `getpeereid`, which tokio calls for
-    /// `peer_cred` on macOS.
-    pub async fn run(self, daemon: Arc<Daemon>) -> io::Result<()> {
+    /// Accepts clients forever, serving each on its own task. The peer's uid
+    /// comes from `getpeereid`, which tokio calls for `peer_cred` on macOS.
+    pub async fn run(self, daemon: Arc<Daemon>) {
         loop {
-            let (stream, _) = self.listener.accept().await?;
+            let stream = match self.listener.accept().await {
+                Ok((stream, _)) => stream,
+                // Out of descriptors or an aborted client: both pass.
+                Err(error) => {
+                    eprintln!("slopwatchd: accept failed: {error}");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
+            };
             let uid = match stream.peer_cred() {
                 Ok(cred) => cred.uid(),
                 Err(error) => {
