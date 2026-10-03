@@ -111,6 +111,14 @@ impl Plugins {
         Some(hash)
     }
 
+    /// The manifests of the Plugins that ship with the app.
+    pub fn builtin_manifests(&self) -> Vec<Manifest> {
+        BUILTINS
+            .iter()
+            .filter_map(|name| builtin_manifest(name))
+            .collect()
+    }
+
     /// The program and arguments that start a session with `plugin`.
     pub fn command(&self, plugin: &str) -> Option<(PathBuf, Vec<String>)> {
         if builtin_manifest(plugin).is_some() {
@@ -149,6 +157,9 @@ fn file_hash(path: &Path) -> Option<String> {
             }),
     )
 }
+
+/// The names of the built-in Plugins.
+const BUILTINS: &[&str] = &["ci"];
 
 fn builtin_manifest(plugin: &str) -> Option<Manifest> {
     match plugin {

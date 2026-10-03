@@ -23,6 +23,7 @@ use slopwatch_protocol::{
 use tokio::sync::broadcast;
 
 use super::now_ms;
+use crate::secrets::{Mask, StreamMask};
 
 /// Records a slow subscriber may fall behind by. One that falls further
 /// reads the rest back from disk.
@@ -100,6 +101,11 @@ pub struct Writer {
     file: Option<File>,
     truncated: Option<Truncation>,
     failed: bool,
+    /// The Secret values the Step received, which never reach the log.
+    mask: Mask,
+    /// The end of a stderr line's last piece, held back while it could be
+    /// the start of a value.
+    stderr: StreamMask,
 }
 
 impl Writer {
@@ -126,7 +132,15 @@ impl Writer {
             file: None,
             truncated: None,
             failed: false,
+            mask: Mask::default(),
+            stderr: StreamMask::default(),
         })
+    }
+
+    /// Masks `mask`'s values out of everything written from now on.
+    pub fn with_mask(mut self, mask: Mask) -> Self {
+        self.mask = mask;
+        self
     }
 
     /// The longest record text.
@@ -134,8 +148,31 @@ impl Writer {
         self.limits.line
     }
 
-    /// Writes `text`, split into records no longer than the line limit.
+    /// Writes `text`, masked and split into records no longer than the
+    /// line limit.
     pub fn write(&mut self, source: LogSource, level: Option<LogLevel>, text: &str) {
+        let masked = self.mask.apply(text).into_owned();
+        self.write_masked(source, level, &masked);
+    }
+
+    /// Writes one piece of a stderr line. A line too long for one record
+    /// comes in pieces, and `ended` marks its last; a value cut in two by
+    /// pieces is still masked.
+    pub fn write_stderr(&mut self, piece: &str, ended: bool) {
+        let masked = self.stderr.piece(&self.mask, piece, ended);
+        if ended || !masked.is_empty() {
+            self.write_masked(LogSource::Stderr, None, &masked);
+        }
+    }
+
+    /// Writes what stderr held back when it closed mid-line.
+    pub fn finish_stderr(&mut self) {
+        if let Some(masked) = self.stderr.finish(&self.mask) {
+            self.write_masked(LogSource::Stderr, None, &masked);
+        }
+    }
+
+    fn write_masked(&mut self, source: LogSource, level: Option<LogLevel>, text: &str) {
         let mut rest = text;
         loop {
             let at = split_at(rest, self.limits.line);
