@@ -18,9 +18,13 @@ slopwatch-daemon = { path = "crates/daemon" }
 gpui-kit = "=0.7.0"
 
 async-trait = "0.1"
+block2 = "0.6"
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-service-management = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "native-tls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

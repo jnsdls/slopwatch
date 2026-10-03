@@ -1,19 +1,22 @@
 //! The GUI's link to the daemon: connect, say hello, subscribe to the
-//! topics the window shows, send the developer's commands, and notice when
-//! the daemon goes away. Blocking I/O on a thread of its own, because
-//! GPUI's executors don't drive tokio sockets.
+//! topics the window shows, send the developer's commands, notice when the
+//! daemon goes away, and hand off to a new daemon after an update. Blocking
+//! I/O on a thread of its own, because GPUI's executors don't drive tokio
+//! sockets.
 
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
+use std::time::{Duration, Instant};
 
 use slopwatch_protocol::{
-    Actor, ClientFrame, ClientHello, Command, LOCAL_URL, Refusal, Request, RequestId, Response,
-    ServerFrame, ServerHello, Topic, TopicUpdate,
+    Actor, ClientFrame, ClientHello, Command, LOCAL_URL, Refusal, RefusalReason, Request,
+    RequestId, Response, ResponseBody, ServerFrame, ServerHello, Topic, TopicUpdate,
 };
 use tungstenite::{Message, WebSocket};
+
+use crate::agent::{Agent, AgentStatus};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a read waits before the link checks for commands to send.
@@ -26,8 +29,19 @@ pub enum LinkState {
     Connected {
         daemon_build_id: String,
     },
-    /// Nothing listens on the socket.
-    NotRunning,
+    /// The daemon runs another build and no handoff can fix it: the GUI
+    /// runs outside its bundle, or it already handed off this launch.
+    Mismatched {
+        daemon_build_id: String,
+    },
+    /// The GUI is replacing the daemon: `restart`, then `unregister` and
+    /// `register` (ADR 0009).
+    HandingOff,
+    /// Nothing listens on the socket. `agent` is `None` when the GUI runs
+    /// outside its bundle and has no agent to recover.
+    NotRunning {
+        agent: Option<AgentStatus>,
+    },
     /// The daemon answered and turned the connection down.
     Refused {
         message: String,
@@ -59,7 +73,7 @@ pub enum ConnectError {
 impl From<ConnectError> for LinkState {
     fn from(error: ConnectError) -> Self {
         match error {
-            ConnectError::NotRunning(_) => LinkState::NotRunning,
+            ConnectError::NotRunning(_) => LinkState::NotRunning { agent: None },
             ConnectError::Refused(refusal) => LinkState::Refused {
                 message: refusal.message,
             },
@@ -95,6 +109,36 @@ impl Session {
         let text = serde_json::to_string(&request).expect("client frames always serialize");
         self.ws.send(Message::text(text))?;
         Ok(id)
+    }
+
+    /// Asks the daemon to restart and waits until it answers or hangs up.
+    /// The daemon exits right after, so the caller just reconnects.
+    pub fn restart(mut self) -> Result<(), String> {
+        self.ws
+            .get_ref()
+            .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+            .map_err(|error| error.to_string())?;
+        let id = self
+            .send(Command::Restart)
+            .map_err(|error| error.to_string())?;
+        loop {
+            match self.ws.read() {
+                Ok(Message::Text(text)) => match serde_json::from_str(&text) {
+                    Ok(ServerFrame::Response(response)) if response.id == id => {
+                        return match response.result {
+                            ResponseBody::Ok(_) => Ok(()),
+                            ResponseBody::Error(error) => Err(error.message),
+                        };
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 
     /// The next frame, or `None` if none arrived within the read timeout.
@@ -156,16 +200,130 @@ fn failed(error: impl std::fmt::Display) -> ConnectError {
     ConnectError::Failed(error.to_string())
 }
 
-/// Keeps a link to the daemon on `path`, retrying every `retry` while it's
-/// down. Each connection subscribes to `watched_prs` and sends the commands
-/// that arrive on `commands`. Commands sent while the daemon is down are
-/// dropped. Returns once `report` returns false.
+/// How the link paces itself.
+#[derive(Debug, Clone, Copy)]
+pub struct Pace {
+    /// Between connection attempts while the daemon is down.
+    pub retry: Duration,
+    /// How long a re-registered daemon gets to answer before the GUI
+    /// registers it again.
+    pub handoff_wait: Duration,
+}
+
+impl Pace {
+    pub const GUI: Pace = Pace {
+        retry: Duration::from_secs(1),
+        handoff_wait: Duration::from_secs(20),
+    };
+}
+
+/// How many times one handoff may register the agent. A build with no Team
+/// ID, such as an ad-hoc one, changes code identity on every rebuild, and
+/// macOS keeps the agent's Background Task Management record pinned to the
+/// old identity: the first `register` after a rebuild launches nothing.
+/// About 10 s later macOS replaces the record, and a second `register`
+/// starts the new daemon (ADR 0009). Signing with an Apple Development
+/// identity, which has a Team ID, should retire the second register.
+const REGISTERS_PER_HANDOFF: u32 = 2;
+
+enum Wait {
+    NotRegistering,
+    /// launchd may still be starting the re-registered daemon.
+    Starting,
+    /// The re-registered daemon should have answered by now.
+    Overdue,
+}
+
+/// The one handoff a GUI launch may run, so a daemon that keeps coming back
+/// on another build can't loop it.
+struct Handoff<'a> {
+    agent: Option<&'a dyn Agent>,
+    registers_left: u32,
+    registered_at: Option<Instant>,
+}
+
+impl<'a> Handoff<'a> {
+    fn new(agent: Option<&'a dyn Agent>) -> Self {
+        Self {
+            agent,
+            registers_left: if agent.is_some() {
+                REGISTERS_PER_HANDOFF
+            } else {
+                0
+            },
+            registered_at: None,
+        }
+    }
+
+    fn can_register(&self) -> bool {
+        self.registers_left > 0
+    }
+
+    /// Unregisters and registers the agent, so launchd starts the binary
+    /// the bundle holds now.
+    fn register(&mut self) {
+        let Some(agent) = self.agent.filter(|_| self.can_register()) else {
+            return;
+        };
+        self.registers_left -= 1;
+        if let Err(error) = agent.reregister() {
+            eprintln!("slopwatch: re-registering the daemon failed: {error}");
+        }
+        self.registered_at = Some(Instant::now());
+    }
+
+    /// Where a daemon that isn't up stands against the last register.
+    fn wait(&self, patience: Duration) -> Wait {
+        match self.registered_at {
+            None => Wait::NotRegistering,
+            Some(at) if at.elapsed() < patience => Wait::Starting,
+            Some(_) => Wait::Overdue,
+        }
+    }
+
+    /// Whether this launch hasn't registered or connected yet.
+    fn untouched(&self) -> bool {
+        self.registers_left == REGISTERS_PER_HANDOFF && self.registered_at.is_none()
+    }
+
+    fn stop_waiting(&mut self) {
+        self.registered_at = None;
+    }
+
+    fn finish(&mut self) {
+        self.registers_left = 0;
+        self.registered_at = None;
+    }
+}
+
+/// What the window hands the link: the developer's commands for the
+/// daemon, and Re-register presses.
+#[derive(Clone, Copy)]
+pub struct Controls<'a> {
+    pub commands: &'a Receiver<Command>,
+    pub reregister: &'a Receiver<()>,
+}
+
+/// Keeps a link to the daemon on `path` as this build's client. Each
+/// connection subscribes to `watched_prs` and sends the commands that
+/// arrive on `controls.commands`. Commands sent while the daemon is down
+/// are dropped. Returns once `report` returns false.
+///
+/// A daemon from another build, or another dialect, gets replaced through
+/// `agent`: `restart`, then `unregister` and `register` (ADR 0009), and
+/// once more if the new daemon hasn't answered within
+/// [`Pace::handoff_wait`]. With no `agent`, as under `cargo run`, the link
+/// only reports the mismatch. A daemon that isn't running when the link
+/// starts, and each Re-register press, get the same unregister and register
+/// steps.
 pub fn run(
     path: &Path,
-    retry: Duration,
-    commands: &Receiver<Command>,
+    pace: Pace,
+    agent: Option<&dyn Agent>,
+    controls: Controls,
     mut report: impl FnMut(LinkEvent) -> bool,
 ) {
+    let hello = ClientHello::local();
     let mut last = LinkState::Connecting;
     // Reports a state only when it differs from the last one.
     let mut changed = |state: LinkState, report: &mut dyn FnMut(LinkEvent) -> bool| {
@@ -174,31 +332,114 @@ pub fn run(
             report(LinkEvent::State(state))
         }
     };
+    let not_running = || LinkState::NotRunning {
+        agent: agent.map(|agent| agent.status()),
+    };
+    let mut handoff = Handoff::new(agent);
 
     loop {
-        while commands.try_recv().is_ok() {}
-        match connect(path, &ClientHello::local()) {
-            Ok(session) => {
+        while controls.commands.try_recv().is_ok() {}
+        match connect(path, &hello) {
+            Ok(session) if session.daemon().build_id == hello.build_id => {
+                handoff.finish();
                 let connected = LinkState::Connected {
                     daemon_build_id: session.daemon().build_id.clone(),
                 };
-                if !changed(connected, &mut report) {
+                if !changed(connected, &mut report) || !serve(session, controls, &mut report) {
                     return;
                 }
-                if !serve(session, commands, &mut report) {
-                    return;
-                }
-                if !changed(LinkState::NotRunning, &mut report) {
+                if !changed(not_running(), &mut report) {
                     return;
                 }
             }
+            Ok(session) if handoff.can_register() => {
+                if !changed(LinkState::HandingOff, &mut report) {
+                    return;
+                }
+                // A daemon that can't answer `restart` still goes away
+                // when it's unregistered.
+                if let Err(error) = session.restart() {
+                    eprintln!("slopwatch: restart failed: {error}");
+                }
+                handoff.register();
+                continue;
+            }
+            Ok(session) => {
+                handoff.finish();
+                let mismatched = LinkState::Mismatched {
+                    daemon_build_id: session.daemon().build_id.clone(),
+                };
+                if !changed(mismatched, &mut report) || !serve(session, controls, &mut report) {
+                    return;
+                }
+            }
+            Err(ConnectError::Refused(refusal))
+                if refusal.reason == RefusalReason::DialectMismatch && handoff.can_register() =>
+            {
+                // The daemon won't take requests from another dialect, so it
+                // can't hear `restart`. Unregistering stops it instead.
+                if !changed(LinkState::HandingOff, &mut report) {
+                    return;
+                }
+                handoff.register();
+                continue;
+            }
+            Err(ConnectError::NotRunning(_)) => match handoff.wait(pace.handoff_wait) {
+                Wait::Starting => {}
+                Wait::Overdue if handoff.can_register() => {
+                    handoff.register();
+                    continue;
+                }
+                // Nothing answers at launch: a first install, or an agent
+                // macOS lost track of. Registering starts it, unless the
+                // developer turned it off in Login Items.
+                Wait::NotRegistering
+                    if handoff.untouched()
+                        && agent.is_some_and(|agent| {
+                            agent.status() != AgentStatus::RequiresApproval
+                        }) =>
+                {
+                    if !changed(LinkState::HandingOff, &mut report) {
+                        return;
+                    }
+                    handoff.register();
+                    continue;
+                }
+                Wait::Overdue | Wait::NotRegistering => {
+                    handoff.stop_waiting();
+                    if !changed(not_running(), &mut report) {
+                        return;
+                    }
+                }
+            },
+            // The old daemon may still be going away.
+            Err(_) if matches!(handoff.wait(pace.handoff_wait), Wait::Starting) => {}
             Err(error) => {
                 if !changed(error.into(), &mut report) {
                     return;
                 }
             }
         }
-        std::thread::sleep(retry);
+        if requested(controls.reregister, pace.retry) {
+            // The developer asked for it, so this launch gets a fresh handoff.
+            handoff = Handoff::new(agent);
+            if !changed(LinkState::HandingOff, &mut report) {
+                return;
+            }
+            handoff.register();
+        }
+    }
+}
+
+/// Waits `retry` for a Re-register press. True if one came.
+fn requested(reregister: &Receiver<()>, retry: Duration) -> bool {
+    match reregister.recv_timeout(retry) {
+        Ok(()) => true,
+        Err(RecvTimeoutError::Timeout) => false,
+        Err(RecvTimeoutError::Disconnected) => {
+            std::thread::sleep(retry);
+            false
+        }
     }
 }
 
@@ -206,9 +447,10 @@ pub fn run(
 /// stop.
 fn serve(
     mut session: Session,
-    commands: &Receiver<Command>,
+    controls: Controls,
     report: &mut dyn FnMut(LinkEvent) -> bool,
 ) -> bool {
+    let commands = controls.commands;
     let subscribe = Command::Subscribe {
         topic: Topic::WatchedPrs,
     };

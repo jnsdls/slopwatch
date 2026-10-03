@@ -1,6 +1,7 @@
 //! The main window: the sources pane and the Watched PR list, or the link
 //! state while the daemon isn't reachable.
 
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -9,6 +10,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Command, PrStatus, PullRequest, Reply, RepoName, ResponseBody};
 
+use crate::agent::Agent;
 use crate::link::{LinkEvent, LinkState};
 use crate::link_view::LinkView;
 use crate::prs::{Prs, Source, poll_line, status_line};
@@ -25,10 +27,17 @@ pub struct MainView {
 }
 
 impl MainView {
-    pub fn new(commands: Sender<Command>, cx: &mut Context<Self>) -> Self {
+    /// `agent` is `None` when the GUI runs outside its bundle. `reregister`
+    /// asks the link to unregister and register the agent.
+    pub fn new(
+        commands: Sender<Command>,
+        agent: Option<Arc<dyn Agent>>,
+        reregister: Sender<()>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             link: LinkState::Connecting,
-            link_view: cx.new(|_| LinkView::new()),
+            link_view: cx.new(|_| LinkView::new(agent, reregister)),
             prs: Prs::default(),
             picker: None,
             error: None,

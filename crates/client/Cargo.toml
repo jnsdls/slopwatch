@@ -18,6 +18,13 @@ serde_json.workspace = true
 slopwatch-protocol.workspace = true
 tungstenite.workspace = true
 
+# SMAppService, to register the daemon as a launchd agent (ADR 0009).
+[target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-service-management.workspace = true
+
 [dev-dependencies]
 slopwatch-daemon.workspace = true
 tempfile.workspace = true

@@ -58,7 +58,11 @@ impl Daemon {
                         let Some(frame) = self.frame(next, &mut deltas) else { break };
                         send(&mut ws, &frame).await?;
                     }
+                    let restarting = result == ResponseBody::Ok(Reply::Restarting);
                     send(&mut ws, &ServerFrame::Response(Response { id, result })).await?;
+                    if restarting {
+                        self.restart.send_replace(true);
+                    }
                 }
                 next = recv(&mut deltas) => {
                     if let Some(frame) = self.frame(next, &mut deltas) {
@@ -132,6 +136,7 @@ impl Daemon {
         let watching = &self.watching;
         let result = match command {
             Command::Ping => Ok(Reply::Pong),
+            Command::Restart => Ok(Reply::Restarting),
             Command::ListAvailableRepos => watching
                 .available_repos()
                 .await

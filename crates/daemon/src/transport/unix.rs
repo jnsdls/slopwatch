@@ -1,58 +1,37 @@
 //! The daemon's Unix socket, the only listener in v1 (ADR 0010).
 
-use std::fs::{self, File, TryLockError};
+use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::UnixListener;
 
-use crate::{Daemon, Peer};
+use crate::{Daemon, DataDir, Peer};
 
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// A bound socket. It holds an exclusive lock next to the socket file, so a
-/// second daemon refuses to start instead of stealing the socket.
+/// The socket in a locked data dir.
 pub struct Listener {
     listener: UnixListener,
     path: PathBuf,
-    _lock: File,
 }
 
 impl Listener {
-    /// Binds `path`, creating its directory if needed. A socket file left by
-    /// a daemon that crashed is replaced; a live daemon holding the lock
-    /// fails the bind.
-    pub fn bind(path: &Path) -> io::Result<Self> {
-        let dir = path.parent().unwrap_or(Path::new("."));
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-
-        let lock = File::create(path.with_extension("lock"))?;
-        lock.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!("another daemon holds {}", path.display()),
-            ),
-            TryLockError::Error(error) => error,
-        })?;
-
-        match fs::remove_file(path) {
+    /// Binds the socket in `data_dir`. Holding the data dir's lock means no
+    /// live daemon owns the socket, so a socket file left by a daemon that
+    /// crashed is replaced.
+    pub fn bind(data_dir: &DataDir) -> io::Result<Self> {
+        let path = data_dir.socket_path();
+        match fs::remove_file(&path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
             _ => {}
         }
-        let listener = UnixListener::bind(path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-
-        Ok(Self {
-            listener,
-            path: path.to_owned(),
-            _lock: lock,
-        })
+        let listener = UnixListener::bind(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        Ok(Self { listener, path })
     }
 
     pub fn path(&self) -> &Path {

@@ -6,15 +6,15 @@
 //! one with a response carrying the same id. A client that subscribes to a
 //! topic also gets topic updates: a snapshot, then ordered deltas.
 
+mod flavor;
 mod frames;
-mod socket;
 mod topics;
 
+pub use flavor::{DATA_DIR_ENV, Flavor, socket_path};
 pub use frames::{
     Actor, Auth, ClientFrame, ClientHello, Command, ErrorBody, ErrorCode, Refusal, RefusalReason,
     Reply, Request, RequestId, Response, ResponseBody, ServerFrame, ServerHello,
 };
-pub use socket::{LOCAL_URL, SOCKET_ENV, local_socket_path};
 pub use topics::{
     PollState, PrStatus, PullRequest, RepoName, Topic, TopicUpdate, WatchedPrs, WatchedPrsDelta,
     WatchedPrsUpdate,
@@ -30,7 +30,14 @@ pub const DIALECT: u32 = 1;
 ///
 /// `watched_prs`: the commands for repos and watching, and the
 /// `watched_prs` topic.
-pub const FEATURES: &[&str] = &["watched_prs"];
+///
+/// `restart`: the `restart` command, which the GUI sends a daemon from
+/// another build (ADR 0009).
+pub const FEATURES: &[&str] = &["watched_prs", "restart"];
+
+/// The URL clients put in the WebSocket handshake. A Unix socket has no
+/// host, so the host here is a placeholder the daemon ignores.
+pub const LOCAL_URL: &str = "ws://localhost/";
 
 /// The git SHA this binary was built from, plus a hash of the uncommitted
 /// changes when the tree was dirty.
