@@ -1,5 +1,6 @@
-//! The main window: the sources pane and either the Watched PR list or the
-//! Library editor, or the link state while the daemon isn't reachable.
+//! The main window: the sources pane, then either the Watched PR list with
+//! the PR pane or the Library editor, or the link state while the daemon
+//! isn't reachable.
 
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -8,13 +9,16 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use slopwatch_protocol::{Command, PrStatus, PullRequest, Reply, RepoName, ResponseBody};
+use slopwatch_protocol::{
+    Command, PrStatus, PullRequest, Reply, RepoName, ResponseBody, TopicUpdate,
+};
 
 use crate::agent::Agent;
 use crate::library_view::LibraryView;
 use crate::link::{LinkEvent, LinkState};
 use crate::link_view::LinkView;
 use crate::prs::{Prs, Source, poll_line, status_line};
+use crate::run_pane::{RunPane, Tone, gate_tone, run_label, run_tone, step_line, step_tone};
 
 /// What fills the window right of the sources pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +33,7 @@ pub struct MainView {
     pane: Pane,
     prs: Prs,
     library: Entity<LibraryView>,
+    run_pane: RunPane,
     /// Repos the developer can add, while the picker is open.
     picker: Option<Vec<RepoName>>,
     /// The last command that failed, until the next one succeeds.
@@ -52,6 +57,7 @@ impl MainView {
             pane: Pane::Prs,
             prs: Prs::default(),
             library: cx.new(|cx| LibraryView::new(commands.clone(), window, cx)),
+            run_pane: RunPane::default(),
             picker: None,
             error: None,
             commands,
@@ -61,16 +67,32 @@ impl MainView {
     pub fn handle(&mut self, event: LinkEvent, cx: &mut Context<Self>) {
         match event {
             LinkEvent::State(state) => {
-                if !matches!(state, LinkState::Connected { .. }) {
+                let connected = matches!(state, LinkState::Connected { .. });
+                if !connected {
                     self.picker = None;
                 } else if self.pane == Pane::Library {
                     self.library.read(cx).refresh();
+                }
+                if connected && !matches!(self.link, LinkState::Connected { .. }) {
+                    // The new connection subscribes to `watched_prs` itself.
+                    for command in self.run_pane.reconnected() {
+                        self.send(command);
+                    }
                 }
                 self.link = state.clone();
                 self.link_view
                     .update(cx, |view, cx| view.set_state(state, cx));
             }
-            LinkEvent::Topic(update) => self.prs.apply(update),
+            LinkEvent::Topic(update @ TopicUpdate::Run { .. }) => self.run_pane.apply(update),
+            LinkEvent::Topic(update) => {
+                self.prs.apply(update);
+                if let Some((repo, number)) = self.run_pane.selected().cloned() {
+                    let commands = self.run_pane.pr_changed(self.prs.pr(&repo, number));
+                    for command in commands {
+                        self.send(command);
+                    }
+                }
+            }
             LinkEvent::Response(response) => match response.result {
                 ResponseBody::Ok(Reply::AvailableRepos { repos }) => {
                     self.error = None;
@@ -316,7 +338,10 @@ impl MainView {
                 });
             }));
 
+        let selected = self.run_pane.selected() == Some(&(pr.repo.clone(), pr.number));
+        let row = pr.clone();
         div()
+            .id(SharedString::from(format!("pr-{}-{}", pr.repo, pr.number)))
             .flex()
             .items_center()
             .gap_3()
@@ -324,6 +349,14 @@ impl MainView {
             .py_2()
             .border_b_1()
             .border_color(theme.border)
+            .when(selected, |this| this.bg(theme.list_active))
+            .hover(|this| this.bg(theme.list_hover))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                for command in this.run_pane.select_pr(&row) {
+                    this.send(command);
+                }
+                cx.notify();
+            }))
             .child(
                 div()
                     .flex_1()
@@ -346,6 +379,192 @@ impl MainView {
                     ),
             )
             .child(toggle)
+    }
+
+    /// The selected PR: its Run history chips, newest first, then the Run
+    /// shown as a Step list with the Gate as its last row.
+    fn pr_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let color = |tone: Tone| match tone {
+            Tone::Good => theme.success,
+            Tone::Bad => theme.danger,
+            Tone::Neutral => theme.muted_foreground,
+        };
+        let mut pane = div()
+            .id("pr-pane")
+            .w(px(400.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .border_l_1()
+            .border_color(theme.border)
+            .overflow_y_scroll();
+        let Some(pr) = self
+            .run_pane
+            .selected()
+            .and_then(|(repo, number)| self.prs.pr(repo, *number))
+        else {
+            return pane.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Select a PR to see its Runs."),
+            );
+        };
+
+        pane = pane.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(div().text_sm().child(pr.title.clone()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{}#{}", pr.repo, pr.number)),
+                ),
+        );
+        if let Some(blocked) = &pr.blocked {
+            pane = pane.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.warning)
+                    .child(blocked.clone()),
+            );
+        }
+        if pr.runs.is_empty() {
+            return pane.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("No Runs yet."),
+            );
+        }
+
+        let mut chips = div().flex().flex_wrap().gap_1();
+        for run in &pr.runs {
+            let shown = self.run_pane.shown() == Some(run.id);
+            let (id, row) = (run.id, pr.clone());
+            chips = chips.child(
+                div()
+                    .id(SharedString::from(format!("run-chip-{id}")))
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(if shown {
+                        theme.foreground
+                    } else {
+                        theme.border
+                    })
+                    .text_xs()
+                    .text_color(color(run_tone(run)))
+                    .hover(|this| this.bg(theme.list_hover))
+                    .child(format!("#{id} {}", run_label(run)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        for command in this.run_pane.select_run(id, &row) {
+                            this.send(command);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        pane = pane.child(chips);
+
+        let Some(view) = self.run_pane.view() else {
+            return pane;
+        };
+        let short = |sha: &str| sha.chars().take(7).collect::<String>();
+        pane = pane.child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(format!(
+                    "Head {} · Pipeline from {} at {}",
+                    short(&view.head_sha),
+                    view.base,
+                    short(&view.base_sha)
+                )),
+        );
+        let mut steps = div()
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md();
+        for step in &view.steps {
+            let mut row = div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .gap_2()
+                        .text_sm()
+                        .child(if step.info.gated {
+                            step.info.id.clone()
+                        } else {
+                            format!("{} (advisory)", step.info.id)
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(step.info.plugin.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(color(step_tone(step)))
+                        .child(step_line(step)),
+                );
+            if let slopwatch_protocol::StepStatus::Settled { outputs, .. } = &step.status {
+                for finding in &outputs.findings {
+                    row = row.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("• {}", finding.message)),
+                    );
+                }
+            }
+            steps = steps.child(row);
+        }
+        let gate = view.gate.unwrap_or(slopwatch_core::GateState::Pending);
+        steps = steps.child(
+            div()
+                .flex()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .text_sm()
+                .child(format!("Gate {}", view.gate_text))
+                .child(
+                    div()
+                        .text_color(color(gate_tone(gate)))
+                        .child(gate.to_string()),
+                ),
+        );
+        pane = pane.child(steps);
+        if let Some(end) = view.end {
+            pane = pane.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("Ended: {end}")),
+            );
+        }
+        pane
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -389,7 +608,7 @@ impl Render for MainView {
                     .overflow_hidden()
                     .child(self.sources(cx))
                     .map(|this| match self.pane {
-                        Pane::Prs => this.child(self.pr_list(cx)),
+                        Pane::Prs => this.child(self.pr_list(cx)).child(self.pr_pane(cx)),
                         Pane::Library => this.child(self.library.clone()),
                     }),
             )

@@ -9,7 +9,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use slopwatch_protocol::RepoName;
 
-use super::{GitHub, GitHubError, OpenPr, PIPELINE_PATH, Poll, RateLimit, RepoPoll, WATCH_LABEL};
+use slopwatch_protocol::step::{Check, CheckState, Checks, ChecksState};
+
+use super::{
+    GitHub, GitHubError, GitRemote, OpenPr, PIPELINE_PATH, Poll, PrDetail, RateLimit, RepoPoll,
+    WATCH_LABEL,
+};
 use crate::auth::Credentials;
 
 const API: &str = "https://api.github.com";
@@ -154,6 +159,23 @@ impl GitHub for Api {
             Err(GitHubError::NotFound(_)) => Ok(()),
             other => other,
         }
+    }
+
+    async fn git_remote(&self, repo: &RepoName) -> Result<GitRemote, GitHubError> {
+        let token = self.credentials.token().await?;
+        // git reads config from these variables, so the token stays off
+        // the command line and out of the clone's config file.
+        Ok(GitRemote {
+            url: format!("https://github.com/{repo}.git"),
+            env: vec![
+                ("GIT_CONFIG_COUNT".into(), "1".into()),
+                (
+                    "GIT_CONFIG_KEY_0".into(),
+                    "http.https://github.com/.extraheader".into(),
+                ),
+                ("GIT_CONFIG_VALUE_0".into(), basic_auth(&token)),
+            ],
+        })
     }
 }
 
@@ -312,10 +334,19 @@ fn poll_query(repos: &[RepoName]) -> (String, Value) {
     issueCount
     nodes {{
       ... on PullRequest {{
-        number title url isDraft headRefOid baseRefName
+        number title body url isDraft headRefOid baseRefName
+        author {{ login }}
         repository {{ nameWithOwner }}
         labels(first: {PAGE}) {{ nodes {{ name }} }}
-        baseRef {{ target {{ ... on Commit {{ file(path: \"{PIPELINE_PATH}\") {{ oid }} }} }} }}
+        baseRef {{ target {{ oid ... on Commit {{ file(path: \"{PIPELINE_PATH}\") {{ oid }} }} }} }}
+        commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{
+          state
+          contexts(first: {PAGE}) {{ nodes {{
+            __typename
+            ... on CheckRun {{ name status conclusion detailsUrl }}
+            ... on StatusContext {{ context state targetUrl }}
+          }} }}
+        }} }} }} }}
       }}
     }}
   }}
@@ -350,13 +381,21 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
     struct Pr {
         number: u64,
         title: String,
+        #[serde(default)]
+        body: String,
         url: String,
         is_draft: bool,
         head_ref_oid: String,
         base_ref_name: String,
+        author: Option<Author>,
         repository: Repo,
         labels: Nodes<Label>,
         base_ref: Option<BaseRef>,
+        commits: Option<Nodes<CommitNode>>,
+    }
+    #[derive(Deserialize)]
+    struct Author {
+        login: String,
     }
     #[derive(Deserialize)]
     struct Label {
@@ -368,7 +407,19 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
     }
     #[derive(Deserialize)]
     struct Target {
+        #[serde(default)]
+        oid: String,
         file: Option<Value>,
+    }
+    #[derive(Deserialize)]
+    struct CommitNode {
+        commit: Commit,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Commit {
+        oid: String,
+        status_check_rollup: Option<Rollup>,
     }
 
     let rate: Option<Rate> = parse(data["rateLimit"].take())?;
@@ -395,24 +446,42 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
                         .name_with_owner
                         .eq_ignore_ascii_case(&found.name_with_owner)
                 })
-                .map(|pr| OpenPr {
-                    number: pr.number,
-                    title: pr.title.clone(),
-                    url: pr.url.clone(),
-                    draft: pr.is_draft,
-                    head_sha: pr.head_ref_oid.clone(),
-                    base: pr.base_ref_name.clone(),
-                    labeled: pr
-                        .labels
-                        .nodes
-                        .iter()
-                        .any(|label| label.name == WATCH_LABEL),
-                    base_has_pipeline: pr
-                        .base_ref
+                .map(|pr| {
+                    let labels: Vec<String> =
+                        pr.labels.nodes.iter().map(|l| l.name.clone()).collect();
+                    let base = pr.base_ref.as_ref().and_then(|base| base.target.as_ref());
+                    // Checks count only on the head the PR reports.
+                    let checks = pr
+                        .commits
                         .as_ref()
-                        .and_then(|base| base.target.as_ref())
-                        .and_then(|target| target.file.as_ref())
-                        .is_some_and(|file| !file.is_null()),
+                        .and_then(|commits| commits.nodes.last())
+                        .filter(|node| node.commit.oid == pr.head_ref_oid)
+                        .and_then(|node| node.commit.status_check_rollup.as_ref())
+                        .map(Rollup::checks)
+                        .unwrap_or_default();
+                    OpenPr {
+                        number: pr.number,
+                        title: pr.title.clone(),
+                        url: pr.url.clone(),
+                        draft: pr.is_draft,
+                        head_sha: pr.head_ref_oid.clone(),
+                        base: pr.base_ref_name.clone(),
+                        labeled: labels.iter().any(|label| label == WATCH_LABEL),
+                        base_has_pipeline: base
+                            .and_then(|target| target.file.as_ref())
+                            .is_some_and(|file| !file.is_null()),
+                        detail: PrDetail {
+                            body: pr.body.clone(),
+                            author: pr
+                                .author
+                                .as_ref()
+                                .map(|author| author.login.clone())
+                                .unwrap_or_default(),
+                            labels,
+                            base_sha: base.map(|target| target.oid.clone()).unwrap_or_default(),
+                            checks,
+                        },
+                    }
                 })
                 .collect()
         });
@@ -437,6 +506,92 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
 #[derive(Deserialize)]
 struct Nodes<T> {
     nodes: Vec<T>,
+}
+
+/// A commit's `statusCheckRollup`.
+#[derive(Deserialize)]
+struct Rollup {
+    state: String,
+    contexts: Nodes<Context>,
+}
+
+/// One check run or commit status. Other node types read as `Other`.
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+#[allow(clippy::enum_variant_names)] // GitHub's type names
+enum Context {
+    #[serde(rename_all = "camelCase")]
+    CheckRun {
+        name: String,
+        status: String,
+        conclusion: Option<String>,
+        details_url: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    StatusContext {
+        context: String,
+        state: String,
+        target_url: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+impl Rollup {
+    fn checks(&self) -> Checks {
+        Checks {
+            state: match self.state.as_str() {
+                "SUCCESS" => ChecksState::Success,
+                "FAILURE" | "ERROR" => ChecksState::Failure,
+                _ => ChecksState::Pending,
+            },
+            runs: self
+                .contexts
+                .nodes
+                .iter()
+                .filter_map(|context| match context {
+                    Context::CheckRun {
+                        name,
+                        status,
+                        conclusion,
+                        details_url,
+                    } => Some(Check {
+                        name: name.clone(),
+                        state: match (status.as_str(), conclusion.as_deref()) {
+                            ("COMPLETED", Some("SUCCESS")) => CheckState::Success,
+                            ("COMPLETED", Some("NEUTRAL")) => CheckState::Neutral,
+                            ("COMPLETED", Some("SKIPPED")) => CheckState::Skipped,
+                            ("COMPLETED", _) => CheckState::Failure,
+                            _ => CheckState::Pending,
+                        },
+                        url: details_url.clone(),
+                    }),
+                    Context::StatusContext {
+                        context,
+                        state,
+                        target_url,
+                    } => Some(Check {
+                        name: context.clone(),
+                        state: match state.as_str() {
+                            "SUCCESS" => CheckState::Success,
+                            "FAILURE" | "ERROR" => CheckState::Failure,
+                            _ => CheckState::Pending,
+                        },
+                        url: target_url.clone(),
+                    }),
+                    Context::Other => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// `Authorization` for git over HTTPS with a GitHub token.
+fn basic_auth(token: &str) -> String {
+    use base64::Engine as _;
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    format!("AUTHORIZATION: basic {encoded}")
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, GitHubError> {

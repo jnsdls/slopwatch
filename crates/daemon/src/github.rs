@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use slopwatch_protocol::RepoName;
+use slopwatch_protocol::step::Checks;
 
 /// The label that makes a PR a Watched PR.
 pub const WATCH_LABEL: &str = "slopwatch";
@@ -30,6 +31,26 @@ pub trait GitHub: Send + Sync {
 
     /// Adds the `slopwatch` label to a PR, or removes it when `on` is false.
     async fn set_label(&self, repo: &RepoName, number: u64, on: bool) -> Result<(), GitHubError>;
+
+    /// Where git fetches `repo` from, with what authenticates it.
+    async fn git_remote(&self, repo: &RepoName) -> Result<GitRemote, GitHubError>;
+}
+
+/// A git remote and the environment a git process needs to reach it.
+#[derive(Clone)]
+pub struct GitRemote {
+    pub url: String,
+    /// Holds a credential for the real remote, so it never goes on a
+    /// command line or into a log.
+    pub env: Vec<(String, String)>,
+}
+
+impl fmt::Debug for GitRemote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GitRemote")
+            .field("url", &self.url)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One poll's answer.
@@ -48,7 +69,7 @@ pub struct RepoPoll {
 }
 
 /// One of the developer's open PRs, as GitHub reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OpenPr {
     pub number: u64,
     pub title: String,
@@ -60,6 +81,20 @@ pub struct OpenPr {
     pub labeled: bool,
     /// The base branch's head has a Pipeline file.
     pub base_has_pipeline: bool,
+    /// What a poll reads besides, for Step snapshots. The store doesn't
+    /// keep these, so they're empty until the first poll after a start.
+    pub detail: PrDetail,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrDetail {
+    pub body: String,
+    pub author: String,
+    pub labels: Vec<String>,
+    /// The base branch's head commit.
+    pub base_sha: String,
+    /// The checks on the head commit.
+    pub checks: Checks,
 }
 
 /// GitHub's GraphQL rate limit after a call.

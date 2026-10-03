@@ -6,15 +6,49 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::runs::{RunEvent, RunId, RunSummary};
+
+/// A topic, by its name on the wire: `watched_prs` or `run/<id>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(try_from = "String", into = "String")]
 pub enum Topic {
     /// Added repos, the developer's open PRs in them, and which are watched.
     WatchedPrs,
+    /// One Run's event journal.
+    Run(RunId),
+}
+
+impl fmt::Display for Topic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Topic::WatchedPrs => f.write_str("watched_prs"),
+            Topic::Run(id) => write!(f, "run/{id}"),
+        }
+    }
+}
+
+impl TryFrom<String> for Topic {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        if text == "watched_prs" {
+            return Ok(Topic::WatchedPrs);
+        }
+        text.strip_prefix("run/")
+            .and_then(|id| id.parse().ok())
+            .map(|id| Topic::Run(RunId(id)))
+            .ok_or_else(|| format!("`{text}` isn't a topic"))
+    }
+}
+
+impl From<Topic> for String {
+    fn from(topic: Topic) -> Self {
+        topic.to_string()
+    }
 }
 
 /// One frame on a topic.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "topic", rename_all = "snake_case")]
 pub enum TopicUpdate {
     WatchedPrs {
@@ -22,6 +56,13 @@ pub enum TopicUpdate {
         /// includes. Each delta after it carries the next number.
         seq: u64,
         update: WatchedPrsUpdate,
+    },
+    /// One event from a Run's journal. A Run topic has no snapshot: its
+    /// events from sequence number 1 are the whole Run.
+    Run {
+        id: RunId,
+        seq: u64,
+        event: RunEvent,
     },
 }
 
@@ -156,6 +197,12 @@ pub struct PullRequest {
     /// The base branch's name.
     pub base: String,
     pub status: PrStatus,
+    /// The PR's latest Runs, newest first.
+    #[serde(default)]
+    pub runs: Vec<RunSummary>,
+    /// Why the PR can't get a Run right now, such as an invalid Pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<String>,
 }
 
 impl PullRequest {
@@ -209,6 +256,8 @@ mod tests {
             head_sha: "abc".into(),
             base: "main".into(),
             status: PrStatus::NotWatched,
+            runs: vec![],
+            blocked: None,
         }
     }
 
@@ -226,6 +275,24 @@ mod tests {
         );
         assert!(serde_json::from_value::<RepoName>(json!("slopwatch")).is_err());
         assert!(serde_json::from_value::<RepoName>(json!("a/b/c")).is_err());
+    }
+
+    #[test]
+    fn topics_are_named_the_way_adr_0010_writes_them() {
+        assert_eq!(
+            serde_json::to_value(Topic::WatchedPrs).unwrap(),
+            json!("watched_prs")
+        );
+        assert_eq!(
+            serde_json::to_value(Topic::Run(RunId(12))).unwrap(),
+            json!("run/12")
+        );
+        assert_eq!(
+            serde_json::from_value::<Topic>(json!("run/12")).unwrap(),
+            Topic::Run(RunId(12))
+        );
+        assert!(serde_json::from_value::<Topic>(json!("run/x")).is_err());
+        assert!(serde_json::from_value::<Topic>(json!("inbox")).is_err());
     }
 
     #[test]

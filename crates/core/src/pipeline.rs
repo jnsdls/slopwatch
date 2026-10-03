@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::expr::{Expr, StepTerm};
@@ -32,6 +32,24 @@ impl Pipeline {
 
     pub fn step(&self, id: &str) -> Option<&Step> {
         self.steps.get(id)
+    }
+
+    /// Every Step, each after the Steps it needs.
+    pub fn ordered_steps(&self) -> impl Iterator<Item = &Step> {
+        self.order.iter().filter_map(|id| self.steps.get(id))
+    }
+
+    /// Whether the Gate reads Step `id`. A Step it doesn't read is advisory.
+    pub fn gate_reads(&self, id: &str) -> bool {
+        let mut found = false;
+        for term in &self.gate {
+            term.walk(&mut |expr| {
+                if let Expr::Step(StepTerm { id: read, .. }) = expr {
+                    found |= read == id;
+                }
+            });
+        }
+        found
     }
 
     /// The Gate's terms, which hold together as an AND.
@@ -120,7 +138,7 @@ pub enum Uses {
 }
 
 /// The workspace a Plugin's manifest declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Workspace {
     None,

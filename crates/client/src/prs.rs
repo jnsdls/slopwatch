@@ -27,7 +27,9 @@ impl Prs {
     /// Applies an update from the daemon. A snapshot replaces everything,
     /// and a delta the snapshot already includes is dropped.
     pub fn apply(&mut self, update: TopicUpdate) {
-        let TopicUpdate::WatchedPrs { seq, update } = update;
+        let TopicUpdate::WatchedPrs { seq, update } = update else {
+            return;
+        };
         match update {
             WatchedPrsUpdate::Snapshot(snapshot) => {
                 self.topic = snapshot;
@@ -46,6 +48,10 @@ impl Prs {
             }
         }
         self.seq = Some(seq);
+    }
+
+    pub fn pr(&self, repo: &RepoName, number: u64) -> Option<&PullRequest> {
+        self.topic.pr(repo, number)
     }
 
     pub fn loaded(&self) -> bool {
@@ -83,7 +89,11 @@ pub fn status_line(pr: &PullRequest) -> String {
     let status = match pr.status {
         PrStatus::NotWatched => "Not watched".to_owned(),
         PrStatus::Waiting => format!("Waiting for a Pipeline on {}", pr.base),
-        PrStatus::Ready => "Watched".to_owned(),
+        PrStatus::Ready => match (&pr.blocked, pr.runs.first()) {
+            (Some(blocked), _) => blocked.clone(),
+            (None, Some(run)) => crate::run_pane::run_label(run),
+            (None, None) => "Watched".to_owned(),
+        },
     };
     if pr.draft {
         format!("Draft · {status}")
@@ -120,6 +130,8 @@ mod tests {
             head_sha: String::new(),
             base: "main".into(),
             status,
+            runs: vec![],
+            blocked: None,
         }
     }
 
