@@ -17,6 +17,10 @@ pub const WATCH_LABEL: &str = "slopwatch";
 /// Where a repo's Pipeline lives on a branch.
 pub const PIPELINE_PATH: &str = ".slopwatch/pipeline.yml";
 
+/// The long-lived branch publishing commits a repo's Pipeline to, and opens
+/// its Pipeline PR from (ADR 0007).
+pub const PIPELINE_BRANCH: &str = "slopwatch/pipeline";
+
 #[async_trait]
 pub trait GitHub: Send + Sync {
     /// The repos the developer can push to.
@@ -105,6 +109,59 @@ pub trait GitHub: Send + Sync {
 
     /// Where git fetches `repo` from, with what authenticates it.
     async fn git_remote(&self, repo: &RepoName) -> Result<GitRemote, GitHubError>;
+
+    /// The open PR from `branch` of the repo itself, if there is one.
+    async fn open_pr_from(
+        &self,
+        repo: &RepoName,
+        branch: &str,
+    ) -> Result<Option<PrLink>, GitHubError>;
+
+    /// Opens a PR from a branch of the repo itself.
+    async fn create_pr(&self, repo: &RepoName, pr: &NewPr<'_>) -> Result<PrLink, GitHubError>;
+
+    /// Points `branch` at `sha`, creating it if it doesn't exist and moving
+    /// it from wherever it was if it does.
+    async fn set_branch(&self, repo: &RepoName, branch: &str, sha: &str)
+    -> Result<(), GitHubError>;
+
+    /// Commits `files` on top of the commit's branch through
+    /// `createCommitOnBranch`, only if the branch's head is still
+    /// `expected_head` (ADR 0002). GitHub signs the commit as the
+    /// developer. Returns its SHA.
+    async fn commit_files(
+        &self,
+        repo: &RepoName,
+        commit: &NewCommit<'_>,
+    ) -> Result<String, GitHubError>;
+}
+
+/// An open PR, as publishing finds or opens it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrLink {
+    pub number: u64,
+    pub url: String,
+    pub head_sha: String,
+}
+
+/// A PR to open.
+#[derive(Debug, Clone, Copy)]
+pub struct NewPr<'a> {
+    pub head: &'a str,
+    pub base: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+}
+
+/// A commit to make through the API.
+#[derive(Debug, Clone, Copy)]
+pub struct NewCommit<'a> {
+    pub branch: &'a str,
+    pub expected_head: &'a str,
+    pub headline: &'a str,
+    pub body: &'a str,
+    /// Each file's path and whole new text.
+    pub files: &'a [(&'a str, &'a str)],
 }
 
 /// What became of a merge GitHub accepted.

@@ -15,7 +15,8 @@ use slopwatch_protocol::step::{
 };
 
 use super::{
-    Branch, GitHub, GitHubError, GitRemote, Merged, OpenPr, PIPELINE_PATH, ParentPr, Poll,
+    Branch, GitHub, GitHubError, GitRemote, Merged, NewCommit, NewPr, OpenPr, PIPELINE_PATH,
+    ParentPr, Poll, PrLink,
     PrDetail, PrFate, RateLimit, RepoPoll, StackLink, WATCH_LABEL,
 };
 use crate::auth::Credentials;
@@ -381,7 +382,135 @@ impl GitHub for Api {
             ],
         })
     }
+
+    async fn open_pr_from(
+        &self,
+        repo: &RepoName,
+        branch: &str,
+    ) -> Result<Option<PrLink>, GitHubError> {
+        let path = format!(
+            "/repos/{repo}/pulls?state=open&per_page=1&head={}:{branch}",
+            repo.owner
+        );
+        let prs: Vec<PullAnswer> = self.rest_json(Method::GET, &path, None).await?;
+        Ok(prs.into_iter().next().map(PrLink::from))
+    }
+
+    async fn create_pr(&self, repo: &RepoName, pr: &NewPr<'_>) -> Result<PrLink, GitHubError> {
+        let body = json!({ "title": pr.title, "head": pr.head, "base": pr.base, "body": pr.body });
+        let path = format!("/repos/{repo}/pulls");
+        let answer: PullAnswer = self.rest_json(Method::POST, &path, Some(body)).await?;
+        Ok(answer.into())
+    }
+
+    async fn set_branch(
+        &self,
+        repo: &RepoName,
+        branch: &str,
+        sha: &str,
+    ) -> Result<(), GitHubError> {
+        let create = json!({ "ref": format!("refs/heads/{branch}"), "sha": sha });
+        match self
+            .rest(
+                Method::POST,
+                &format!("/repos/{repo}/git/refs"),
+                Some(create),
+            )
+            .await
+        {
+            // The branch exists already.
+            Err(GitHubError::Unprocessable(_)) => {
+                let path = format!("/repos/{repo}/git/refs/heads/{branch}");
+                let moved = json!({ "sha": sha, "force": true });
+                self.rest(Method::PATCH, &path, Some(moved)).await
+            }
+            other => other,
+        }
+    }
+
+    async fn commit_files(
+        &self,
+        repo: &RepoName,
+        commit: &NewCommit<'_>,
+    ) -> Result<String, GitHubError> {
+        use base64::Engine as _;
+        let additions: Vec<Value> = commit
+            .files
+            .iter()
+            .map(|(path, text)| {
+                json!({
+                    "path": path,
+                    "contents": base64::engine::general_purpose::STANDARD.encode(text),
+                })
+            })
+            .collect();
+        let input = json!({
+            "branch": { "repositoryNameWithOwner": repo.to_string(), "branchName": commit.branch },
+            "expectedHeadOid": commit.expected_head,
+            "message": { "headline": commit.headline, "body": commit.body },
+            "fileChanges": { "additions": additions },
+        });
+        // A refused commit, such as one on a branch that moved, still
+        // answers with data, holding a null payload next to the error.
+        let answer = self
+            .graphql_answer(COMMIT_ON_BRANCH, json!({ "input": input }))
+            .await?;
+        answer["data"]["createCommitOnBranch"]["commit"]["oid"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| graphql_error(&answer))
+    }
 }
+
+impl Api {
+    /// A REST call whose answer is JSON.
+    async fn rest_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<T, GitHubError> {
+        self.send(|http| {
+            let request = http.request(method.clone(), format!("{API}{path}"));
+            match &body {
+                Some(body) => request.json(body),
+                None => request,
+            }
+        })
+        .await?
+        .json()
+        .await
+        .map_err(|error| GitHubError::Other(format!("unreadable answer from {path}: {error}")))
+    }
+}
+
+/// A PR as REST answers for it.
+#[derive(Deserialize)]
+struct PullAnswer {
+    number: u64,
+    html_url: String,
+    head: PullHead,
+}
+
+#[derive(Deserialize)]
+struct PullHead {
+    sha: String,
+}
+
+impl From<PullAnswer> for PrLink {
+    fn from(pr: PullAnswer) -> Self {
+        PrLink {
+            number: pr.number,
+            url: pr.html_url,
+            head_sha: pr.head.sha,
+        }
+    }
+}
+
+const COMMIT_ON_BRANCH: &str = "
+mutation($input: CreateCommitOnBranchInput!) {
+  createCommitOnBranch(input: $input) { commit { oid } }
+}";
 
 /// Turns an error status into a [`GitHubError`]. A rate limit shows up as
 /// a 403 or 429 with `retry-after` or an empty `x-ratelimit-remaining`.

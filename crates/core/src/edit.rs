@@ -573,3 +573,36 @@ fn string(s: &str) -> String {
         Value::String(s.to_owned()).to_string()
     }
 }
+
+/// The text of `key`'s entry in the top-level mapping, or in `steps:` when
+/// `step` is true, as the file writes it: its whole lines for a block
+/// entry, unindented, or the entry alone in a flow mapping. `None` when the
+/// file has no such entry or doesn't read.
+pub(crate) fn entry_source(text: &str, step: bool, key: &str) -> Option<String> {
+    let file = YamlFile::from_str(text).ok()?;
+    let root = file.documents().next()?.as_mapping()?;
+    let mapping = if step {
+        root.get_mapping("steps")?
+    } else {
+        root
+    };
+    let index = mapping.entries().position(|e| e.key_matches(key))?;
+    let entry = &mapping_entries(&mapping)[index];
+    let start = range(entry).start;
+    if mapping.is_flow_style() {
+        return Some(text[start..flow_content_end(text, entry)].to_owned());
+    }
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let lines = &text[line_start..block_entry_end(text, entry)];
+    let indent = lines
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let unindented: Vec<&str> = lines
+        .lines()
+        .map(|line| line.get(indent..).unwrap_or_else(|| line.trim_start()))
+        .collect();
+    Some(unindented.join("\n"))
+}

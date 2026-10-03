@@ -257,11 +257,31 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX stack_updates_open ON stack_updates (open, id);
 ",
+    // Publishing drafts (ADR 0007): the Pipeline PR a draft was published
+    // as and the conflicts that stopped its last publish, both JSON. Each
+    // commit to `slopwatch/pipeline` gets a row before the call, with the
+    // head it expects and the file it writes, and the SHA GitHub made
+    // after (ADR 0002). `finished` without a SHA is a commit that didn't
+    // happen.
+    "
+    ALTER TABLE pipeline_drafts ADD COLUMN published TEXT;
+    ALTER TABLE pipeline_drafts ADD COLUMN conflicts TEXT NOT NULL DEFAULT '[]';
+    CREATE TABLE pipeline_commits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        expected_head TEXT NOT NULL,
+        text TEXT NOT NULL,
+        sha TEXT,
+        finished INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX pipeline_commits_open ON pipeline_commits (repo, finished);
+",
 ];
 
 mod drafts;
 
-pub use drafts::StoredDraft;
+pub use drafts::{OpenPipelineCommit, StoredDraft};
 
 #[derive(Clone)]
 pub struct Store {

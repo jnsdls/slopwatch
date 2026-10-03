@@ -19,7 +19,8 @@ use slopwatch_protocol::step::{
 };
 
 use super::{
-    Branch, GitHub, GitHubError, GitRemote, Merged, OpenPr, PIPELINE_PATH, ParentPr, Poll,
+    Branch, GitHub, GitHubError, GitRemote, Merged, NewCommit, NewPr, OpenPr, PIPELINE_PATH,
+    ParentPr, Poll, PrLink,
     PrDetail, PrFate, RateLimit, RepoPoll, StackLink, WATCH_LABEL,
 };
 
@@ -56,6 +57,8 @@ struct State {
     retargets: Vec<(u64, String)>,
     /// Branch update calls hang and never return while set.
     hold_updates: bool,
+    /// Every commit made through the API, as `(branch, sha)`, in order.
+    api_commits: Vec<(String, String)>,
 }
 
 /// Where a comment call stops and never returns, the way a daemon killed
@@ -82,6 +85,8 @@ struct Pr {
     author: String,
     title: String,
     base: String,
+    /// The head branch.
+    head: String,
     head_sha: String,
     open: bool,
     labels: BTreeSet<String>,
@@ -123,6 +128,7 @@ impl FakeGitHub {
                 updates: Vec::new(),
                 retargets: Vec::new(),
                 hold_updates: false,
+                api_commits: Vec::new(),
             }),
             origins: tempfile::tempdir().expect("create a directory for the fake's git repos"),
         }
@@ -235,6 +241,7 @@ impl FakeGitHub {
                     author: author.to_owned(),
                     title: title.to_owned(),
                     base: base.to_owned(),
+                    head: head_branch(number),
                     head_sha,
                     open: true,
                     labels: BTreeSet::new(),
@@ -481,6 +488,41 @@ impl FakeGitHub {
     pub fn updates(&self) -> Vec<(u64, UpdateMethod)> {
         self.with(|state| state.updates.clone())
     }
+
+    /// Every commit made through the API so far, as `(branch, sha)`.
+    pub fn api_commits(&self) -> Vec<(String, String)> {
+        self.with(|state| state.api_commits.clone())
+    }
+
+    /// Every PR from `branch`, open or not, by number.
+    pub fn prs_from(&self, repo: &RepoName, branch: &str) -> Vec<u64> {
+        self.with(|state| {
+            let prs = &state.repo(repo).prs;
+            prs.iter()
+                .filter(|(_, pr)| pr.head == branch)
+                .map(|(&number, _)| number)
+                .collect()
+        })
+    }
+
+    pub fn is_open(&self, repo: &RepoName, number: u64) -> bool {
+        self.with(|state| state.pr(repo, number).open)
+    }
+
+    /// The text of `path` at the tip of `branch`, if both exist.
+    pub fn file(&self, repo: &RepoName, branch: &str, path: &str) -> Option<String> {
+        self.with(|state| {
+            let git = &state.repo(repo).git;
+            let sha = tip(git, branch)?;
+            has_file(git, branch, path)
+                .then(|| git_raw(git, &["cat-file", "blob", &format!("{sha}:{path}")]))
+        })
+    }
+
+    /// Whether `branch` exists.
+    pub fn has_branch(&self, repo: &RepoName, branch: &str) -> bool {
+        self.with(|state| tip(&state.repo(repo).git, branch).is_some())
+    }
 }
 
 fn head_branch(number: u64) -> String {
@@ -507,6 +549,19 @@ impl State {
             .prs
             .get_mut(&number)
             .unwrap_or_else(|| panic!("the fake has no PR {repo}#{number}"))
+    }
+
+    /// Moves the open PRs from `branch` to its new tip `sha`, as GitHub
+    /// does on a push. The new head has no checks yet.
+    fn follow_branch(&mut self, repo: &RepoName, branch: &str, sha: &str) {
+        let fake = self.repo(repo);
+        for (&number, pr) in &mut fake.prs {
+            if pr.open && pr.head == branch && pr.head_sha != sha {
+                pull_ref(&fake.git, number, sha);
+                pr.head_sha = sha.to_owned();
+                pr.checks = Checks::default();
+            }
+        }
     }
 
     /// Puts the PR's head tree on its base and closes the PR as merged:
@@ -556,6 +611,7 @@ impl State {
         let git = self.repo(repo).git.clone();
         let pr = self.pr(repo, number);
         let head = pr.head_sha.clone();
+        let head_ref = format!("refs/heads/{}", pr.head);
         let base = tip(&git, &pr.base.clone()).expect("the base exists");
         let tree = run_git(&git, &["merge-tree", "--write-tree", &head, &base]);
         let sha = run_git(
@@ -571,14 +627,7 @@ impl State {
                 "Update branch",
             ],
         );
-        run_git(
-            &git,
-            &[
-                "update-ref",
-                &format!("refs/heads/{}", head_branch(number)),
-                &sha,
-            ],
-        );
+        run_git(&git, &["update-ref", &head_ref, &sha]);
         pull_ref(&git, number, &sha);
         let pr = self.pr(repo, number);
         pr.head_sha = sha;
@@ -701,6 +750,14 @@ fn has_file(git: &Path, branch: &str, path: &str) -> bool {
 
 fn run_git(git: &Path, args: &[&str]) -> String {
     git_with(git, args, &[], None)
+}
+
+/// Runs git in `git` and returns its stdout untrimmed, such as a file's
+/// text.
+fn git_raw(git: &Path, args: &[&str]) -> String {
+    let output = git_command(git, &[]).args(args).output().unwrap();
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8(output.stdout).unwrap()
 }
 
 /// Runs git in `git` and returns its trimmed stdout, panicking on failure.
@@ -1073,4 +1130,127 @@ impl GitHub for FakeGitHub {
             })
         })
     }
+
+    async fn open_pr_from(
+        &self,
+        repo: &RepoName,
+        branch: &str,
+    ) -> Result<Option<PrLink>, GitHubError> {
+        self.with(|state| {
+            let fake = state
+                .repos
+                .get(repo)
+                .ok_or_else(|| GitHubError::NotFound(repo.to_string()))?;
+            Ok(fake
+                .prs
+                .iter()
+                .find(|(_, pr)| pr.open && pr.head == branch)
+                .map(|(&number, pr)| link(repo, number, pr)))
+        })
+    }
+
+    /// Like GitHub, refuses a PR whose head has nothing the base lacks.
+    async fn create_pr(&self, repo: &RepoName, new: &NewPr<'_>) -> Result<PrLink, GitHubError> {
+        self.with(|state| {
+            let viewer = state.viewer.clone();
+            let fake = state
+                .repos
+                .get_mut(repo)
+                .ok_or_else(|| GitHubError::NotFound(repo.to_string()))?;
+            let invalid = |message: &str| GitHubError::Unprocessable(message.to_owned());
+            let head_sha = tip(&fake.git, new.head).ok_or_else(|| invalid("head is invalid"))?;
+            let base_sha = tip(&fake.git, new.base).ok_or_else(|| invalid("base is invalid"))?;
+            if is_ancestor(&fake.git, &head_sha, &base_sha) {
+                return Err(invalid(&format!(
+                    "No commits between {} and {}",
+                    new.base, new.head
+                )));
+            }
+            let number = fake.prs.keys().max().map_or(1, |n| n + 1);
+            pull_ref(&fake.git, number, &head_sha);
+            let pr = Pr {
+                author: viewer,
+                title: new.title.to_owned(),
+                base: new.base.to_owned(),
+                head: new.head.to_owned(),
+                head_sha,
+                open: true,
+                labels: BTreeSet::new(),
+                checks: Checks::default(),
+                comments: Vec::new(),
+                draft: false,
+                merged: false,
+                in_merge_queue: false,
+                conflicts: false,
+                blocked: false,
+                linked_issues: Vec::new(),
+                native: false,
+                kept_commits: false,
+            };
+            let link = link(repo, number, &pr);
+            fake.prs.insert(number, pr);
+            Ok(link)
+        })
+    }
+
+    async fn set_branch(
+        &self,
+        repo: &RepoName,
+        branch: &str,
+        sha: &str,
+    ) -> Result<(), GitHubError> {
+        self.with(|state| {
+            let git = state.repo(repo).git.clone();
+            run_git(&git, &["update-ref", &format!("refs/heads/{branch}"), sha]);
+            state.follow_branch(repo, branch, sha);
+            Ok(())
+        })
+    }
+
+    /// Like `createCommitOnBranch`, refuses a branch that isn't at the
+    /// expected head.
+    async fn commit_files(
+        &self,
+        repo: &RepoName,
+        commit: &NewCommit<'_>,
+    ) -> Result<String, GitHubError> {
+        self.with(|state| {
+            let git = state.repo(repo).git.clone();
+            let head = tip(&git, commit.branch);
+            if head.as_deref() != Some(commit.expected_head) {
+                return Err(GitHubError::Other(format!(
+                    "Expected branch to point to \"{}\" but it did not",
+                    commit.expected_head
+                )));
+            }
+            let files: Vec<(&str, Option<&str>)> = commit
+                .files
+                .iter()
+                .map(|(path, text)| (*path, Some(*text)))
+                .collect();
+            let sha = state.commit(&git, commit.branch, None, &files);
+            state.follow_branch(repo, commit.branch, &sha);
+            state
+                .api_commits
+                .push((commit.branch.to_owned(), sha.clone()));
+            Ok(sha)
+        })
+    }
+}
+
+fn link(repo: &RepoName, number: u64, pr: &Pr) -> PrLink {
+    PrLink {
+        number,
+        url: format!("https://github.com/{repo}/pull/{number}"),
+        head_sha: pr.head_sha.clone(),
+    }
+}
+
+/// Whether `ancestor` is in `of`'s history.
+fn is_ancestor(git: &Path, ancestor: &str, of: &str) -> bool {
+    git_command(git, &[])
+        .args(["merge-base", "--is-ancestor", ancestor, of])
+        .status()
+        .unwrap()
+        .success()
 }

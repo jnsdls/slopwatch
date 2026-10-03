@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
-use crate::drafts::{DraftError, Drafts};
+use crate::drafts::{DraftError, Drafts, Landed};
 use crate::inbox::InboxSubscription;
 use crate::notifications::NotificationsSubscription;
 use crate::runs::{Journalled, Live, LiveLog, LogError, RunError, Runs, SubscribeError};
@@ -535,6 +535,35 @@ impl Daemon {
                         .and_then(|drafts| drafts.tidy(&repo))
                         .map(|()| Reply::Done),
                 );
+            }
+            Command::PublishPipeline { repo, edits_seen } => {
+                return respond(match self.drafts_or_refuse() {
+                    Ok(drafts) => drafts
+                        .publish(&repo, edits_seen)
+                        .await
+                        .map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
+            Command::MergePipeline { repo } => {
+                let merged = match self.drafts_or_refuse() {
+                    Ok(drafts) => drafts.merge(&repo).await,
+                    Err(error) => Err(error),
+                };
+                if matches!(merged, Ok(Landed::Merged)) {
+                    // The base moved, so Watched PRs on it get same-SHA
+                    // Runs under the new Pipeline without waiting a poll.
+                    if let Err(error) = self.poll().await {
+                        eprintln!("slopwatchd: poll after merging a Pipeline failed: {error:?}");
+                    }
+                }
+                return respond(merged.map(|_| Reply::Done));
+            }
+            Command::DiscardPipelineDraft { repo } => {
+                return respond(match self.drafts_or_refuse() {
+                    Ok(drafts) => drafts.discard(&repo).await.map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
             }
             Command::DismissEntry { entry } => {
                 return respond(match self.runs_or_refuse() {

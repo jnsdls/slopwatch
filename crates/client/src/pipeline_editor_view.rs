@@ -845,8 +845,78 @@ impl PipelineEditorView {
             for problem in &draft.problems {
                 footer = footer.child(div().text_color(theme.warning).child(problem.clone()));
             }
+            if !draft.conflicts.is_empty() {
+                footer = footer.child(self.conflicts(draft, cx));
+            }
         }
         footer
+    }
+
+    /// The nodes that stopped the last publish, each as the draft and the
+    /// branch write it, and the way out: starting over from the branch.
+    fn conflicts(&self, draft: &PipelineDraft, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let branch = &draft.base.branch;
+        let version = |title: String, text: Option<&String>| {
+            let lines = match text {
+                Some(text) => text
+                    .lines()
+                    .map(|line| div().child(line.to_owned()))
+                    .collect(),
+                None => vec![div().text_color(theme.muted_foreground).child("(removed)")],
+            };
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_color(theme.muted_foreground).child(title))
+                .child(
+                    div()
+                        .p_2()
+                        .rounded_md()
+                        .bg(theme.muted)
+                        .font_family("Menlo")
+                        .children(lines),
+                )
+        };
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.danger);
+        for conflict in &draft.conflicts {
+            panel = panel
+                .child(
+                    div()
+                        .text_color(theme.danger)
+                        .child(format!("{} changed on {branch} too", conflict.node)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(version("This draft".into(), conflict.draft.as_ref()))
+                        .child(version(format!("{branch} now"), conflict.branch.as_ref())),
+                );
+        }
+        panel.child(
+            div().child(
+                Button::new("discard-draft")
+                    .label(format!("Start over from {branch}"))
+                    .small()
+                    .outline()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        let commands = this.editor.discard();
+                        this.send(commands);
+                        cx.notify();
+                    })),
+            ),
+        )
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -863,6 +933,11 @@ impl PipelineEditorView {
                 format!("{edits} · from {}@{sha}", draft.base.branch)
             }
         };
+        let published = self
+            .editor
+            .draft()
+            .and_then(|draft| draft.published.clone());
+        let busy = self.editor.busy();
         div()
             .flex()
             .items_center()
@@ -874,6 +949,14 @@ impl PipelineEditorView {
                     .text_color(theme.muted_foreground)
                     .child(status),
             )
+            .when_some(busy, |toolbar, busy| {
+                toolbar.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(busy),
+                )
+            })
             .child(
                 Button::new("tidy")
                     .label("Tidy")
@@ -882,6 +965,41 @@ impl PipelineEditorView {
                     .disabled(!self.editor.arranged())
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         let commands = this.editor.tidy();
+                        this.send(commands);
+                        cx.notify();
+                    })),
+            )
+            .when_some(published, |toolbar, pr| {
+                let url = pr.url.clone();
+                toolbar
+                    .child(
+                        Button::new("pipeline-pr")
+                            .label(format!("PR #{}", pr.number))
+                            .small()
+                            .ghost()
+                            .on_click(move |_: &ClickEvent, _, cx| cx.open_url(&url)),
+                    )
+                    .child(
+                        Button::new("merge-pipeline")
+                            .label("Merge it now")
+                            .small()
+                            .outline()
+                            .disabled(busy.is_some())
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                let commands = this.editor.merge_now();
+                                this.send(commands);
+                                cx.notify();
+                            })),
+                    )
+            })
+            .child(
+                Button::new("publish-pipeline")
+                    .label("Publish")
+                    .small()
+                    .primary()
+                    .disabled(!self.editor.can_publish())
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        let commands = this.editor.publish();
                         this.send(commands);
                         cx.notify();
                     })),

@@ -91,6 +91,10 @@ pub const DIALECT: u32 = 1;
 /// `plugins`: the `list_plugins`, `approve_plugin` and
 /// `set_plugin_settings` commands, and the `unapproved_plugin` Inbox
 /// cause (ADR 0012).
+///
+/// `pipeline_publish`: the `publish_pipeline`, `merge_pipeline` and
+/// `discard_pipeline_draft` commands, and `published` and `conflicts` on a
+/// draft.
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -106,6 +110,7 @@ pub const FEATURES: &[&str] = &[
     "pipeline_editor",
     "plugins",
     "stacks",
+    "pipeline_publish",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

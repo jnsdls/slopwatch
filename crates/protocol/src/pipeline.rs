@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use slopwatch_core::Edit;
+use slopwatch_core::{Conflict, Edit};
 
 use crate::{GateTerm, RepoName, StepInfo};
 
@@ -34,6 +34,14 @@ pub struct PipelineDraft {
     /// What the editor can add: the developer's Library Steps and the
     /// installed Plugins.
     pub palette: Vec<PaletteItem>,
+    /// The Pipeline PR the draft was last published as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<PipelinePr>,
+    /// The nodes that stopped the last publish: changed on the branch since
+    /// the draft started, and edited in the draft too. Empty once a publish
+    /// goes through or the draft starts over.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts: Vec<Conflict>,
 }
 
 impl PipelineDraft {
@@ -67,6 +75,16 @@ pub struct DraftStep {
     /// The Step is a Merge Step, so it belongs after the Gate.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub merge: bool,
+}
+
+/// A PR from the `slopwatch/pipeline` branch, which publishing opens and
+/// then updates (ADR 0007).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelinePr {
+    pub number: u64,
+    pub url: String,
+    /// The branch's head after the last publish.
+    pub head: String,
 }
 
 /// A node's place on the canvas, in canvas pixels from its top left.
@@ -163,6 +181,70 @@ mod tests {
             })
             .unwrap(),
             json!({ "name": "tidy_pipeline", "repo": "o/r" })
+        );
+    }
+
+    #[test]
+    fn publishing_commands_name_the_repo() {
+        let repo = || RepoName::new("o", "r");
+        let wire = |command: Command| serde_json::to_value(command).unwrap();
+
+        assert_eq!(
+            wire(Command::PublishPipeline {
+                repo: repo(),
+                edits_seen: 2
+            }),
+            json!({ "name": "publish_pipeline", "repo": "o/r", "edits_seen": 2 })
+        );
+        assert_eq!(
+            wire(Command::MergePipeline { repo: repo() }),
+            json!({ "name": "merge_pipeline", "repo": "o/r" })
+        );
+        assert_eq!(
+            wire(Command::DiscardPipelineDraft { repo: repo() }),
+            json!({ "name": "discard_pipeline_draft", "repo": "o/r" })
+        );
+    }
+
+    #[test]
+    fn a_draft_from_before_publishing_reads_as_unpublished() {
+        let draft = json!({
+            "repo": "o/r",
+            "base": { "branch": "main", "commit": "c1" },
+            "text": "version: 1\n",
+            "edits": [],
+            "steps": [],
+            "gate_terms": [],
+            "problems": [],
+            "positions": {},
+            "palette": [],
+        });
+
+        let draft: PipelineDraft = serde_json::from_value(draft.clone()).unwrap();
+
+        assert_eq!(draft.published, None);
+        assert!(draft.conflicts.is_empty());
+        let published = PipelineDraft {
+            published: Some(PipelinePr {
+                number: 4,
+                url: "https://github.com/o/r/pull/4".into(),
+                head: "abc".into(),
+            }),
+            conflicts: vec![Conflict {
+                node: slopwatch_core::Node::Gate,
+                draft: Some("gate: [ci]".into()),
+                branch: None,
+            }],
+            ..draft
+        };
+        let wire = serde_json::to_value(&published).unwrap();
+        assert_eq!(
+            wire["published"],
+            json!({ "number": 4, "url": "https://github.com/o/r/pull/4", "head": "abc" })
+        );
+        assert_eq!(
+            wire["conflicts"],
+            json!([{ "node": "gate", "draft": "gate: [ci]", "branch": null }])
         );
     }
 }
