@@ -9,12 +9,12 @@
 //! Within a Run, core's [`Pipeline::plan`] decides what happens next, and
 //! the engine carries it out: it spawns each Step that may start as its own
 //! process (ADR 0003), marks skips, and ends the Run once every Step has
-//! settled. Every change goes to the Run's event journal first, and the
-//! `run/<id>` topic replays from it. The store keeps each Step's state, so
-//! a restarted daemon picks its Runs back up (ADR 0009).
+//! settled. Every change goes to the store and to the Run's event journal,
+//! and the `run/<id>` topic replays from the journal. The store keeps each
+//! Step's state, so a restarted daemon picks its Runs back up (ADR 0009).
 //!
 //! One lock serializes the engine: a sync and the reports from Step
-//! processes take turns.
+//! processes take turns. Reading a Pipeline from git happens outside it.
 
 mod journal;
 pub mod process;
@@ -30,10 +30,10 @@ use slopwatch_protocol::step::{FromStep, Outcome, Outputs, PrSnapshot, Start, To
 use slopwatch_protocol::{RepoName, RunEvent, RunId, StepInfo};
 use tokio::sync::mpsc;
 
-use crate::clones::Clones;
+use crate::clones::{Clones, PipelineAt};
 use crate::github::{GitHub, OpenPr};
 use crate::plugins::Plugins;
-use crate::store::{NewRun, StepRow, StepRowState, Store, StoreError};
+use crate::store::{NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
 use crate::watching::{RunInfo, Watching};
 
 use journal::Journal;
@@ -48,6 +48,8 @@ type PrKey = (RepoName, u64);
 pub struct Runs {
     engine: tokio::sync::Mutex<Engine>,
     journal: Arc<Journal>,
+    github: Arc<dyn GitHub>,
+    clones: Clones,
     live: AtomicBool,
 }
 
@@ -77,12 +79,11 @@ impl Runs {
     ) -> Result<Arc<Self>, StoreError> {
         let journal = Arc::new(Journal::new(store.clone()));
         let (reports, mut received) = mpsc::unbounded_channel();
+        let clones = Clones::new(config.data_dir.join("repos"));
         let mut engine = Engine {
-            clones: Clones::new(config.data_dir.join("repos")),
             data_dir: config.data_dir,
             plugins: config.plugins,
             store,
-            github,
             journal: Arc::clone(&journal),
             watching: Arc::clone(&watching),
             reports,
@@ -101,6 +102,8 @@ impl Runs {
             live: AtomicBool::new(!engine.active.is_empty()),
             engine: tokio::sync::Mutex::new(engine),
             journal,
+            github,
+            clones,
         });
         let driver = Arc::clone(&runs);
         tokio::spawn(async move {
@@ -117,11 +120,31 @@ impl Runs {
 
     /// Brings Runs in line with the PRs as the last poll saw them.
     pub async fn sync(&self) {
-        let mut engine = self.engine.lock().await;
-        let prs = engine.watching.prs();
-        engine.sync(prs).await;
+        let starts = {
+            let mut engine = self.engine.lock().await;
+            let prs = engine.watching.prs();
+            engine.sync(prs)
+        };
+        for (repo, pr) in starts {
+            let read = self.read_pipeline(&repo, &pr.base).await;
+            self.engine.lock().await.start_run(&repo, &pr, read);
+        }
+        let engine = self.engine.lock().await;
         self.live
             .store(!engine.active.is_empty(), Ordering::Relaxed);
+    }
+
+    /// The Pipeline at the tip of `base`, fetched into the repo's clone.
+    async fn read_pipeline(&self, repo: &RepoName, base: &str) -> Result<PipelineAt, String> {
+        let remote = self
+            .github
+            .git_remote(repo)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.clones
+            .pipeline_at(repo, &remote, base)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Kills every running Step's process group at once, for a daemon
@@ -168,8 +191,6 @@ impl Runs {
 
 struct Engine {
     store: Store,
-    github: Arc<dyn GitHub>,
-    clones: Clones,
     plugins: Plugins,
     journal: Arc<Journal>,
     watching: Arc<Watching>,
@@ -179,12 +200,18 @@ struct Engine {
     active: BTreeMap<PrKey, Active>,
     /// PRs that were watched at the last sync.
     watched: HashSet<PrKey>,
-    /// Why a PR's next Run can't start. With a base SHA, the Pipeline at
-    /// that commit is invalid, so nothing is tried again until the base
-    /// moves. Without one, the next sync tries again.
-    blocked: HashMap<PrKey, (Option<String>, String)>,
+    /// Why a PR's next Run can't start.
+    blocked: HashMap<PrKey, Blocked>,
     /// The daemon is about to exit: nothing more changes.
     stopped: bool,
+}
+
+struct Blocked {
+    /// The base commit whose Pipeline is invalid, so nothing is tried
+    /// again until the base moves. `None` when the read itself failed,
+    /// and the next sync tries again.
+    invalid_at: Option<String>,
+    message: String,
 }
 
 /// A Run that hasn't ended.
@@ -269,7 +296,10 @@ impl Engine {
                             .outcomes
                             .insert(row.step, Outcome { verdict, outputs });
                     }
-                    StepRowState::Running { .. } => {
+                    StepRowState::Running { pgid, started_us } => {
+                        process::kill_leftover(pgid, started_us);
+                        let _ =
+                            std::fs::remove_dir_all(step_dir(&self.data_dir, active.id, &row.step));
                         self.store.put_step(
                             active.id,
                             &StepRow {
@@ -292,16 +322,22 @@ impl Engine {
         Ok(())
     }
 
-    async fn sync(&mut self, prs: Vec<(RepoName, OpenPr)>) {
+    /// Ends the Runs the poll says are over, passes PR updates to running
+    /// Steps, and returns the PRs that need a new Run.
+    fn sync(&mut self, prs: Vec<(RepoName, OpenPr)>) -> Vec<(RepoName, OpenPr)> {
         if self.stopped {
-            return;
+            return Vec::new();
         }
-        if let Err(error) = self.try_sync(prs).await {
+        self.try_sync(prs).unwrap_or_else(|error| {
             eprintln!("slopwatchd: can't update Runs: {error}");
-        }
+            Vec::new()
+        })
     }
 
-    async fn try_sync(&mut self, prs: Vec<(RepoName, OpenPr)>) -> Result<(), StoreError> {
+    fn try_sync(
+        &mut self,
+        prs: Vec<(RepoName, OpenPr)>,
+    ) -> Result<Vec<(RepoName, OpenPr)>, StoreError> {
         let open: BTreeMap<PrKey, (RepoName, OpenPr)> = prs
             .into_iter()
             .map(|(repo, pr)| ((repo.clone(), pr.number), (repo, pr)))
@@ -346,6 +382,7 @@ impl Engine {
             }
         }
 
+        let mut starts = Vec::new();
         for (key, (repo, pr)) in &open {
             if !pr.labeled {
                 self.blocked.remove(key);
@@ -357,12 +394,13 @@ impl Engine {
             let newly_watched = !self.watched.contains(key);
             let latest = self.store.run_summaries(repo, pr.number, 1)?;
             let new_head = latest.first().is_none_or(|run| run.head_sha != pr.head_sha);
-            let still_invalid = matches!(
-                self.blocked.get(key),
-                Some((Some(sha), _)) if *sha == pr.detail.base_sha
-            );
+            let still_invalid = self
+                .blocked
+                .get(key)
+                .and_then(|blocked| blocked.invalid_at.as_ref())
+                .is_some_and(|sha| *sha == pr.detail.base_sha);
             if (newly_watched || new_head) && !still_invalid {
-                self.start_run(repo, pr).await?;
+                starts.push((repo.clone(), pr.clone()));
             }
         }
         self.watched = open
@@ -370,23 +408,36 @@ impl Engine {
             .filter(|(_, (_, pr))| pr.labeled)
             .map(|(key, _)| key)
             .collect();
-        Ok(())
+        Ok(starts)
     }
 
     /// Starts a Run on the PR's head, with the Pipeline from its root
     /// base. A Stack's root base comes with Stacks; until then it's the
     /// PR's own base.
-    async fn start_run(&mut self, repo: &RepoName, pr: &OpenPr) -> Result<(), StoreError> {
+    fn start_run(&mut self, repo: &RepoName, pr: &OpenPr, read: Result<PipelineAt, String>) {
+        if self.stopped {
+            return;
+        }
+        if let Err(error) = self.try_start_run(repo, pr, read) {
+            eprintln!(
+                "slopwatchd: can't start a Run on {repo}#{}: {error}",
+                pr.number
+            );
+        }
+    }
+
+    fn try_start_run(
+        &mut self,
+        repo: &RepoName,
+        pr: &OpenPr,
+        read: Result<PipelineAt, String>,
+    ) -> Result<(), StoreError> {
         let key = (repo.clone(), pr.number);
+        // Another sync started one while this one read the Pipeline.
+        if self.active.contains_key(&key) {
+            return Ok(());
+        }
         let base = &pr.base;
-        let read = match self.github.git_remote(repo).await {
-            Ok(remote) => self
-                .clones
-                .pipeline_at(repo, &remote, base)
-                .await
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error.to_string()),
-        };
         let read = match read {
             Ok(read) => read,
             Err(error) => {
@@ -419,7 +470,11 @@ impl Engine {
                 pipeline: &text,
                 steps: steps
                     .iter()
-                    .map(|step| (step.id.clone(), step.plugin.clone(), step.config_hash()))
+                    .map(|step| NewStep {
+                        id: step.id.clone(),
+                        plugin: step.plugin.clone(),
+                        config_hash: step.config_hash(),
+                    })
                     .collect(),
             },
             now(),
@@ -473,8 +528,14 @@ impl Engine {
         base_sha: Option<String>,
         message: String,
     ) -> Result<(), StoreError> {
-        let changed = self.blocked.get(key).map(|(_, old)| old) != Some(&message);
-        self.blocked.insert(key.clone(), (base_sha, message));
+        let changed = self.blocked.get(key).map(|old| &old.message) != Some(&message);
+        self.blocked.insert(
+            key.clone(),
+            Blocked {
+                invalid_at: base_sha,
+                message,
+            },
+        );
         if changed {
             self.publish(&key.0, key.1)?;
         }
@@ -551,11 +612,7 @@ impl Engine {
             );
         };
 
-        let dir = self
-            .data_dir
-            .join("worktrees")
-            .join(run.id.to_string())
-            .join(step_id);
+        let dir = step_dir(&self.data_dir, run.id, step_id);
         let log = self
             .data_dir
             .join("logs")
@@ -724,9 +781,6 @@ impl Engine {
         let step = report.step;
         match report.report {
             Report::Message(FromStep::Outcome(outcome)) if !reported => {
-                // The Step exits after its Outcome. One that lingers gets
-                // the cancel path's signals.
-                running.handle.cancel();
                 if matches!(
                     outcome.verdict,
                     Verdict::Pass | Verdict::Fail | Verdict::Inconclusive
@@ -762,12 +816,7 @@ impl Engine {
             Report::Exited(code) => {
                 let run = self.active.get_mut(&key).expect("found above");
                 run.running.remove(&step);
-                let _ = std::fs::remove_dir_all(
-                    self.data_dir
-                        .join("worktrees")
-                        .join(run.id.to_string())
-                        .join(&step),
-                );
+                let _ = std::fs::remove_dir_all(step_dir(&self.data_dir, run.id, &step));
                 if !reported {
                     let reason = match code {
                         Some(code) => {
@@ -834,7 +883,7 @@ impl Engine {
         self.journal.append(run.id, RunEvent::Ended { reason })?;
         // A cancelled Step's process may take a moment to go, and its
         // directory with it; the Run's own directory goes now.
-        let _ = std::fs::remove_dir_all(self.data_dir.join("worktrees").join(run.id.to_string()));
+        let _ = std::fs::remove_dir_all(run_dir(&self.data_dir, run.id));
         self.publish(&run.repo, run.number)
     }
 
@@ -845,11 +894,21 @@ impl Engine {
             blocked: self
                 .blocked
                 .get(&(repo.clone(), number))
-                .map(|(_, message)| message.clone()),
+                .map(|blocked| blocked.message.clone()),
         };
         self.watching.set_run_info(repo, number, info);
         Ok(())
     }
+}
+
+/// Where a Run's Steps get their working directories.
+fn run_dir(data_dir: &std::path::Path, run: RunId) -> PathBuf {
+    data_dir.join("worktrees").join(run.to_string())
+}
+
+/// A Step's working directory, deleted once the Step ends.
+fn step_dir(data_dir: &std::path::Path, run: RunId, step: &str) -> PathBuf {
+    run_dir(data_dir, run).join(step)
 }
 
 /// Every Step upstream of `step`, nearest first.

@@ -86,6 +86,10 @@ impl Daemon {
                                 Topic::WatchedPrs => subs.watched_prs = None,
                                 Topic::Run(run) => {
                                     subs.runs.remove(&run);
+                                    if subs.runs.is_empty() {
+                                        // Nothing left to filter for.
+                                        subs.live = None;
+                                    }
                                 }
                             }
                             ResponseBody::Ok(Reply::Done)
@@ -186,13 +190,20 @@ impl Daemon {
                 let subscribed: Vec<(RunId, u64)> =
                     subs.runs.iter().map(|(&run, &last)| (run, last)).collect();
                 for (run, last) in subscribed {
-                    if let Ok((events, live)) = runs.subscribe(run, last) {
-                        subs.live.get_or_insert(live);
-                        frames.extend(
-                            events
-                                .into_iter()
-                                .filter_map(|(seq, event)| run_frame(subs, run, seq, event)),
-                        );
+                    match runs.subscribe(run, last) {
+                        Ok((events, live)) => {
+                            subs.live.get_or_insert(live);
+                            frames.extend(
+                                events
+                                    .into_iter()
+                                    .filter_map(|(seq, event)| run_frame(subs, run, seq, event)),
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "slopwatchd: can't catch a client up on Run {run}: {error:?}"
+                            );
+                        }
                     }
                 }
                 frames

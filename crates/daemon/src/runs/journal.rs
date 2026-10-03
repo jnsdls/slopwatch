@@ -61,7 +61,13 @@ impl Journal {
             .store
             .events_after(run, after)?
             .into_iter()
-            .filter_map(|(seq, text)| Some((seq, serde_json::from_str(&text).ok()?)))
+            .filter_map(|(seq, text)| match serde_json::from_str(&text) {
+                Ok(event) => Some((seq, event)),
+                Err(error) => {
+                    eprintln!("slopwatchd: Run {run} event {seq} doesn't read back: {error}");
+                    None
+                }
+            })
             .collect())
     }
 }

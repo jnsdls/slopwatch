@@ -10,17 +10,21 @@ use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use slopwatch_protocol::step::{FromStep, ToStep};
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 use tokio::time::Sleep;
 
 /// After `cancel`, how long a Step gets before SIGTERM, then before SIGKILL.
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
 const TERM_GRACE: Duration = Duration::from_secs(5);
+/// How long the rest of stdout gets once the process has exited.
+const DRAIN: Duration = Duration::from_secs(2);
 
 /// Everything needed to start one Step process.
 pub struct Spawn {
@@ -45,7 +49,7 @@ pub enum Report {
 }
 
 #[derive(Debug)]
-pub enum Control {
+enum Control {
     Send(Box<ToStep>),
     Cancel,
 }
@@ -53,6 +57,9 @@ pub enum Control {
 /// The engine's handle on a running Step. Dropping it cancels the Step.
 pub struct StepHandle {
     control: mpsc::UnboundedSender<Control>,
+    /// Set once the process has exited and been reaped, after which its
+    /// pid, and so its group id, may belong to someone else.
+    exited: Arc<AtomicBool>,
     pub pgid: i32,
     /// When the kernel says the process started, in microseconds since the
     /// Unix epoch.
@@ -71,7 +78,9 @@ impl StepHandle {
 
     /// SIGKILLs the Step's group now, with no cancel first.
     pub fn kill(&self) {
-        signal_group(self.pgid, libc::SIGKILL);
+        if !self.exited.load(Ordering::Acquire) {
+            signal_group(self.pgid, libc::SIGKILL);
+        }
     }
 }
 
@@ -99,124 +108,121 @@ pub fn spawn(spawn: Spawn, report: impl Fn(Report) + Send + 'static) -> io::Resu
         .spawn()?;
     let pid = child.id().expect("a just-spawned child has a pid") as i32;
     let started_us = process_start_us(pid);
+    let stdin = child.stdin.take().expect("stdin is piped");
+    let stdout = child.stdout.take().expect("stdout is piped");
     let (control, controls) = mpsc::unbounded_channel();
-    tokio::spawn(session(
-        child_parts(&mut child),
+    let exited = Arc::new(AtomicBool::new(false));
+    let session = Session {
         child,
-        pid,
-        spawn.start,
-        controls,
-        log,
+        pgid: pid,
+        exited: Arc::clone(&exited),
+        to_step: writer(stdin),
+        log: tokio::fs::File::from_std(log),
         report,
-    ));
+    };
+    let _ = session.to_step.send(spawn.start);
+    tokio::spawn(session.run(stdout, controls));
     Ok(StepHandle {
         control,
+        exited,
         pgid: pid,
         started_us,
     })
 }
 
-struct Parts {
-    stdin: ChildStdin,
-    stdout: tokio::process::ChildStdout,
-}
-
-fn child_parts(child: &mut Child) -> Parts {
-    Parts {
-        stdin: child.stdin.take().expect("stdin is piped"),
-        stdout: child.stdout.take().expect("stdout is piped"),
-    }
-}
-
-async fn session(
-    parts: Parts,
-    mut child: Child,
-    pgid: i32,
-    start: ToStep,
-    mut controls: mpsc::UnboundedReceiver<Control>,
-    log: std::fs::File,
-    report: impl Fn(Report),
-) {
-    let mut log = tokio::fs::File::from_std(log);
-    let mut stdin = Some(parts.stdin);
-    let mut lines = BufReader::new(parts.stdout).lines();
-    let mut stdout_open = true;
-    let mut controls_open = true;
-    // The next signal to send to the group, and when.
-    let mut kill: Option<(libc::c_int, Pin<Box<Sleep>>)> = None;
-
-    write_message(&mut stdin, &start).await;
-    loop {
-        tokio::select! {
-            line = lines.next_line(), if stdout_open => match line {
-                Ok(Some(line)) => match serde_json::from_str::<FromStep>(&line) {
-                    Ok(FromStep::Log { message }) => {
-                        let _ = log.write_all(format!("{message}\n").as_bytes()).await;
-                    }
-                    Ok(message) => report(Report::Message(message)),
-                    Err(error) => report(Report::ProtocolError(format!(
-                        "wrote a line that isn't a protocol message ({error}): {}",
-                        truncate(&line)
-                    ))),
-                },
-                Ok(None) | Err(_) => stdout_open = false,
-            },
-            control = controls.recv(), if controls_open => match control {
-                Some(Control::Send(message)) => write_message(&mut stdin, &message).await,
-                Some(Control::Cancel) | None => {
-                    controls_open = control.is_some();
-                    if kill.is_none() {
-                        write_message(&mut stdin, &ToStep::Cancel).await;
-                        kill = Some((libc::SIGTERM, Box::pin(tokio::time::sleep(CANCEL_GRACE))));
-                    }
-                }
-            },
-            () = async { kill.as_mut().expect("guarded").1.as_mut().await }, if kill.is_some() => {
-                let (signal, _) = kill.take().expect("guarded");
-                signal_group(pgid, signal);
-                if signal == libc::SIGTERM {
-                    kill = Some((libc::SIGKILL, Box::pin(tokio::time::sleep(TERM_GRACE))));
-                }
-            },
-            status = child.wait() => {
-                // Read what's left on stdout: an outcome may still be there.
-                while stdout_open {
-                    match lines.next_line().await {
-                        Ok(Some(line)) => match serde_json::from_str::<FromStep>(&line) {
-                            Ok(FromStep::Log { message }) => {
-                                let _ = log.write_all(format!("{message}\n").as_bytes()).await;
-                            }
-                            Ok(message) => report(Report::Message(message)),
-                            Err(error) => report(Report::ProtocolError(format!(
-                                "wrote a line that isn't a protocol message ({error}): {}",
-                                truncate(&line)
-                            ))),
-                        },
-                        _ => stdout_open = false,
-                    }
-                }
-                // Whatever the Step started in its group goes with it.
-                signal_group(pgid, libc::SIGKILL);
-                report(Report::Exited(status.ok().and_then(|status| status.code())));
+/// Writes messages to the Step's stdin on a task of its own, so a Step
+/// that stops reading can't stall its session.
+fn writer(mut stdin: ChildStdin) -> mpsc::UnboundedSender<ToStep> {
+    let (sender, mut messages) = mpsc::unbounded_channel::<ToStep>();
+    tokio::spawn(async move {
+        while let Some(message) = messages.recv().await {
+            let mut line = serde_json::to_string(&message).expect("Step messages always serialize");
+            line.push('\n');
+            if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+                // The Step closed its stdin or exited. Its exit reports
+                // the rest.
                 return;
             }
         }
-    }
+    });
+    sender
 }
 
-async fn write_message(stdin: &mut Option<ChildStdin>, message: &ToStep) {
-    let Some(pipe) = stdin else { return };
-    let mut line = serde_json::to_string(message).expect("Step messages always serialize");
-    line.push('\n');
-    if write_line(pipe, &line).await.is_err() {
-        // The Step closed its stdin or exited. Its exit reports the rest.
-        *stdin = None;
-    }
+struct Session<R> {
+    child: Child,
+    pgid: i32,
+    exited: Arc<AtomicBool>,
+    to_step: mpsc::UnboundedSender<ToStep>,
+    log: tokio::fs::File,
+    report: R,
 }
 
-async fn write_line(pipe: &mut (impl AsyncWrite + Unpin), line: &str) -> io::Result<()> {
-    pipe.write_all(line.as_bytes()).await?;
-    pipe.flush().await
+impl<R: Fn(Report)> Session<R> {
+    async fn run(mut self, stdout: ChildStdout, mut controls: mpsc::UnboundedReceiver<Control>) {
+        let mut lines = BufReader::new(stdout).lines();
+        let mut stdout_open = true;
+        let mut controls_open = true;
+        // The next signal to send to the group, and when.
+        let mut kill: Option<(libc::c_int, Pin<Box<Sleep>>)> = None;
+        loop {
+            tokio::select! {
+                line = lines.next_line(), if stdout_open => match line {
+                    Ok(Some(line)) => self.line(&line).await,
+                    Ok(None) | Err(_) => stdout_open = false,
+                },
+                control = controls.recv(), if controls_open => match control {
+                    Some(Control::Send(message)) => {
+                        let _ = self.to_step.send(*message);
+                    }
+                    Some(Control::Cancel) | None => {
+                        controls_open = control.is_some();
+                        if kill.is_none() {
+                            let _ = self.to_step.send(ToStep::Cancel);
+                            kill = Some((libc::SIGTERM, Box::pin(tokio::time::sleep(CANCEL_GRACE))));
+                        }
+                    }
+                },
+                () = async { kill.as_mut().expect("guarded").1.as_mut().await }, if kill.is_some() => {
+                    let (signal, _) = kill.take().expect("guarded");
+                    signal_group(self.pgid, signal);
+                    if signal == libc::SIGTERM {
+                        kill = Some((libc::SIGKILL, Box::pin(tokio::time::sleep(TERM_GRACE))));
+                    }
+                },
+                status = self.child.wait() => {
+                    // Whatever the Step started in its group goes with it,
+                    // which also closes any stdout it handed down.
+                    signal_group(self.pgid, libc::SIGKILL);
+                    self.exited.store(true, Ordering::Release);
+                    // Read what's left on stdout: an outcome may be there.
+                    let deadline = tokio::time::Instant::now() + DRAIN;
+                    while stdout_open {
+                        match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                            Ok(Ok(Some(line))) => self.line(&line).await,
+                            _ => stdout_open = false,
+                        }
+                    }
+                    (self.report)(Report::Exited(status.ok().and_then(|status| status.code())));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// One stdout line: a log message goes to the Step log, and anything
+    /// else to the engine.
+    async fn line(&mut self, line: &str) {
+        match serde_json::from_str::<FromStep>(line) {
+            Ok(FromStep::Log { message }) => {
+                let _ = self.log.write_all(format!("{message}\n").as_bytes()).await;
+            }
+            Ok(message) => (self.report)(Report::Message(message)),
+            Err(error) => (self.report)(Report::ProtocolError(format!(
+                "wrote a line that isn't a protocol message ({error}): {}",
+                truncate(line)
+            ))),
+        }
+    }
 }
 
 fn truncate(line: &str) -> String {
@@ -227,7 +233,7 @@ fn truncate(line: &str) -> String {
     }
 }
 
-fn signal_group(pgid: i32, signal: libc::c_int) {
+pub(crate) fn signal_group(pgid: i32, signal: libc::c_int) {
     // SAFETY: killpg takes plain integers and touches no memory. A group
     // that's already gone just returns ESRCH.
     unsafe {
@@ -238,6 +244,16 @@ fn signal_group(pgid: i32, signal: libc::c_int) {
 /// When the kernel says `pid` started, in microseconds since the Unix
 /// epoch, or now if it can't say.
 fn process_start_us(pid: i32) -> i64 {
+    kernel_start_us(pid).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_micros() as i64)
+            .unwrap_or_default()
+    })
+}
+
+/// When the kernel says `pid` started, if it's running.
+pub(crate) fn kernel_start_us(pid: i32) -> Option<i64> {
     #[cfg(target_os = "macos")]
     {
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -253,14 +269,20 @@ fn process_start_us(pid: i32) -> i64 {
             )
         };
         if written == size {
-            return (info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec) as i64;
+            return Some((info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec) as i64);
         }
     }
     let _ = pid;
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_micros() as i64)
-        .unwrap_or_default()
+    None
+}
+
+/// Kills a Step's group left over from before a restart, if its leader is
+/// still the process that started at `started_us` and not a later one
+/// that reused the pid (ADR 0009).
+pub(crate) fn kill_leftover(pgid: i32, started_us: i64) {
+    if pgid > 0 && kernel_start_us(pgid) == Some(started_us) {
+        signal_group(pgid, libc::SIGKILL);
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +373,32 @@ mod tests {
         ));
         let heard = std::fs::read_to_string(dir.path().join("heard")).unwrap();
         assert_eq!(heard.lines().count(), 2, "start, then cancel: {heard}");
+    }
+
+    #[tokio::test]
+    async fn a_step_that_leaves_a_child_holding_stdout_still_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_handle, mut reports) = reports(sh("sleep 600 & exit 0", &dir)).await;
+
+        let exited = tokio::time::timeout(Duration::from_secs(10), reports.recv()).await;
+
+        assert!(
+            matches!(exited, Ok(Some(Report::Exited(Some(0))))),
+            "{exited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_leftover_group_dies_only_if_its_leader_started_when_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let (handle, mut reports) = reports(sh("read line; sleep 600", &dir)).await;
+
+        kill_leftover(handle.pgid, handle.started_us + 1);
+        let early = tokio::time::timeout(Duration::from_millis(300), reports.recv()).await;
+        assert!(early.is_err(), "a different start time spares it");
+
+        kill_leftover(handle.pgid, handle.started_us);
+        assert!(matches!(reports.recv().await, Some(Report::Exited(None))));
     }
 
     #[tokio::test(start_paused = true)]

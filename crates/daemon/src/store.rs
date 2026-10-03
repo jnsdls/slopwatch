@@ -95,8 +95,14 @@ pub struct NewRun<'a> {
     /// The Pipeline file's text, so the Run can load it again after a
     /// restart.
     pub pipeline: &'a str,
-    /// Step id, Plugin and config hash for every Step.
-    pub steps: Vec<(String, String, String)>,
+    pub steps: Vec<NewStep>,
+}
+
+/// A Run's Step as it starts.
+pub struct NewStep {
+    pub id: String,
+    pub plugin: String,
+    pub config_hash: String,
 }
 
 /// A Run that hasn't ended, as the store keeps it.
@@ -283,7 +289,12 @@ impl Store {
             ],
         )?;
         let id = tx.last_insert_rowid();
-        for (step, plugin, config_hash) in &run.steps {
+        for NewStep {
+            id: step,
+            plugin,
+            config_hash,
+        } in &run.steps
+        {
             tx.execute(
                 "INSERT INTO run_steps (run_id, step, plugin, config_hash, state)
                  VALUES (?1, ?2, ?3, ?4, 'pending')",
@@ -597,7 +608,11 @@ mod tests {
             base: "main",
             base_sha: "base",
             pipeline: "version: 1",
-            steps: vec![("ci".into(), "ci".into(), "hash".into())],
+            steps: vec![NewStep {
+                id: "ci".into(),
+                plugin: "ci".into(),
+                config_hash: "hash".into(),
+            }],
         }
     }
 
