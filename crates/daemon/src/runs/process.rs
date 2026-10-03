@@ -532,13 +532,31 @@ mod tests {
         .unwrap()
     }
 
-    async fn reports(spawn_with: Spawn) -> (StepHandle, mpsc::UnboundedReceiver<Report>) {
+    async fn reports(spawn_with: Spawn) -> (Spawned, mpsc::UnboundedReceiver<Report>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let handle = spawn(spawn_with, move |report| {
             let _ = sender.send(report);
         })
         .unwrap();
-        (handle, receiver)
+        (Spawned(handle), receiver)
+    }
+
+    /// A Step that takes its whole group down once the test is done with
+    /// it, children its leader left behind included.
+    struct Spawned(StepHandle);
+
+    impl std::ops::Deref for Spawned {
+        type Target = StepHandle;
+
+        fn deref(&self) -> &StepHandle {
+            &self.0
+        }
+    }
+
+    impl Drop for Spawned {
+        fn drop(&mut self) {
+            signal_group(self.0.pgid, libc::SIGKILL);
+        }
     }
 
     #[tokio::test]
@@ -705,7 +723,9 @@ mod tests {
     /// group as recorded at spawn and the child's pid.
     fn leaderless_group() -> (Leftover, i32) {
         let mut leader = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 600 & echo $!; read line"])
+            // Long enough for any test, short enough not to linger if one
+            // fails before killing it.
+            .args(["-c", "sleep 60 & echo $!; read line"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .process_group(0)
@@ -804,12 +824,13 @@ mod tests {
     #[tokio::test]
     async fn a_step_that_goes_quiet_stalls_but_heartbeats_keep_it_going() {
         let dir = tempfile::tempdir().unwrap();
-        // Five heartbeats 100 ms apart outlast a 300 ms stall_after, then
-        // the Step goes quiet.
+        // Five heartbeats 100 ms apart outlast a 2 s stall_after, twenty
+        // times the gap so a loaded machine can't stretch one past it, and
+        // then the Step goes quiet.
         let script =
             r#"for i in 1 2 3 4 5; do echo '{"type":"progress"}'; sleep 0.1; done; sleep 600"#;
         let mut spawn = sh(script, &dir);
-        spawn.limits.stall_after = Some(Duration::from_millis(300));
+        spawn.limits.stall_after = Some(Duration::from_secs(2));
         let (_handle, mut reports) = reports(spawn).await;
 
         let mut heartbeats = 0;

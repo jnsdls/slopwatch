@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod support;
+
 use slopwatch_core::{EndReason, GateState, Verdict};
 use slopwatch_daemon::github::fake::FakeGitHub;
 use slopwatch_daemon::github::{GitHub, GitHubError};
@@ -570,6 +572,9 @@ const SLOW_PIPELINE: &str =
 /// A PR whose base has [`SLOW_PIPELINE`], with passing checks, and a data
 /// dir that outlives each daemon.
 struct Restarts {
+    /// Lives across every life, so a crash leaves `slow` behind for the
+    /// next daemon to kill, and whatever is left dies with the test.
+    _reaper: support::Reaper,
     github: Arc<FakeGitHub>,
     data: tempfile::TempDir,
     bin: tempfile::TempDir,
@@ -587,10 +592,12 @@ impl Restarts {
             1,
             checks(ChecksState::Success, CheckState::Success),
         );
+        let bin = tempfile::tempdir().unwrap();
         let restarts = Self {
+            _reaper: support::Reaper::new(bin.path()),
             github,
             data: tempfile::tempdir().unwrap(),
-            bin: tempfile::tempdir().unwrap(),
+            bin,
         };
         restarts.write_plugins();
         restarts
@@ -598,15 +605,16 @@ impl Restarts {
 
     /// Stands in for the built-in Plugins. Step `slow` starts a child in
     /// its group, notes both pids, and waits until the daemon goes away and
-    /// its stdin closes. Its leader then exits and leaves the child behind.
-    /// Once `release` exists, `slow` runs as `ci`.
+    /// its stdin closes. Its leader then exits and leaves the child behind,
+    /// which gives up once `bin` is gone or after about two minutes. Once
+    /// `release` exists, `slow` runs as `ci`.
     fn write_plugins(&self) {
         use std::os::unix::fs::PermissionsExt as _;
         let bin = self.bin.path().display();
         let script = format!(
             "#!/bin/sh\n\
              if [ \"$SLOPWATCH_STEP\" = slow ] && [ ! -e '{bin}/release' ]; then\n\
-             \x20 sleep 600 &\n\
+             \x20 (i=0; while [ -d '{bin}' ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i + 1)); done) &\n\
              \x20 echo $$ $! >> '{bin}/slow.pids'\n\
              \x20 while read line; do :; done\n\
              \x20 exit 0\n\
