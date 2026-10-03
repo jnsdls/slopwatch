@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{RepoName, Topic, TopicUpdate};
+use crate::{RepoName, RunId, Topic, TopicUpdate};
 
 /// A frame a client sends to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +175,18 @@ pub enum Command {
     /// Removes the Library Step `step`. A Pipeline that uses it fails to
     /// load, naming it, until it's back.
     DeleteLibraryStep {
+        step: String,
+    },
+    /// Ends a Run that's still going as cancelled. Its running Steps are
+    /// cancelled the Step contract's way, which ends in killing their
+    /// process groups.
+    CancelRun {
+        run: RunId,
+    },
+    /// Runs an errored Step again in the same Run, along with every Step
+    /// after it. The Run must still be going.
+    RetryStep {
+        run: RunId,
         step: String,
     },
 }

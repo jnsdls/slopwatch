@@ -91,6 +91,7 @@ mod tests {
                     base: "main",
                     base_sha: "def",
                     pipeline: "",
+                    files: &[],
                     steps: vec![],
                 },
                 0,

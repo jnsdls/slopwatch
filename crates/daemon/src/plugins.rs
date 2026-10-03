@@ -8,6 +8,7 @@
 
 pub mod ci;
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::MetadataExt as _;
@@ -31,6 +32,14 @@ pub struct Plugins {
     /// SHA-256 of `builtin_exe`, and the file it was taken from.
     builtin_hash: Mutex<Option<(FileStamp, String)>>,
     library: Arc<Library>,
+    /// Plugins from outside the app, by name.
+    third_party: HashMap<String, ThirdParty>,
+}
+
+struct ThirdParty {
+    manifest: Manifest,
+    program: PathBuf,
+    args: Vec<String>,
 }
 
 /// Tells one file from another at a path, or the same file rewritten.
@@ -47,11 +56,28 @@ impl Plugins {
             builtin_exe: builtin_exe.into(),
             builtin_hash: Mutex::new(None),
             library,
+            third_party: HashMap::new(),
         }
     }
 
+    /// Adds a Plugin from outside the app, named by its manifest's id, that
+    /// runs as `program args`. Finding third-party Plugins on disk and
+    /// approving them come with their own ticket (ADR 0012); until then
+    /// only tests add one.
+    pub fn with_plugin(mut self, manifest: Manifest, program: PathBuf, args: Vec<String>) -> Self {
+        self.third_party.insert(
+            manifest.id.clone(),
+            ThirdParty {
+                manifest,
+                program,
+                args,
+            },
+        );
+        self
+    }
+
     pub fn manifest(&self, plugin: &str) -> Option<Manifest> {
-        builtin_manifest(plugin)
+        builtin_manifest(plugin).or_else(|| Some(self.third_party.get(plugin)?.manifest.clone()))
     }
 
     /// The version an Outcome is reused under: the manifest version plus
@@ -86,11 +112,14 @@ impl Plugins {
 
     /// The program and arguments that start a session with `plugin`.
     pub fn command(&self, plugin: &str) -> Option<(PathBuf, Vec<String>)> {
-        builtin_manifest(plugin)?;
-        Some((
-            self.builtin_exe.clone(),
-            vec!["plugin".into(), plugin.into(), "run".into()],
-        ))
+        if builtin_manifest(plugin).is_some() {
+            return Some((
+                self.builtin_exe.clone(),
+                vec!["plugin".into(), plugin.into(), "run".into()],
+            ));
+        }
+        let plugin = self.third_party.get(plugin)?;
+        Some((plugin.program.clone(), plugin.args.clone()))
     }
 }
 
@@ -135,7 +164,7 @@ impl Resolver for Plugins {
     fn plugin(&self, name: &str) -> Option<PluginInfo> {
         self.manifest(name).map(|manifest| PluginInfo {
             workspace: manifest.workspace,
-            builtin: true,
+            builtin: builtin_manifest(name).is_some(),
         })
     }
 }

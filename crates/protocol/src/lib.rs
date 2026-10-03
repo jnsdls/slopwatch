@@ -41,7 +41,10 @@ pub const DIALECT: u32 = 1;
 ///
 /// `runs`: Run history on `watched_prs` rows, the `run/<id>` topics, and
 /// `unsubscribe`.
-pub const FEATURES: &[&str] = &["watched_prs", "restart", "library", "runs"];
+///
+/// `run_control`: the `cancel_run` and `retry_step` commands, and the
+/// `step_retried` Run event.
+pub const FEATURES: &[&str] = &["watched_prs", "restart", "library", "runs", "run_control"];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no
 /// host, so the host here is a placeholder the daemon ignores.

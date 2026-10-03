@@ -22,6 +22,7 @@ mod library;
 mod pace;
 pub mod plugins;
 pub mod runs;
+pub mod shell_env;
 pub mod store;
 pub mod transport;
 mod watching;
@@ -36,7 +37,7 @@ use slopwatch_protocol::{
 };
 
 pub use library::{CONFIG_DIR_ENV, Library, LibraryError};
-pub use runs::{Runs, RunsConfig};
+pub use runs::{RunError, Runs, RunsConfig, STEP_CAP};
 pub use watching::{RunInfo, Subscription, WatchError, Watching};
 
 /// Who is on the other end of a connection, as the transport reports it.

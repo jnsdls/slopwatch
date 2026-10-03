@@ -7,6 +7,7 @@ use slopwatch_daemon::auth::GhToken;
 use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::api::Api;
 use slopwatch_daemon::plugins::{self, Plugins};
+use slopwatch_daemon::shell_env;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::unix::Listener;
 use slopwatch_daemon::{Daemon, DataDir, Library, Runs, RunsConfig, Watching};
@@ -83,9 +84,16 @@ async fn serve() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // launchd's PATH lacks what the developer's shell finds, so Steps get
+    // the login shell's merged in. Asking it takes a moment, and the
+    // first Step can't start without it.
+    let login_path = tokio::task::spawn_blocking(shell_env::login_shell_path)
+        .await
+        .unwrap_or_default();
     let config = RunsConfig {
         data_dir: data_dir.path().to_owned(),
         plugins: Plugins::new(exe, Arc::clone(&library)),
+        login_path,
     };
     let runs = match Runs::start(store, github, Arc::clone(&watching), config) {
         Ok(runs) => runs,

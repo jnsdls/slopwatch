@@ -227,8 +227,9 @@ fn duration(
     parsed
 }
 
-/// A duration written as `90s`, `30m` or `2h`.
-pub(crate) fn parse_duration(value: &str) -> Option<Duration> {
+/// A duration written as `90s`, `30m` or `2h`, as Pipelines and Plugin
+/// manifests write `timeout` and `stall_after`.
+pub fn parse_duration(value: &str) -> Option<Duration> {
     let split = value
         .find(|c: char| !c.is_ascii_digit())
         .filter(|&split| split > 0)?;
