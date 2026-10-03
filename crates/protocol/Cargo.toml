@@ -1,0 +1,14 @@
+[package]
+name = "slopwatch-protocol"
+description = "Frames clients and the daemon exchange (ADR 0010), and the Step JSONL messages."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

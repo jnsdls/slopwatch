@@ -1,0 +1,25 @@
+[package]
+name = "slopwatch-daemon"
+description = "The slopwatch daemon: Runs, polling, Effects, journals, storage and Step processes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "slopwatchd"
+path = "src/main.rs"
+
+[dependencies]
+futures-util.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+slopwatch-protocol.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

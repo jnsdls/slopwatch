@@ -1,0 +1,27 @@
+[package]
+name = "slopwatch-client"
+description = "The slopwatch GUI. The only crate that may depend on GPUI or gpui-kit (ADR 0005)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "slopwatch"
+path = "src/main.rs"
+
+[dependencies]
+futures-channel.workspace = true
+futures-util.workspace = true
+gpui-kit.workspace = true
+serde_json.workspace = true
+slopwatch-protocol.workspace = true
+tungstenite.workspace = true
+
+[dev-dependencies]
+slopwatch-daemon.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
