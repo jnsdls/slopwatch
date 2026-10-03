@@ -76,11 +76,11 @@ impl Journal {
     }
 
     /// Prunes an ended Run's journal down to the events that rebuild its
-    /// record: the start, each Step's last settle, the last Gate, the
-    /// Effects and the end. Then appends [`RunEvent::Pruned`], so a client that already
-    /// had the Run learns its detail is gone. Folding what's left still
-    /// gives the Run's final state, for a client starting from scratch or
-    /// from any sequence number it had.
+    /// record: the start, each Step's last settle, the Waivers, the last
+    /// Gate, the Effects and the end. Then appends [`RunEvent::Pruned`], so
+    /// a client that already had the Run learns its detail is gone.
+    /// Folding what's left still gives the Run's final state, for a client
+    /// starting from scratch or from any sequence number it had.
     pub fn prune(&self, run: RunId, at: i64) -> Result<(), StoreError> {
         let live = self.live.lock().expect("no panics while appending");
         let mut keep = Vec::new();
@@ -88,10 +88,12 @@ impl Journal {
         let mut gate = None;
         for Journalled { seq, event, .. } in self.replay(run, 0)? {
             match event {
-                // What a Step did on GitHub stays on record.
-                RunEvent::Started { .. } | RunEvent::Ended { .. } | RunEvent::Effect { .. } => {
-                    keep.push(seq)
-                }
+                // What a Step did on GitHub and what the developer waived
+                // stay on record.
+                RunEvent::Started { .. }
+                | RunEvent::StepWaived { .. }
+                | RunEvent::Ended { .. }
+                | RunEvent::Effect { .. } => keep.push(seq),
                 RunEvent::StepSettled { step, .. } => {
                     settled.insert(step, seq);
                 }
@@ -251,6 +253,7 @@ mod tests {
             gate(GateState::Pass),
             RunEvent::Ended {
                 reason: EndReason::Shippable,
+                waived: false,
             },
         ];
         let mut full = RunView::default();

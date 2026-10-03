@@ -22,7 +22,9 @@ pub use logs::{
     LogFilter, LogKey, LogLevel, LogPage, LogRecord, LogSource, MAX_PAGE, StepLogPage,
     StorageWarning, Truncation,
 };
-pub use runs::{EffectView, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView};
+pub use runs::{
+    EffectView, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView, Waiver,
+};
 pub use topics::{
     PollState, PrStatus, PullRequest, RepoName, Topic, TopicUpdate, WatchedPrs, WatchedPrsDelta,
     WatchedPrsUpdate,
@@ -52,6 +54,8 @@ pub const DIALECT: u32 = 1;
 ///
 /// `step_logs`: the `log/<run>/<step>/<attempt>` topics, `read_step_log`,
 /// timestamps on Run events, and the storage warning on `watched_prs`.
+/// `waivers`: the `waive_step` and `override_gate` commands, the
+/// `step_waived` Run event, and the `waived` mark on an ended Run.
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -59,6 +63,7 @@ pub const FEATURES: &[&str] = &[
     "runs",
     "run_control",
     "step_logs",
+    "waivers",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

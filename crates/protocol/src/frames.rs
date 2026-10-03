@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use slopwatch_core::WaiverCategory;
 
 use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
 use crate::{RepoName, RunId, Topic, TopicUpdate};
@@ -200,6 +201,23 @@ pub enum Command {
         page: LogPage,
         #[serde(default)]
         filter: LogFilter,
+    },
+    /// Waives Step `step`'s settled, non-pass Verdict for the Run's head
+    /// SHA, so the Gate counts it as pass. In a Run that's still going the
+    /// Gate moves at once. On the PR's latest Run, once it has ended, a new
+    /// Run starts on the same SHA and reuses the settled Outcomes.
+    WaiveStep {
+        run: RunId,
+        step: String,
+        category: WaiverCategory,
+        reason: String,
+    },
+    /// Waives every Step that makes a Gate term fail, in one action, the
+    /// way [`Command::WaiveStep`] waives one.
+    OverrideGate {
+        run: RunId,
+        category: WaiverCategory,
+        reason: String,
     },
 }
 

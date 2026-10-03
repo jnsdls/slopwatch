@@ -170,7 +170,7 @@ done
 
     fn ended(&self, run: RunId) -> Option<EndReason> {
         self.events(run).iter().find_map(|event| match event {
-            RunEvent::Ended { reason } => Some(*reason),
+            RunEvent::Ended { reason, .. } => Some(*reason),
             _ => None,
         })
     }

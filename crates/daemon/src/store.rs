@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, params};
 use slopwatch_core::{EndReason, GateState, ReuseKey, Verdict};
 use slopwatch_protocol::step::{Effect, EffectResult, Outputs};
-use slopwatch_protocol::{RepoName, RunId, RunSummary};
+use slopwatch_protocol::{RepoName, RunId, RunSummary, Waiver};
 
 use crate::github::OpenPr;
 
@@ -119,6 +119,24 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX effects_by_head ON effects (repo, head_sha);
 ",
+    // Waivers belong to a PR's head SHA, not to a Run, so every Run on that
+    // SHA counts them. `run_id` is the Run they were made from. A Run that
+    // ended shippable only because of Waivers is marked `waived`.
+    "
+    CREATE TABLE waivers (
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        head_sha TEXT NOT NULL,
+        step TEXT NOT NULL,
+        category TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        waived_at INTEGER NOT NULL,
+        PRIMARY KEY (repo, number, head_sha, step)
+    );
+    ALTER TABLE runs ADD COLUMN waived INTEGER NOT NULL DEFAULT 0;
+",
 ];
 
 #[derive(Clone)]
@@ -221,7 +239,8 @@ pub struct NewEffect<'a> {
     pub effect: &'a Effect,
 }
 
-/// A Run that hasn't ended, as the store keeps it.
+/// A Run as the store keeps it: one that hasn't ended, as a restart picks
+/// it up, or any Run a developer's command names.
 #[derive(Debug, Clone)]
 pub struct ActiveRun {
     pub id: RunId,
@@ -549,13 +568,15 @@ impl Store {
 
     /// The newest Outcome the PR settled under `key` in a Run before
     /// `before`, if its Verdict may be reused. A reused Outcome names the
-    /// Run that first reported it.
+    /// Run that first reported it. A `waived` Step takes any Verdict but
+    /// skipped, since the Waiver already counts it as pass.
     pub fn reusable_outcome(
         &self,
         repo: &RepoName,
         number: u64,
         key: &ReuseKey,
         before: RunId,
+        waived: bool,
     ) -> Result<Option<Reusable>, StoreError> {
         let found = self
             .db()
@@ -591,7 +612,7 @@ impl Store {
         };
         let Some(verdict) = verdict
             .and_then(|v| serde_json::from_value::<Verdict>(v.into()).ok())
-            .filter(|verdict| verdict.reusable())
+            .filter(|verdict| verdict.reusable() || (waived && *verdict != Verdict::Skipped))
         else {
             return Ok(None);
         };
@@ -623,13 +644,26 @@ impl Store {
 
     /// Runs that haven't ended, oldest first.
     pub fn active_runs(&self) -> Result<Vec<ActiveRun>, StoreError> {
+        self.runs_where("end_reason IS NULL", [])
+    }
+
+    /// Run `run` with its Steps, ended or not.
+    pub fn run(&self, run: RunId) -> Result<Option<ActiveRun>, StoreError> {
+        Ok(self.runs_where("id = ?1", params![run.0 as i64])?.pop())
+    }
+
+    fn runs_where(
+        &self,
+        filter: &str,
+        args: impl rusqlite::Params,
+    ) -> Result<Vec<ActiveRun>, StoreError> {
         let db = self.db();
         let mut runs = db
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, repo, number, head_sha, base, base_sha, pipeline, gate, files
-                 FROM runs WHERE end_reason IS NULL ORDER BY id",
-            )?
-            .query_map([], |row| {
+                 FROM runs WHERE {filter} ORDER BY id"
+            ))?
+            .query_map(args, |row| {
                 Ok(ActiveRun {
                     id: RunId(row.get::<_, i64>(0)? as u64),
                     repo: parse_repo(&row.get::<_, String>(1)?),
@@ -694,7 +728,7 @@ impl Store {
     ) -> Result<Vec<RunSummary>, StoreError> {
         let db = self.db();
         let mut query = db.prepare(
-            "SELECT id, head_sha, gate, end_reason FROM runs
+            "SELECT id, head_sha, gate, end_reason, waived FROM runs
              WHERE repo = ?1 AND number = ?2 ORDER BY id DESC LIMIT ?3",
         )?;
         let rows = query.query_map(
@@ -707,6 +741,7 @@ impl Store {
                     end: row
                         .get::<_, Option<String>>(3)?
                         .and_then(|reason| serde_json::from_value(reason.into()).ok()),
+                    waived: row.get(4)?,
                 })
             },
         )?;
@@ -733,6 +768,108 @@ impl Store {
                 },
             )
             .optional()
+    }
+
+    /// The id of the PR's newest Run, ended or not.
+    pub fn latest_run_id(&self, repo: &RepoName, number: u64) -> Result<Option<RunId>, StoreError> {
+        self.db()
+            .query_row(
+                "SELECT MAX(id) FROM runs WHERE repo = ?1 AND number = ?2",
+                params![repo.to_string(), number as i64],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map(|id| id.map(|id| RunId(id as u64)))
+    }
+
+    /// Marks an ended Run as shippable only because of Waivers.
+    pub fn mark_waived(&self, run: RunId) -> Result<(), StoreError> {
+        self.db().execute(
+            "UPDATE runs SET waived = 1 WHERE id = ?1",
+            params![run.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Records a Waiver on `step` for the head SHA of Run `run`, the Run it
+    /// was made from. A Step has at most one Waiver per SHA, so a second
+    /// one is ignored.
+    pub fn add_waiver(
+        &self,
+        run: RunId,
+        step: &str,
+        waiver: &Waiver,
+        now: i64,
+    ) -> Result<(), StoreError> {
+        self.db().execute(
+            "INSERT OR IGNORE INTO waivers
+                 (repo, number, head_sha, step, category, reason, actor, run_id, waived_at)
+             SELECT repo, number, head_sha, ?2, ?3, ?4, ?5, id, ?6 FROM runs WHERE id = ?1",
+            params![
+                run.0 as i64,
+                step,
+                json_str(&waiver.category),
+                waiver.reason,
+                serde_json::to_string(&waiver.actor).expect("actors always serialize"),
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The Steps a Waiver covers on the PR's head SHA.
+    pub fn waived_steps(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        head_sha: &str,
+    ) -> Result<std::collections::HashSet<String>, StoreError> {
+        Ok(self
+            .waivers(repo, number, head_sha)?
+            .into_iter()
+            .map(|(step, _)| step)
+            .collect())
+    }
+
+    /// Every Waiver on the PR's head SHA, by Step, oldest first.
+    pub fn waivers(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        head_sha: &str,
+    ) -> Result<Vec<(String, Waiver)>, StoreError> {
+        let db = self.db();
+        let mut query = db.prepare(
+            "SELECT step, category, reason, actor FROM waivers
+             WHERE repo = ?1 AND number = ?2 AND head_sha = ?3 ORDER BY waived_at, rowid",
+        )?;
+        let rows = query.query_map(params![repo.to_string(), number as i64, head_sha], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut waivers = Vec::new();
+        for row in rows {
+            let (step, category, reason, actor) = row?;
+            // Only this build writes the table, so both always parse.
+            let (Ok(category), Ok(actor)) = (
+                serde_json::from_value(category.into()),
+                serde_json::from_str(&actor),
+            ) else {
+                continue;
+            };
+            waivers.push((
+                step,
+                Waiver {
+                    category,
+                    reason,
+                    actor,
+                },
+            ));
+        }
+        Ok(waivers)
     }
 
     /// Every PR that has a Run.
@@ -1370,7 +1507,7 @@ mod tests {
         let third = store.insert_run(&new_run(&repo, "aaa"), 3).unwrap();
 
         let found = store
-            .reusable_outcome(&repo, 7, &ci_key("aaa"), second)
+            .reusable_outcome(&repo, 7, &ci_key("aaa"), second, false)
             .unwrap()
             .expect("the first Run's fail is reusable");
         assert_eq!((found.run, found.verdict), (first, Verdict::Fail));
@@ -1381,14 +1518,14 @@ mod tests {
             .put_reused_step(second, &ci_key("aaa"), &found)
             .unwrap();
         let again = store
-            .reusable_outcome(&repo, 7, &ci_key("aaa"), third)
+            .reusable_outcome(&repo, 7, &ci_key("aaa"), third, false)
             .unwrap()
             .unwrap();
         assert_eq!(again.run, first, "a reuse of a reuse names the first");
 
         assert_eq!(
             store
-                .reusable_outcome(&repo, 7, &ci_key("bbb"), third)
+                .reusable_outcome(&repo, 7, &ci_key("bbb"), third, false)
                 .unwrap(),
             None,
             "another head SHA"
@@ -1399,7 +1536,7 @@ mod tests {
         };
         assert_eq!(
             store
-                .reusable_outcome(&repo, 7, &other_version, third)
+                .reusable_outcome(&repo, 7, &other_version, third, false)
                 .unwrap(),
             None
         );
@@ -1417,10 +1554,46 @@ mod tests {
 
         assert_eq!(
             store
-                .reusable_outcome(&repo, 7, &ci_key("aaa"), third)
+                .reusable_outcome(&repo, 7, &ci_key("aaa"), third, false)
                 .unwrap(),
             None
         );
+        let waived = store
+            .reusable_outcome(&repo, 7, &ci_key("aaa"), third, true)
+            .unwrap()
+            .expect("a waived Step keeps its errored Outcome");
+        assert_eq!((waived.run, waived.verdict), (second, Verdict::Error));
+    }
+
+    #[test]
+    fn waivers_belong_to_the_head_sha_and_a_second_one_on_a_step_is_ignored() {
+        let store = Store::in_memory();
+        let repo = RepoName::new("o", "r");
+        let first = store.insert_run(&new_run(&repo, "aaa"), 1).unwrap();
+        let waiver = |reason: &str| Waiver {
+            category: slopwatch_core::WaiverCategory::AcceptedRisk,
+            reason: reason.into(),
+            actor: slopwatch_protocol::Actor::Developer { via: "gui".into() },
+        };
+        store.add_waiver(first, "ci", &waiver("first"), 5).unwrap();
+        store.add_waiver(first, "ci", &waiver("second"), 6).unwrap();
+        store.end_run(first, EndReason::Shippable, 7).unwrap();
+        store.mark_waived(first).unwrap();
+        let pushed = store.insert_run(&new_run(&repo, "bbb"), 8).unwrap();
+
+        assert_eq!(
+            store.waivers(&repo, 7, "aaa").unwrap(),
+            [("ci".to_owned(), waiver("first"))]
+        );
+        assert!(store.waivers(&repo, 7, "bbb").unwrap().is_empty());
+        assert_eq!(store.latest_run_id(&repo, 7).unwrap(), Some(pushed));
+        let summaries = store.run_summaries(&repo, 7, 5).unwrap();
+        assert_eq!(
+            summaries.iter().map(|s| s.waived).collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert_eq!(store.run(first).unwrap().unwrap().head_sha, "aaa");
+        assert!(store.run(RunId(99)).unwrap().is_none());
     }
 
     fn intent<'a>(

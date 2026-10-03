@@ -1,7 +1,7 @@
 //! Evaluating a Pipeline against the current state of one Run: what the Gate
 //! says, which Steps may start, and which are skipped and why.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use crate::expr::{Env, Expr, StepTerm, Tri};
@@ -94,9 +94,41 @@ impl Pipeline {
         self.plan(state).gate
     }
 
+    /// The Steps a Gate override waives, sorted: in every Gate term that
+    /// fails, each Step that makes it fail and whose settled Verdict a
+    /// Waiver may still cover. A Step under `not:` is left alone, since
+    /// counting it as pass can't help that term.
+    pub fn failing_waivable_steps(&self, state: &RunState) -> Vec<String> {
+        let env = self.evaluate(state).0;
+        let mut waives = BTreeSet::new();
+        for term in &self.gate {
+            collect_failing(term, &env, state, &mut waives);
+        }
+        waives.into_iter().collect()
+    }
+
+    /// Whether the Gate passes only because of the Run's Waivers.
+    pub fn passes_by_waiver(&self, state: &RunState) -> bool {
+        let unwaived = RunState {
+            waived: HashSet::new(),
+            ..state.clone()
+        };
+        self.gate(state) == GateState::Pass && self.gate(&unwaived) != GateState::Pass
+    }
+
     /// Decides every pending Step. A skip counts as settled for the Steps
     /// after it, so one call returns the whole skip cascade.
     pub fn plan(&self, state: &RunState) -> Plan {
+        let (env, decisions) = self.evaluate(state);
+        Plan {
+            gate: env.gate,
+            decisions,
+        }
+    }
+
+    /// One evaluation pass: the decisions for pending Steps, and the Run's
+    /// state with the skips they imply.
+    fn evaluate<'a>(&'a self, state: &'a RunState) -> (Working<'a>, Vec<(String, Decision)>) {
         let mut env = Working::new(state);
         let mut decisions = Vec::new();
         for node in &self.order {
@@ -115,10 +147,7 @@ impl Pipeline {
             }
             decisions.push((node.clone(), decision));
         }
-        Plan {
-            gate: env.gate,
-            decisions,
-        }
+        (env, decisions)
     }
 
     fn decide(&self, step: &Step, env: &Working<'_>, state: &RunState) -> Decision {
@@ -130,6 +159,37 @@ impl Pipeline {
             Tri::True if upstream_settled(step, env) => Decision::Start,
             _ => Decision::Wait,
         }
+    }
+}
+
+/// Adds the waivable Steps that make `term` false. `and`/`or` fail only
+/// through their failing parts; `not:` fails through passing ones, which a
+/// Waiver can't change.
+fn collect_failing(
+    term: &Expr,
+    env: &Working<'_>,
+    state: &RunState,
+    waives: &mut BTreeSet<String>,
+) {
+    if term.eval(env) != Tri::False {
+        return;
+    }
+    match term {
+        Expr::Step(StepTerm { id, .. }) => {
+            let waivable = matches!(
+                state.steps.get(id),
+                Some(StepState::Settled(verdict)) if *verdict != Verdict::Pass
+            );
+            if waivable && !state.waived.contains(id) {
+                waives.insert(id.clone());
+            }
+        }
+        Expr::All(items) | Expr::Any(items) => {
+            for item in items {
+                collect_failing(item, env, state, waives);
+            }
+        }
+        _ => {}
     }
 }
 

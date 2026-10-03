@@ -6,8 +6,12 @@
 //! one from the history chips. Each method returns the commands the link
 //! should send to keep the subscriptions on what's shown: the Run, and the
 //! Step log of the open Step row.
+//!
+//! The pane also holds the Waiver form while the developer fills it in:
+//! what it waives, one Step or the whole Gate, and the category. The
+//! reason is typed into the view's input and comes in on submit.
 
-use slopwatch_core::{EndReason, GateState, Verdict};
+use slopwatch_core::{EndReason, GateState, Verdict, WaiverCategory};
 use slopwatch_protocol::{
     Command, LogKey, LogRecord, PullRequest, RepoName, RunId, RunSummary, RunView, StepLogPage,
     StepStatus, StepView, Topic, TopicUpdate,
@@ -31,6 +35,22 @@ pub struct RunPane {
     tail: Option<LogTail>,
     /// The full log of one of the open Step's attempts.
     viewer: Option<LogViewer>,
+    /// The Waiver being filled in.
+    waiving: Option<WaiveForm>,
+}
+
+/// A Waiver the developer is filling in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaiveForm {
+    pub target: WaiveTarget,
+    pub category: WaiverCategory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaiveTarget {
+    Step(String),
+    /// The Gate override: every Step behind a failing term.
+    Gate,
 }
 
 impl RunPane {
@@ -95,6 +115,85 @@ impl RunPane {
         (view.end.is_none() && errored).then(|| Command::RetryStep {
             run,
             step: step.to_owned(),
+        })
+    }
+
+    /// Whether `step` can be waived in the Run shown: its Verdict settled
+    /// and isn't pass, no Waiver covers it yet, and the Run is the PR's
+    /// latest, since a Waiver on an ended Run starts the PR's next one.
+    pub fn can_waive(&self, step: &str) -> bool {
+        let Some(view) = self.view() else {
+            return false;
+        };
+        let Some(step) = view.step(step) else {
+            return false;
+        };
+        let non_pass = matches!(
+            step.status,
+            StepStatus::Settled { verdict, .. } if verdict != Verdict::Pass
+        );
+        self.pinned.is_none() && non_pass && step.waiver.is_none()
+    }
+
+    /// Whether the Gate can be overridden in the Run shown: it fails, and
+    /// the Run is the PR's latest.
+    pub fn can_override(&self) -> bool {
+        self.pinned.is_none()
+            && self
+                .view()
+                .is_some_and(|view| view.gate == Some(GateState::Fail))
+    }
+
+    /// Opens the Waiver form on `target`, with the first category picked.
+    pub fn start_waiver(&mut self, target: WaiveTarget) {
+        let allowed = match &target {
+            WaiveTarget::Step(step) => self.can_waive(step),
+            WaiveTarget::Gate => self.can_override(),
+        };
+        if allowed {
+            self.waiving = Some(WaiveForm {
+                target,
+                category: WaiverCategory::ALL[0],
+            });
+        }
+    }
+
+    pub fn waiver_form(&self) -> Option<&WaiveForm> {
+        self.waiving.as_ref()
+    }
+
+    pub fn pick_category(&mut self, category: WaiverCategory) {
+        if let Some(form) = &mut self.waiving {
+            form.category = category;
+        }
+    }
+
+    pub fn cancel_waiver(&mut self) {
+        self.waiving = None;
+    }
+
+    /// The command the filled-in form sends, which closes it. `None`, with
+    /// the form left open, until there's a reason.
+    pub fn submit_waiver(&mut self, reason: &str) -> Option<Command> {
+        let reason = reason.trim();
+        let run = self.shown?;
+        if reason.is_empty() {
+            return None;
+        }
+        let form = self.waiving.take()?;
+        let reason = reason.to_owned();
+        Some(match form.target {
+            WaiveTarget::Step(step) => Command::WaiveStep {
+                run,
+                step,
+                category: form.category,
+                reason,
+            },
+            WaiveTarget::Gate => Command::OverrideGate {
+                run,
+                category: form.category,
+                reason,
+            },
         })
     }
 
@@ -276,6 +375,7 @@ impl RunPane {
         }
         let mut commands = self.close_step();
         self.open_step = None;
+        self.waiving = None;
         if let Some(old) = self.shown.take() {
             commands.push(Command::Unsubscribe {
                 topic: Topic::Run(old),
@@ -297,13 +397,29 @@ impl RunPane {
 /// How a Run reads on its history chip and in the PR list.
 pub fn run_label(run: &RunSummary) -> String {
     match run.end {
-        Some(reason) => capitalized(&reason.to_string()),
+        Some(reason) => capitalized(&end_label(reason, run.waived)),
         None => match run.gate {
             GateState::Pending => "Running".to_owned(),
             GateState::Pass => "Running, Gate passed".to_owned(),
             GateState::Fail => "Running, Gate failed".to_owned(),
         },
     }
+}
+
+/// How an ended Run reads: "shippable (waived)" when only Waivers passed
+/// its Gate.
+pub fn end_label(reason: EndReason, waived: bool) -> String {
+    if waived {
+        format!("{reason} (waived)")
+    } else {
+        reason.to_string()
+    }
+}
+
+/// The Waiver on a Step, as its row says it.
+pub fn waiver_line(step: &StepView) -> Option<String> {
+    let waiver = step.waiver.as_ref()?;
+    Some(format!("Waived, {}: {}", waiver.category, waiver.reason))
 }
 
 /// Whether a Run reads as good, bad or neither.
@@ -353,6 +469,9 @@ pub fn step_line(step: &StepView) -> String {
 }
 
 pub fn step_tone(step: &StepView) -> Tone {
+    if step.waiver.is_some() {
+        return Tone::Neutral;
+    }
     match step.status {
         StepStatus::Settled {
             verdict: Verdict::Pass,
@@ -394,6 +513,7 @@ mod tests {
             head_sha: format!("sha{id}"),
             gate: GateState::Pending,
             end,
+            waived: false,
         }
     }
 
@@ -556,10 +676,100 @@ mod tests {
             ts: 3,
             event: RunEvent::Ended {
                 reason: EndReason::NotShippable,
+                waived: false,
             },
         });
         assert_eq!(pane.cancel(), None);
         assert_eq!(pane.retry("ci"), None, "an ended Run can't retry");
+    }
+
+    #[test]
+    fn a_settled_non_pass_step_and_a_failing_gate_can_be_waived_from_the_latest_run() {
+        let mut pane = RunPane::default();
+        let row = pr(vec![summary(5, None)]);
+        pane.select_pr(&row);
+        pane.apply(started(5));
+        assert!(!pane.can_waive("ci"), "ci hasn't settled");
+        pane.start_waiver(WaiveTarget::Step("ci".into()));
+        assert_eq!(pane.waiver_form(), None);
+
+        pane.apply(settled(Verdict::Fail));
+        pane.apply(event(
+            5,
+            3,
+            RunEvent::Gate {
+                state: GateState::Fail,
+            },
+        ));
+        assert!(pane.can_waive("ci"));
+        assert!(pane.can_override());
+
+        pane.start_waiver(WaiveTarget::Step("ci".into()));
+        pane.pick_category(WaiverCategory::AcceptedRisk);
+        assert_eq!(pane.submit_waiver("  "), None, "a Waiver needs a reason");
+        assert_eq!(
+            pane.submit_waiver("known issue"),
+            Some(Command::WaiveStep {
+                run: RunId(5),
+                step: "ci".into(),
+                category: WaiverCategory::AcceptedRisk,
+                reason: "known issue".into(),
+            })
+        );
+        assert_eq!(pane.waiver_form(), None, "submitting closes the form");
+
+        pane.start_waiver(WaiveTarget::Gate);
+        assert_eq!(
+            pane.submit_waiver("ship it"),
+            Some(Command::OverrideGate {
+                run: RunId(5),
+                category: WaiverCategory::FalsePositive,
+                reason: "ship it".into(),
+            })
+        );
+
+        let older = pr(vec![
+            summary(6, None),
+            summary(5, Some(EndReason::NotShippable)),
+        ]);
+        pane.select_run(RunId(5), &older);
+        pane.apply(started(5));
+        pane.apply(settled(Verdict::Fail));
+        assert!(!pane.can_waive("ci"), "only the latest Run takes Waivers");
+    }
+
+    #[test]
+    fn a_waived_step_and_a_waived_pass_say_so() {
+        let mut waived = summary(1, Some(EndReason::Shippable));
+        waived.waived = true;
+        assert_eq!(run_label(&waived), "Shippable (waived)");
+
+        let step = StepView {
+            info: StepInfo {
+                id: "ci".into(),
+                plugin: "ci".into(),
+                needs: vec![],
+                gated: true,
+            },
+            status: StepStatus::Settled {
+                verdict: Verdict::Fail,
+                reason: None,
+                outputs: Outputs::default(),
+                reused_from: None,
+            },
+            attempt: 1,
+            progress: None,
+            waiver: Some(slopwatch_protocol::Waiver {
+                category: WaiverCategory::DoesntApply,
+                reason: "docs-only PR".into(),
+                actor: slopwatch_protocol::Actor::Developer { via: "gui".into() },
+            }),
+        };
+        assert_eq!(
+            waiver_line(&step).as_deref(),
+            Some("Waived, doesn't apply: docs-only PR")
+        );
+        assert_eq!(step_tone(&step), Tone::Neutral);
     }
 
     #[test]
@@ -589,6 +799,7 @@ mod tests {
             },
             attempt: 1,
             progress: None,
+            waiver: None,
         };
         assert_eq!(step_line(&step), "cancelled: the Run ended superseded");
 

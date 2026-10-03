@@ -10,6 +10,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
+use slopwatch_core::WaiverCategory;
 use slopwatch_protocol::{
     Command, LogLevel, LogSource, PrStatus, PullRequest, Reply, RepoName, ResponseBody, RunView,
     StepStatus, StepView, TopicUpdate,
@@ -20,7 +21,10 @@ use crate::library_view::LibraryView;
 use crate::link::{LinkEvent, LinkState};
 use crate::link_view::LinkView;
 use crate::prs::{Prs, Source, poll_line, status_line, storage_line};
-use crate::run_pane::{RunPane, Tone, gate_tone, run_label, run_tone, step_line, step_tone};
+use crate::run_pane::{
+    RunPane, Tone, WaiveTarget, end_label, gate_tone, run_label, run_tone, step_line, step_tone,
+    waiver_line,
+};
 use crate::step_log::{self, LogViewer, Row};
 
 /// What fills the window right of the sources pane.
@@ -44,6 +48,8 @@ pub struct MainView {
     commands: Sender<Command>,
     /// The log viewer's search field.
     log_search: Entity<InputState>,
+    /// The Waiver form's reason field.
+    waiver_reason: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -58,19 +64,33 @@ impl MainView {
         cx: &mut Context<Self>,
     ) -> Self {
         let log_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search the log"));
-        let _subscriptions = vec![cx.subscribe_in(
-            &log_search,
-            window,
-            |this, input, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    let search = input.read(cx).value().to_string();
-                    this.with_viewer(|viewer| Some(viewer.set_search(&search)));
-                    cx.notify();
-                }
-            },
-        )];
+        let waiver_reason =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Why it doesn't block this PR"));
+        let _subscriptions = vec![
+            cx.subscribe_in(
+                &log_search,
+                window,
+                |this, input, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        let search = input.read(cx).value().to_string();
+                        this.with_viewer(|viewer| Some(viewer.set_search(&search)));
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &waiver_reason,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.submit_waiver(window, cx);
+                    }
+                },
+            ),
+        ];
         Self {
             log_search,
+            waiver_reason,
             _subscriptions,
             link: LinkState::Connecting,
             link_view: cx.new(|_| LinkView::new(agent, reregister)),
@@ -139,6 +159,17 @@ impl MainView {
                 ResponseBody::Ok(_) => self.error = None,
                 ResponseBody::Error(error) => self.error = Some(error.message),
             },
+        }
+        cx.notify();
+    }
+
+    /// Sends the Waiver form with the reason typed in, if it has one.
+    fn submit_waiver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let reason = self.waiver_reason.read(cx).value().to_string();
+        if let Some(command) = self.run_pane.submit_waiver(&reason) {
+            self.send(command);
+            self.waiver_reason
+                .update(cx, |input, cx| input.set_value("", window, cx));
         }
         cx.notify();
     }
@@ -619,8 +650,27 @@ impl MainView {
                                         this.send(retry.clone());
                                     })),
                             )
+                        })
+                        .when(self.run_pane.can_waive(&step.info.id), |this| {
+                            let target = WaiveTarget::Step(step.info.id.clone());
+                            this.child(
+                                Button::new(SharedString::from(format!("waive-{}", step.info.id)))
+                                    .label("Waive")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.run_pane.start_waiver(target.clone());
+                                        cx.notify();
+                                    })),
+                            )
                         }),
-                );
+                )
+                .children(waiver_line(step).map(|line| {
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(line)
+                }));
             if let slopwatch_protocol::StepStatus::Settled { outputs, .. } = &step.status {
                 for finding in &outputs.findings {
                     row = row.child(
@@ -644,23 +694,108 @@ impl MainView {
                 .px_3()
                 .py_2()
                 .text_sm()
+                .items_center()
+                .gap_2()
                 .child(format!("Gate {}", view.gate_text))
                 .child(
                     div()
-                        .text_color(color(gate_tone(gate)))
-                        .child(gate.to_string()),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(self.run_pane.can_override(), |this| {
+                            this.child(
+                                Button::new("override-gate")
+                                    .label("Override Gate")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.run_pane.start_waiver(WaiveTarget::Gate);
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_color(color(gate_tone(gate)))
+                                .child(gate.to_string()),
+                        ),
                 ),
         );
         pane = pane.child(steps);
+        if self.run_pane.waiver_form().is_some() {
+            pane = pane.child(self.waiver_form(cx));
+        }
         if let Some(end) = view.end {
             pane = pane.child(
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(format!("Ended: {end}")),
+                    .child(format!("Ended: {}", end_label(end, view.waived))),
             );
         }
         pane
+    }
+
+    /// The Waiver being filled in: a category, a reason, and the buttons
+    /// that send or drop it. On an ended Run, sending starts a new Run on
+    /// the same SHA.
+    fn waiver_form(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let Some(form) = self.run_pane.waiver_form() else {
+            return div();
+        };
+        let title = match &form.target {
+            WaiveTarget::Step(step) => format!("Waive `{step}` for this head SHA"),
+            WaiveTarget::Gate => "Override the Gate: waive every failing term".to_owned(),
+        };
+        let mut categories = div().flex().flex_wrap().gap_1();
+        for category in WaiverCategory::ALL {
+            categories = categories.child(
+                Button::new(SharedString::from(format!("waiver-category-{category:?}")))
+                    .label(category.to_string())
+                    .small()
+                    .when(form.category == category, |button| button.primary())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.run_pane.pick_category(category);
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .child(div().text_sm().child(title))
+            .child(categories)
+            .child(Input::new(&self.waiver_reason).small())
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("waiver-submit")
+                            .label("Waive")
+                            .small()
+                            .primary()
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.submit_waiver(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("waiver-cancel")
+                            .label("Cancel")
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.run_pane.cancel_waiver();
+                                cx.notify();
+                            })),
+                    ),
+            )
     }
 
     /// The open Step row's last lines, with the way into its full log.

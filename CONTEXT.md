@@ -71,8 +71,8 @@ The one-word part of an Outcome. The Step reports pass, fail or inconclusive. Th
 _Avoid_: status, conclusion
 
 **Waiver**:
-The developer's ruling that one Step's settled, non-pass Verdict counts as pass for one head SHA. It carries a category (false positive, doesn't apply, accepted risk, fix in follow-up) and a reason.
-_Avoid_: override, exception, skip
+The developer's ruling that one Step's settled, non-pass Verdict counts as pass for one head SHA. It carries a category (false positive, doesn't apply, accepted risk, fix in follow-up) and a reason. Overriding the Gate is one action that waives every Step behind a failing Gate term, and a Run whose Gate passes only through Waivers reads "shippable (waived)".
+_Avoid_: override (for a single Step), exception, skip
 
 **Finding**:
 One specific problem a Step reports about the PR, with a severity and optionally a file and line. Later Steps, such as Fix, read the Findings of the Steps upstream of them.
