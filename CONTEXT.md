@@ -63,7 +63,7 @@ _Avoid_: run group, timeline
 ### Outcomes
 
 **Outcome**:
-What one Step reports for one Run: a Verdict plus named outputs such as Findings, a probability or a note. It belongs to the Run's head SHA and the Step's settings, so a later Run on the same SHA reuses it unless its Verdict was error, cancelled or missing, or the Step's settings or Plugin version have changed.
+What one Step reports for one Run: a Verdict plus named outputs such as Findings, a probability or a note. It belongs to the Run's head SHA and the Step's settings, so a later Run on the same SHA reuses it unless its Verdict was error, cancelled, missing or skipped, or the Step's settings or Plugin version have changed. A skip is decided again because it depends on the rest of the Run.
 _Avoid_: result, status
 
 **Verdict**:

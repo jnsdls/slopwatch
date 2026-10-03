@@ -6,6 +6,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::pipeline::Step;
+use crate::verdict::Verdict;
+
+impl Verdict {
+    /// Whether a later Run with the same [`ReuseKey`] may take this
+    /// Outcome instead of running the Step: only when the Step reported
+    /// it. Error, cancelled and missing say the Step didn't finish, and a
+    /// skip depends on the rest of its Run.
+    pub fn reusable(self) -> bool {
+        matches!(self, Verdict::Pass | Verdict::Fail | Verdict::Inconclusive)
+    }
+}
 
 /// An Outcome is reused only by a Step with the same key: same head SHA,
 /// Pipeline id, resolved config and Plugin version.

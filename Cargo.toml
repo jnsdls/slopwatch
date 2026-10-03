@@ -36,3 +36,8 @@ tungstenite = "0.30"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# The daemon hashes its own executable for the built-in Plugins' reuse
+# version, which takes seconds unoptimized.
+[profile.dev.package.sha2]
+opt-level = 3

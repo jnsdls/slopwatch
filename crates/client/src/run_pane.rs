@@ -148,11 +148,16 @@ pub fn step_line(step: &StepView) -> String {
             verdict,
             reason,
             outputs,
+            reused_from,
         } => {
             let detail = reason.as_ref().or(outputs.note.as_ref());
-            match detail {
+            let line = match detail {
                 Some(detail) => format!("{verdict}: {detail}"),
                 None => verdict.to_string(),
+            };
+            match reused_from {
+                Some(run) => format!("{line} (reused from Run {run})"),
+                None => line,
             }
         }
     }
@@ -340,8 +345,26 @@ mod tests {
                 verdict: Verdict::Cancelled,
                 reason: Some("the Run ended superseded".into()),
                 outputs: Outputs::default(),
+                reused_from: None,
             },
         };
         assert_eq!(step_line(&step), "cancelled: the Run ended superseded");
+
+        let reused = StepView {
+            status: StepStatus::Settled {
+                verdict: Verdict::Pass,
+                reason: None,
+                outputs: Outputs {
+                    note: Some("1 check passed".into()),
+                    ..Outputs::default()
+                },
+                reused_from: Some(RunId(3)),
+            },
+            ..step
+        };
+        assert_eq!(
+            step_line(&reused),
+            "pass: 1 check passed (reused from Run 3)"
+        );
     }
 }
