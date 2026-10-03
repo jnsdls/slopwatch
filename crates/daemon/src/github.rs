@@ -93,6 +93,7 @@ pub trait GitHub: Send + Sync {
 /// What became of a merge GitHub accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Merged {
+    /// GitHub merged the PR, now or on an earlier call.
     Merged,
     /// The base's merge queue has it.
     Enqueued,

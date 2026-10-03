@@ -352,6 +352,7 @@ pub enum MergeStatus {
     Blocked,
     /// Conflicts with the base.
     Dirty,
+    /// The PR is a draft.
     Draft,
     /// GitHub hasn't worked it out yet.
     #[default]

@@ -519,6 +519,7 @@ struct MergeAnswer {
     details: MergeDetails,
 }
 
+/// Why a merge failed, or the id to ask after a pending one with.
 #[derive(Deserialize)]
 struct MergeDetails {
     #[serde(default)]

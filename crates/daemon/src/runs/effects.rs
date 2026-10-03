@@ -22,11 +22,11 @@
 use std::sync::Arc;
 
 use slopwatch_core::GateState;
-use slopwatch_protocol::step::{CheckState, Effect, EffectResult, ToStep};
+use slopwatch_protocol::step::{CheckState, Effect, EffectKind, EffectResult, ToStep};
 use slopwatch_protocol::{RunEvent, RunId};
 
 use super::{Engine, Input, PrKey};
-use crate::github::{GitHub, Merged, WATCH_LABEL};
+use crate::github::{GitHub, GitHubError, Merged, WATCH_LABEL};
 use crate::store::{EffectRow, NewEffect, StoreError};
 
 /// How many rebase-started Runs in a row a PR gets before the daemon
@@ -45,6 +45,7 @@ pub(super) struct Finished {
     run: RunId,
     step: String,
     request: String,
+    kind: EffectKind,
     result: EffectResult,
 }
 
@@ -250,6 +251,15 @@ impl Engine {
             return;
         };
         let run = self.active.get_mut(&key).expect("found above");
+        if finished.kind == EffectKind::Merge {
+            // A merge state read before GitHub took the merge could show
+            // the PR outside the queue it's now in. Only one read after
+            // this counts, and the Step hears it even if nothing changed.
+            run.merge_epoch += 1;
+            if let Some(snapshot) = run.snapshot.as_mut() {
+                snapshot.merge = None;
+            }
+        }
         if let Some(running) = run.running.get_mut(&finished.step)
             && running.awaiting.remove(&finished.request)
         {
@@ -287,6 +297,7 @@ impl Engine {
                 run: row.run,
                 step: row.step,
                 request: row.request,
+                kind: row.effect.kind(),
                 result,
             }));
         });
@@ -317,37 +328,33 @@ async fn perform(github: &dyn GitHub, row: &EffectRow, call: Call) -> EffectResu
             };
         }
     }
-    let done = match &row.effect {
+    let done = |called: Result<(), GitHubError>| called.map(|()| EffectResult::Done);
+    let result = match &row.effect {
         Effect::Comment { body } => {
             let body = format!("{body}\n\n{}", marker(row.id));
-            github.comment(&row.repo, row.number, &body).await
+            done(github.comment(&row.repo, row.number, &body).await)
         }
         Effect::Label { name, remove } => {
-            github.set_label(&row.repo, row.number, name, !remove).await
+            done(github.set_label(&row.repo, row.number, name, !remove).await)
         }
-        Effect::Rerun { job, .. } => github.rerun_job(&row.repo, *job).await,
+        Effect::Rerun { job, .. } => done(github.rerun_job(&row.repo, *job).await),
         // Both carry the head the Run judged, so GitHub refuses them once
         // the PR has moved on.
-        Effect::Rebase { method } => {
+        Effect::Rebase { method } => done(
             github
                 .update_branch(&row.repo, row.number, &row.head_sha, *method)
-                .await
-        }
-        Effect::Merge { method } => {
-            return match github
-                .merge(&row.repo, row.number, &row.head_sha, *method)
-                .await
-            {
-                Ok(Merged::Merged) => EffectResult::Done,
-                Ok(Merged::Enqueued) => EffectResult::Enqueued,
-                Err(error) => EffectResult::Failed {
-                    reason: error.to_string(),
-                },
-            };
-        }
+                .await,
+        ),
+        Effect::Merge { method } => github
+            .merge(&row.repo, row.number, &row.head_sha, *method)
+            .await
+            .map(|merged| match merged {
+                Merged::Merged => EffectResult::Done,
+                Merged::Enqueued => EffectResult::Enqueued,
+            }),
     };
-    match done {
-        Ok(()) => EffectResult::Done,
+    match result {
+        Ok(result) => result,
         Err(error) => EffectResult::Failed {
             reason: error.to_string(),
         },

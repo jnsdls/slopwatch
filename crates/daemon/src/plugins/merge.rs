@@ -87,10 +87,27 @@ pub enum Next {
 #[derive(Debug, Default)]
 pub struct Merge {
     config: Config,
-    /// The Effect it asked for, and the daemon's answer once it came.
-    asked: Option<(EffectKind, Option<EffectResult>)>,
-    /// The PR showed up in the merge queue after Merge enqueued it.
-    seen_in_queue: bool,
+    asked: Option<Asked>,
+    /// The merge queue took the PR, and no snapshot has come since. The
+    /// merge state in hand was read before, so it can't tell an ejection
+    /// from a PR the queue hadn't taken yet.
+    stale_after_enqueue: bool,
+}
+
+/// The Effect a session asked for, with the daemon's answer once it came.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Asked {
+    Rebase(Option<EffectResult>),
+    Merge(Option<EffectResult>),
+}
+
+impl Asked {
+    fn request_id(&self) -> &'static str {
+        match self {
+            Asked::Rebase(_) => REBASE_REQUEST,
+            Asked::Merge(_) => MERGE_REQUEST,
+        }
+    }
 }
 
 impl Merge {
@@ -103,11 +120,24 @@ impl Merge {
 
     /// Notes what became of an Effect this session asked for.
     pub fn effect_result(&mut self, id: &str, result: &EffectResult) {
-        if let Some((kind, answer)) = &mut self.asked
-            && request_id(*kind) == id
-        {
-            *answer = Some(result.clone());
+        let Some(asked) = &mut self.asked else {
+            return;
+        };
+        if asked.request_id() != id {
+            return;
         }
+        if *result == EffectResult::Enqueued {
+            self.stale_after_enqueue = true;
+        }
+        match asked {
+            Asked::Rebase(answer) | Asked::Merge(answer) => *answer = Some(result.clone()),
+        }
+    }
+
+    /// Notes that a new snapshot came. After the merge queue took the PR,
+    /// the daemon sends the merge state it reads next, even unchanged.
+    pub fn snapshot_updated(&mut self) {
+        self.stale_after_enqueue = false;
     }
 
     pub fn judge(&mut self, snapshot: &PrSnapshot) -> Next {
@@ -117,19 +147,19 @@ impl Merge {
         }
         match &self.asked {
             None => self.decide(snapshot),
-            Some((EffectKind::Merge, None)) => Next::Wait("Merging".into()),
-            Some((EffectKind::Merge, Some(EffectResult::Done))) => Next::Report(pass("Merged")),
-            Some((EffectKind::Merge, Some(EffectResult::Enqueued))) => self.queued(state),
-            Some((EffectKind::Merge, Some(result))) => Next::Report(fail(format!(
+            Some(Asked::Merge(None)) => Next::Wait("Merging".into()),
+            Some(Asked::Merge(Some(EffectResult::Done))) => Next::Report(pass("Merged")),
+            Some(Asked::Merge(Some(EffectResult::Enqueued))) => self.queued(state),
+            Some(Asked::Merge(Some(result))) => Next::Report(fail(format!(
                 "GitHub didn't merge the PR: {}",
                 reason(result)
             ))),
-            Some((_, None)) => Next::Wait("Updating the branch with its base".into()),
+            Some(Asked::Rebase(None)) => Next::Wait("Updating the branch with its base".into()),
             // The push ends the Run, and the next one judges what it made.
-            Some((_, Some(EffectResult::Done))) => {
+            Some(Asked::Rebase(Some(EffectResult::Done))) => {
                 Next::Wait("Waiting for GitHub to push the updated branch".into())
             }
-            Some((_, Some(result))) => Next::Report(fail(format!(
+            Some(Asked::Rebase(Some(result))) => Next::Report(fail(format!(
                 "Couldn't update the branch with its base `{}`: {}",
                 snapshot.base,
                 reason(result)
@@ -167,7 +197,7 @@ impl Merge {
             } else {
                 UpdateMethod::Rebase
             });
-            self.asked = Some((EffectKind::Rebase, None));
+            self.asked = Some(Asked::Rebase(None));
             return Next::Ask(REBASE_REQUEST, Effect::Rebase { method });
         }
         match state.status {
@@ -204,32 +234,21 @@ impl Merge {
             }
             Some(method)
         };
-        self.asked = Some((EffectKind::Merge, None));
+        self.asked = Some(Asked::Merge(None));
         Next::Ask(MERGE_REQUEST, Effect::Merge { method })
     }
 
     /// A PR the merge queue took: it waits for GitHub to merge it, and a
     /// PR the queue drops again fails.
-    fn queued(&mut self, state: Option<&MergeState>) -> Next {
+    fn queued(&self, state: Option<&MergeState>) -> Next {
         match state {
-            Some(state) if state.in_merge_queue => {
-                self.seen_in_queue = true;
-                Next::Wait("In the merge queue".into())
-            }
-            // An answer read before the queue took the PR doesn't show it
-            // yet, so only a PR seen in the queue can have left it.
-            Some(_) if self.seen_in_queue => Next::Report(fail(
+            _ if self.stale_after_enqueue => Next::Wait("Waiting for the merge queue".into()),
+            Some(state) if state.in_merge_queue => Next::Wait("In the merge queue".into()),
+            Some(_) => Next::Report(fail(
                 "The merge queue removed the PR without merging it".into(),
             )),
-            _ => Next::Wait("Waiting for the merge queue".into()),
+            None => Next::Wait("Waiting for the merge queue".into()),
         }
-    }
-}
-
-fn request_id(kind: EffectKind) -> &'static str {
-    match kind {
-        EffectKind::Merge => MERGE_REQUEST,
-        _ => REBASE_REQUEST,
     }
 }
 
@@ -292,7 +311,12 @@ pub fn run(input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
                 }
                 snapshot = Some(start.snapshot);
             }
-            Ok(ToStep::PrUpdated { snapshot: update }) => snapshot = Some(update),
+            Ok(ToStep::PrUpdated { snapshot: update }) => {
+                if let Some(merge) = &mut merge {
+                    merge.snapshot_updated();
+                }
+                snapshot = Some(update);
+            }
             Ok(ToStep::EffectResult { id, result }) => {
                 if let Some(merge) = &mut merge {
                     merge.effect_result(&id, &result);
@@ -536,6 +560,7 @@ mod tests {
             matches!(merge.judge(&snapshot(Some(queue.clone()))), Next::Wait(_)),
             "a merge state read before the queue took it"
         );
+        merge.snapshot_updated();
         let in_queue = MergeState {
             in_merge_queue: true,
             ..queue.clone()

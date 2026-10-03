@@ -301,10 +301,7 @@ fn a_pr_the_merge_queue_ejects_fails_merge_and_ends_not_shippable() {
             world.github.is_in_merge_queue(&repo(), 1)
         })
         .await;
-        // Let Merge see it in the queue.
-        for _ in 0..5 {
-            daemon.poll().await.unwrap();
-        }
+        // The queue drops it before any merge state shows it queued.
         world.github.eject_from_queue(&repo(), 1);
         assert_eq!(world.end(daemon, run).await, EndReason::NotShippable);
     });

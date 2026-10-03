@@ -69,7 +69,7 @@ use slopwatch_protocol::{
 use tokio::sync::mpsc;
 
 use crate::clones::{Clones, PipelineAt};
-use crate::github::{GitHub, OpenPr};
+use crate::github::{GitHub, GitHubError, OpenPr};
 use crate::inbox::Inbox;
 use crate::plugins::Plugins;
 use crate::shell_env;
@@ -96,8 +96,18 @@ const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60)
 
 type PrKey = (RepoName, u64);
 
-/// What GitHub said about merging each PR, with the head SHA it compared.
-type MergeStates = HashMap<PrKey, (String, MergeState)>;
+/// What GitHub said about merging each PR, and which read it answered.
+/// `None` means GitHub has no such PR anymore.
+type MergeStates = HashMap<PrKey, (MergeRead, Option<MergeState>)>;
+
+/// A read of a PR's merge state, as the sync asks for it. A Run takes the
+/// answer only if it still judges `head_sha`, and if no merge it asked for
+/// finished while the read was out, which bumps its `merge_epoch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeRead {
+    head_sha: String,
+    epoch: u64,
+}
 
 pub struct Runs {
     engine: tokio::sync::Mutex<Engine>,
@@ -255,12 +265,16 @@ impl Runs {
             if !engine.watching.fresh() {
                 return;
             }
-            engine.merge_states_wanted(&engine.watching.prs())
+            // The same PRs go to the sync below, so a poll in between
+            // can't show a PR gone that the merge states saw open.
+            let prs = engine.watching.prs();
+            let wanted = engine.merge_states_wanted(&prs);
+            (prs, wanted)
         };
+        let (prs, wanted) = wanted;
         let merge_states = self.read_merge_states(wanted).await;
         let starts = {
             let mut engine = self.engine.lock().await;
-            let prs = engine.watching.prs();
             let starts = engine.sync(prs, merge_states);
             engine.schedule();
             starts
@@ -277,14 +291,17 @@ impl Runs {
     }
 
     /// Asks GitHub where each PR stands for merging, at the head its Run
-    /// judges. One that can't be read is left out, and the next sync asks
-    /// again.
-    async fn read_merge_states(&self, wanted: Vec<(PrKey, String)>) -> MergeStates {
+    /// judges. A PR GitHub can't find reads as `None`. One that can't be
+    /// read for another reason is left out, and the next sync asks again.
+    async fn read_merge_states(&self, wanted: Vec<(PrKey, MergeRead)>) -> MergeStates {
         let mut states = HashMap::new();
-        for ((repo, number), head_sha) in wanted {
-            match self.github.merge_state(&repo, number, &head_sha).await {
+        for ((repo, number), read) in wanted {
+            match self.github.merge_state(&repo, number, &read.head_sha).await {
                 Ok(state) => {
-                    states.insert((repo, number), (head_sha, state));
+                    states.insert((repo, number), (read, Some(state)));
+                }
+                Err(GitHubError::NotFound(_)) => {
+                    states.insert((repo, number), (read, None));
                 }
                 Err(error) => {
                     eprintln!("slopwatchd: can't read {repo}#{number}'s merge state: {error}");
@@ -633,6 +650,19 @@ struct Active {
     /// GitHub merged the PR after the Run asked it to, and the PR has left
     /// the poll. The Run ends merged once its Steps settle.
     merged: bool,
+    /// How many merges the Run asked for have finished. A merge state
+    /// read before the latest one doesn't count (see [`MergeRead`]).
+    merge_epoch: u64,
+}
+
+impl Active {
+    /// The merge state read this Run would take now.
+    fn merge_read(&self) -> MergeRead {
+        MergeRead {
+            head_sha: self.head_sha.clone(),
+            epoch: self.merge_epoch,
+        }
+    }
 }
 
 /// What a developer's Waiver covers.
@@ -789,6 +819,7 @@ impl Engine {
                 interrupted: BTreeMap::new(),
                 rerun: HashSet::new(),
                 merged: false,
+                merge_epoch: 0,
             };
             active.state.waived =
                 self.store
@@ -903,7 +934,7 @@ impl Engine {
     /// their Run judges: those with a running Step that reads it, and those
     /// that left the poll after their Run asked to merge them, which may
     /// mean GitHub merged them.
-    fn merge_states_wanted(&self, prs: &[(RepoName, OpenPr)]) -> Vec<(PrKey, String)> {
+    fn merge_states_wanted(&self, prs: &[(RepoName, OpenPr)]) -> Vec<(PrKey, MergeRead)> {
         let open: HashSet<PrKey> = prs
             .iter()
             .map(|(repo, pr)| (repo.clone(), pr.number))
@@ -926,7 +957,7 @@ impl Engine {
                         false
                     })
             })
-            .map(|(key, run)| (key.clone(), run.head_sha.clone()))
+            .map(|(key, run)| (key.clone(), run.merge_read()))
             .collect()
     }
 
@@ -954,10 +985,13 @@ impl Engine {
                 // GitHub merged it, and the Run ends once its Steps settle.
                 None if run.merged => continue,
                 None => match merge_states.get(&key) {
-                    Some((_, state)) if state.merged => {
+                    Some((_, Some(state))) if state.merged => {
                         self.merged_on_github(&key, state)?;
                         continue;
                     }
+                    // A merge finished while the read was out, so its
+                    // "not merged" may predate the merge.
+                    Some((read, _)) if read.epoch != run.merge_epoch => continue,
                     Some(_) => Some(EndReason::Closed),
                     // The Run asked to merge it, but GitHub couldn't say
                     // whether it did. The next sync asks again.
@@ -989,7 +1023,7 @@ impl Engine {
             // A merge state read this time replaces the last one, which
             // stays until then.
             snapshot.merge = match merge_states.get(&key) {
-                Some((head_sha, state)) if *head_sha == run.head_sha => Some(state.clone()),
+                Some((read, Some(state))) if *read == run.merge_read() => Some(state.clone()),
                 _ => run.snapshot.as_ref().and_then(|last| last.merge.clone()),
             };
             if run.snapshot.as_ref() == Some(&snapshot) {
@@ -1254,6 +1288,7 @@ impl Engine {
                 interrupted: BTreeMap::new(),
                 rerun: HashSet::new(),
                 merged: false,
+                merge_epoch: 0,
             },
         );
         for (step, waiver) in self.store.waivers(repo, pr.number, &pr.head_sha)? {
@@ -2110,16 +2145,19 @@ fn end_reason(run: &Active) -> EndReason {
     if run.merged || merge_verdicts().any(|verdict| verdict == Verdict::Pass) {
         return EndReason::Merged;
     }
-    let landing_failed = merge_verdicts().any(|verdict| {
-        matches!(
-            verdict,
-            Verdict::Fail | Verdict::Error | Verdict::Cancelled | Verdict::Missing
-        )
-    });
     match run.gate {
-        GateState::Pass if !landing_failed => EndReason::Shippable,
+        GateState::Pass if !merge_verdicts().any(failed_to_land) => EndReason::Shippable,
         _ => EndReason::NotShippable,
     }
+}
+
+/// Whether a Merge Step that settled `verdict` tried to land the PR and
+/// couldn't. A skip, or an inconclusive draft, didn't try.
+fn failed_to_land(verdict: Verdict) -> bool {
+    matches!(
+        verdict,
+        Verdict::Fail | Verdict::Error | Verdict::Cancelled | Verdict::Missing
+    )
 }
 
 /// Where a Run's Step logs live.
@@ -2213,10 +2251,7 @@ fn couldnt_merge(run: &Active) -> Option<Vec<String>> {
             let Some(StepState::Settled(verdict)) = run.state.steps.get(id) else {
                 return None;
             };
-            if matches!(
-                verdict,
-                Verdict::Pass | Verdict::Skipped | Verdict::Inconclusive
-            ) {
+            if !failed_to_land(*verdict) {
                 return None;
             }
             let finding = run
