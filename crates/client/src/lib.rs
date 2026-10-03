@@ -1,6 +1,8 @@
 //! The slopwatch GUI.
 
 pub mod agent;
+pub mod dock;
+pub mod inbox;
 pub mod library;
 pub mod library_view;
 pub mod link;

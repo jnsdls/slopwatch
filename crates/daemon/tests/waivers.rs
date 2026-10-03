@@ -204,6 +204,8 @@ impl Client {
                 WatchedPrsUpdate::Snapshot(snapshot) => self.prs = snapshot,
                 WatchedPrsUpdate::Delta(delta) => self.prs.apply(delta),
             },
+            // These tests don't subscribe to the Inbox.
+            TopicUpdate::Inbox { .. } => {}
             TopicUpdate::Run { id, seq, event, .. } => {
                 self.runs.entry(id).or_default().apply(seq, event);
             }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use slopwatch_core::{EndReason, GateState, Verdict, WaiverCategory};
 
 use crate::step::{Effect, EffectResult, Outputs};
-use crate::{Actor, RepoName};
+use crate::{Actor, InboxEntry, RepoName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -98,8 +98,15 @@ pub enum RunEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         waived: bool,
     },
+    /// An Inbox entry that touched the Run opened, changed or closed. It
+    /// replaces an earlier one with the same id, and may come after
+    /// `ended`: a PR entry the Run's end raised closes later.
+    Inbox {
+        entry: InboxEntry,
+    },
     /// The Run's detail is gone: its Step logs, and every journal event
-    /// except the ones that rebuild its record. Always the last event.
+    /// except the ones that rebuild its record. Only `inbox` events come
+    /// after it, for an entry that closes later.
     Pruned {
         /// Seconds since the Unix epoch.
         at: i64,
@@ -147,6 +154,8 @@ pub struct RunView {
     pub pruned_at: Option<i64>,
     /// The Run ended shippable only because of Waivers.
     pub waived: bool,
+    /// The Inbox entries that touched the Run, oldest first.
+    pub inbox: Vec<InboxEntry>,
     /// Every Effect the Run's Steps requested, in the order they finished.
     pub effects: Vec<EffectView>,
 }
@@ -272,6 +281,12 @@ impl RunView {
             RunEvent::Ended { reason, waived } => {
                 self.end = Some(reason);
                 self.waived = waived;
+            }
+            RunEvent::Inbox { entry } => {
+                match self.inbox.binary_search_by(|known| known.id.cmp(&entry.id)) {
+                    Ok(index) => self.inbox[index] = entry,
+                    Err(index) => self.inbox.insert(index, entry),
+                }
             }
         }
     }
@@ -450,6 +465,38 @@ mod tests {
                 reason: EndReason::Shippable,
                 waived: false,
             }
+        );
+    }
+
+    #[test]
+    fn inbox_events_keep_each_entry_that_touched_the_run_in_its_last_state() {
+        use crate::{Closed, Closing, EntryId, PrRef, Scope};
+        let entry = |id: u64, closed: Option<Closing>| RunEvent::Inbox {
+            entry: InboxEntry {
+                id: EntryId(id),
+                scope: Scope::Pr,
+                title: "Not shippable".into(),
+                reasons: vec![],
+                prs: vec![PrRef {
+                    repo: RepoName::new("o", "r"),
+                    number: 7,
+                }],
+                raised_at: 1,
+                closed: closed.map(|how| Closed { at: 2, how }),
+            },
+        };
+        let mut view = RunView::default();
+        view.apply(1, started());
+        view.apply(2, entry(4, None));
+        view.apply(3, entry(3, None));
+        view.apply(4, entry(4, Some(Closing::NextRunStarted)));
+
+        let ids: Vec<u64> = view.inbox.iter().map(|entry| entry.id.0).collect();
+        assert_eq!(ids, [3, 4], "oldest first");
+        assert!(view.inbox[0].closed.is_none());
+        assert_eq!(
+            view.inbox[1].closed.as_ref().map(|closed| &closed.how),
+            Some(&Closing::NextRunStarted)
         );
     }
 

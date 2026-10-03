@@ -18,6 +18,7 @@ pub mod clones;
 mod connection;
 mod data_dir;
 pub mod github;
+pub mod inbox;
 mod library;
 mod pace;
 pub mod plugins;

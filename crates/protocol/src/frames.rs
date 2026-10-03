@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use slopwatch_core::WaiverCategory;
 
 use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
-use crate::{RepoName, RunId, Topic, TopicUpdate};
+use crate::{EntryId, RepoName, RunId, Topic, TopicUpdate};
 
 /// A frame a client sends to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +218,12 @@ pub enum Command {
         run: RunId,
         category: WaiverCategory,
         reason: String,
+    },
+    /// Closes an open PR entry in the Inbox without acting on it. The PR's
+    /// End reason stays as it is. Run and cause entries can't be
+    /// dismissed.
+    DismissEntry {
+        entry: EntryId,
     },
 }
 

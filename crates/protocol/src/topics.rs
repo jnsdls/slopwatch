@@ -6,16 +6,19 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::inbox::InboxUpdate;
 use crate::logs::{LogKey, LogRecord, StorageWarning};
 use crate::runs::{RunEvent, RunId, RunSummary};
 
-/// A topic, by its name on the wire: `watched_prs`, `run/<id>` or
+/// A topic, by its name on the wire: `watched_prs`, `inbox`, `run/<id>` or
 /// `log/<run>/<step>/<attempt>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Topic {
     /// Added repos, the developer's open PRs in them, and which are watched.
     WatchedPrs,
+    /// The open Escalations, oldest first.
+    Inbox,
     /// One Run's event journal.
     Run(RunId),
     /// One attempt's Step log, as it's written.
@@ -26,6 +29,7 @@ impl fmt::Display for Topic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Topic::WatchedPrs => f.write_str("watched_prs"),
+            Topic::Inbox => f.write_str("inbox"),
             Topic::Run(id) => write!(f, "run/{id}"),
             Topic::StepLog(key) => write!(f, "log/{key}"),
         }
@@ -36,8 +40,10 @@ impl TryFrom<String> for Topic {
     type Error = String;
 
     fn try_from(text: String) -> Result<Self, Self::Error> {
-        if text == "watched_prs" {
-            return Ok(Topic::WatchedPrs);
+        match text.as_str() {
+            "watched_prs" => return Ok(Topic::WatchedPrs),
+            "inbox" => return Ok(Topic::Inbox),
+            _ => {}
         }
         if let Some(key) = text.strip_prefix("log/").and_then(LogKey::parse) {
             return Ok(Topic::StepLog(key));
@@ -65,6 +71,8 @@ pub enum TopicUpdate {
         seq: u64,
         update: WatchedPrsUpdate,
     },
+    /// Like `watched_prs`: a snapshot, then deltas.
+    Inbox { seq: u64, update: InboxUpdate },
     /// One event from a Run's journal. A Run topic has no snapshot: its
     /// events from sequence number 1 are the whole Run.
     Run {
@@ -332,7 +340,11 @@ mod tests {
             serde_json::from_value::<Topic>(json!("log/12/ci/1")).unwrap(),
             log
         );
-        assert!(serde_json::from_value::<Topic>(json!("inbox")).is_err());
+        assert_eq!(
+            serde_json::from_value::<Topic>(json!("inbox")).unwrap(),
+            Topic::Inbox
+        );
+        assert!(serde_json::from_value::<Topic>(json!("outbox")).is_err());
     }
 
     #[test]
