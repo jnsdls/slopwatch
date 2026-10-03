@@ -6,15 +6,16 @@
 //! New collections are written in flow style (`{ uses: ci, needs: [a] }`),
 //! the shape the reference Pipeline uses, one line per Step.
 //!
-//! `yaml-edit` 0.3.2 parses losslessly, but some of its mutations damage
-//! lines next to the edit: removing a block entry eats the blank line and
-//! indentation after it, removing a block sequence item pulls the comment
-//! above it onto the previous item's line, removing the last item of a flow
-//! sequence leaves a stray comma that a later insert turns into `[a, , b]`,
-//! and appending to a flow mapping writes `{ a: b , c: d}`. The editor makes
-//! those edits itself, as splices of the text at the byte ranges `yaml-edit`
-//! reports, and leaves the rest to `yaml-edit`. A `yaml-edit` release that
-//! fixes them lets [`remove`] and [`append_to_flow`] go, if the suite agrees.
+//! `yaml-edit` reads the file into a lossless tree, and the editor finds the
+//! nodes to change there. It then writes each edit itself, as a splice of the
+//! text at the byte ranges the tree reports, rather than through `yaml-edit`'s
+//! own mutations. In 0.3.2 those damage the lines around an edit next to a
+//! blank line or a comment: removing or appending a block entry eats the
+//! blank line and unindents the comment after it, replacing a block value
+//! does the same, removing a sequence item pulls the comment above it onto
+//! the previous line, and removing the last flow item leaves a comma that a
+//! later insert turns into `[a, , b]`. A release that fixes them could take
+//! the splices back, if this suite agrees.
 //!
 //! [`load`]: crate::load
 
@@ -23,7 +24,7 @@ use std::str::FromStr;
 
 use rowan::ast::AstNode;
 use serde_json::{Map, Value};
-use yaml_edit::{Document, Lang, Mapping, Sequence, SyntaxKind, YamlFile, YamlNode};
+use yaml_edit::{Lang, Mapping, Sequence, SyntaxKind, YamlFile, YamlNode};
 
 use crate::pipeline::GATE;
 
@@ -62,12 +63,12 @@ pub enum Edit {
         step: String,
         key: String,
     },
-    /// Appends an edge to a Step's `needs`, creating `needs:` if needed.
+    /// Appends to a Step's `needs`, creating `needs:` if needed.
     AddNeed {
         step: String,
         need: String,
     },
-    /// Removes an edge from a Step's `needs`, or `needs:` itself if it was
+    /// Removes one entry from a Step's `needs`, or `needs:` itself if it was
     /// the last.
     RemoveNeed {
         step: String,
@@ -100,6 +101,8 @@ pub enum EditError {
     UnknownStep(String),
     #[error("Step `{0}` is already in the Pipeline")]
     StepExists(String),
+    #[error("Step `{0}` isn't a mapping of keys, so the editor can't change it")]
+    StepNotMapping(String),
     #[error("Step `{step}` writes `{key}` in a shape the editor can't change")]
     StepShape { step: String, key: String },
     #[error("Step `{step}` has no `{key}`")]
@@ -127,89 +130,90 @@ fn apply(text: &str, edit: &Edit) -> Result<String, EditError> {
         .next()
         .and_then(|doc| doc.as_mapping())
         .ok_or(EditError::Shape("top-level mapping"))?;
-    // A mutation through `yaml-edit` changes `file`; a splice returns early.
-    match edit {
+    let edited = match edit {
         Edit::AddStep { id, step } => {
             let steps = steps(&root)?;
             if steps.contains_key(id.as_str()) {
                 return Err(EditError::StepExists(id.clone()));
             }
-            return Ok(set(text, &steps, id, parse(&step_flow(step))));
+            set(text, &steps, id, &new_step_yaml(step))
         }
-        Edit::RemoveStep { id } => {
-            let steps = steps(&root)?;
-            return remove_key(text, &steps, id).ok_or_else(|| EditError::UnknownStep(id.clone()));
-        }
+        Edit::RemoveStep { id } => remove_key(text, &steps(&root)?, id)
+            .ok_or_else(|| EditError::UnknownStep(id.clone()))?,
         Edit::SetKey { step, key, value } => {
-            return Ok(set(text, &step_mapping(&root, step)?, key, node(value)));
+            set(text, &step_mapping(&root, step)?, key, &flow_style(value))
         }
-        Edit::RemoveKey { step, key } => {
-            return remove_key(text, &step_mapping(&root, step)?, key)
-                .ok_or_else(|| unknown_key(step, key));
-        }
+        Edit::RemoveKey { step, key } => remove_key(text, &step_mapping(&root, step)?, key)
+            .ok_or_else(|| unknown_key(step, key))?,
         Edit::SetWith { step, key, value } => {
-            let node_ = step_mapping(&root, step)?;
-            return Ok(match child_mapping(&node_, step, "with")? {
-                Some(with) => set(text, &with, key, node(value)),
+            let step_node = step_mapping(&root, step)?;
+            match child_mapping(&step_node, step, "with")? {
+                Some(with) => set(text, &with, key, &flow_style(value)),
                 None => {
                     let with = Map::from_iter([(key.clone(), value.clone())]);
-                    set(text, &node_, "with", node(&Value::Object(with)))
+                    set(text, &step_node, "with", &flow_style(&Value::Object(with)))
                 }
-            });
+            }
         }
         Edit::RemoveWith { step, key } => {
-            let node_ = step_mapping(&root, step)?;
-            let with = child_mapping(&node_, step, "with")?
+            let step_node = step_mapping(&root, step)?;
+            let with = child_mapping(&step_node, step, "with")?
                 .filter(|with| with.contains_key(key.as_str()))
                 .ok_or_else(|| unknown_key(step, &format!("with.{key}")))?;
-            return Ok(if with.len() == 1 {
-                remove_key(text, &node_, "with")
+            if with.len() == 1 {
+                remove_key(text, &step_node, "with")
             } else {
                 remove_key(text, &with, key)
             }
-            .expect("the key is there"));
+            .expect("the key is there")
         }
         Edit::AddNeed { step, need } => {
-            let node_ = step_mapping(&root, step)?;
+            let step_node = step_mapping(&root, step)?;
             let need = Value::String(need.clone());
-            return Ok(match child_sequence(&node_, step, "needs")? {
+            match child_sequence(&step_node, step, "needs")? {
                 Some(needs) => push(text, &needs, &need),
-                None => set(text, &node_, "needs", node(&Value::Array(vec![need]))),
-            });
+                None => set(
+                    text,
+                    &step_node,
+                    "needs",
+                    &flow_style(&Value::Array(vec![need])),
+                ),
+            }
         }
         Edit::RemoveNeed { step, need } => {
-            let node_ = step_mapping(&root, step)?;
+            let step_node = step_mapping(&root, step)?;
             let unknown = || EditError::UnknownNeed {
                 step: step.clone(),
                 need: need.clone(),
             };
-            let needs = child_sequence(&node_, step, "needs")?.ok_or_else(unknown)?;
+            let needs = child_sequence(&step_node, step, "needs")?.ok_or_else(unknown)?;
             let index = needs
                 .values()
                 .position(|n| n.as_scalar().is_some_and(|s| s.as_string() == *need))
                 .ok_or_else(unknown)?;
-            return Ok(if needs.len() == 1 {
-                remove_key(text, &node_, "needs").expect("`needs` is there")
+            if needs.len() == 1 {
+                remove_key(text, &step_node, "needs").expect("`needs` is there")
             } else {
-                remove(
-                    text,
-                    &sequence_entries(&needs),
-                    index,
-                    needs.is_flow_style(),
-                )
-            });
-        }
-        Edit::AddGateTerm { term } => {
-            return Ok(match root.get(GATE) {
-                None => set(text, &root, GATE, node(&Value::Array(vec![term.clone()]))),
-                Some(YamlNode::Sequence(gate)) => push(text, &gate, term),
-                Some(_) => return Err(EditError::Shape(GATE)),
-            });
-        }
-        Edit::SetGateTerm { index, term } => {
-            if !gate(&root)?.set(*index, node(term)) {
-                return Err(EditError::UnknownGateTerm(*index));
+                let entries = sequence_entries(&needs);
+                remove(text, &entries, index, needs.is_flow_style())
             }
+        }
+        Edit::AddGateTerm { term } => match root.get(GATE) {
+            None => set(
+                text,
+                &root,
+                GATE,
+                &flow_style(&Value::Array(vec![term.clone()])),
+            ),
+            Some(YamlNode::Sequence(gate)) => push(text, &gate, term),
+            Some(_) => return Err(EditError::Shape(GATE)),
+        },
+        Edit::SetGateTerm { index, term } => {
+            let entries = sequence_entries(&gate(&root)?);
+            let entry = entries
+                .get(*index)
+                .ok_or(EditError::UnknownGateTerm(*index))?;
+            replace_value(text, entry, &flow_style(term))
         }
         Edit::RemoveGateTerm { index } => {
             let gate = gate(&root)?;
@@ -217,16 +221,14 @@ fn apply(text: &str, edit: &Edit) -> Result<String, EditError> {
             if *index >= entries.len() {
                 return Err(EditError::UnknownGateTerm(*index));
             }
-            return Ok(remove(text, &entries, *index, gate.is_flow_style()));
+            remove(text, &entries, *index, gate.is_flow_style())
         }
-        Edit::SetFixRounds(Some(rounds)) => {
-            return Ok(set(text, &root, "fix_rounds", parse(&rounds.to_string())));
-        }
+        Edit::SetFixRounds(Some(rounds)) => set(text, &root, "fix_rounds", &rounds.to_string()),
         Edit::SetFixRounds(None) => {
-            return Ok(remove_key(text, &root, "fix_rounds").unwrap_or_else(|| text.to_owned()));
+            remove_key(text, &root, "fix_rounds").unwrap_or_else(|| text.to_owned())
         }
-    }
-    Ok(file.to_string())
+    };
+    Ok(edited)
 }
 
 fn unknown_key(step: &str, key: &str) -> EditError {
@@ -247,10 +249,7 @@ fn gate(root: &Mapping) -> Result<Sequence, EditError> {
 fn step_mapping(root: &Mapping, step: &str) -> Result<Mapping, EditError> {
     match steps(root)?.get(step) {
         Some(YamlNode::Mapping(m)) => Ok(m),
-        Some(_) => Err(EditError::StepShape {
-            step: step.to_owned(),
-            key: step.to_owned(),
-        }),
+        Some(_) => Err(EditError::StepNotMapping(step.to_owned())),
         None => Err(EditError::UnknownStep(step.to_owned())),
     }
 }
@@ -277,35 +276,30 @@ fn child_sequence(parent: &Mapping, step: &str, key: &str) -> Result<Option<Sequ
     }
 }
 
-/// Sets `key` in `mapping`, replacing its value or appending it.
-fn set(text: &str, mapping: &Mapping, key: &str, value: YamlNode) -> String {
-    if mapping.is_flow_style() && !mapping.contains_key(key) {
-        let entry = format!("{}: {value}", string(key));
-        return append_to_flow(text, mapping.syntax(), &mapping_entries(mapping), &entry);
+/// Sets `key` in `mapping` to the YAML `value`, replacing its value or
+/// appending it.
+fn set(text: &str, mapping: &Mapping, key: &str, value: &str) -> String {
+    let entries = mapping_entries(mapping);
+    if let Some(index) = mapping.entries().position(|e| e.key_matches(key)) {
+        return replace_value(text, &entries[index], value);
     }
-    mapping.set(key, value);
-    root_text(mapping.syntax())
+    let entry = format!("{}: {value}", string(key));
+    if mapping.is_flow_style() {
+        append_to_flow_collection(text, mapping.syntax(), &entries, &entry)
+    } else {
+        append_to_block_collection(text, &entries, &entry)
+    }
 }
 
 /// Appends to `sequence`.
 fn push(text: &str, sequence: &Sequence, value: &Value) -> String {
+    let item = flow_style(value);
+    let entries = sequence_entries(sequence);
     if sequence.is_flow_style() {
-        return append_to_flow(
-            text,
-            sequence.syntax(),
-            &sequence_entries(sequence),
-            &flow(value),
-        );
+        append_to_flow_collection(text, sequence.syntax(), &entries, &item)
+    } else {
+        append_to_block_collection(text, &entries, &format!("- {item}"))
     }
-    // `push` adds a blank line and drops the final newline when the sequence
-    // ends the file; `insert` at the end doesn't.
-    sequence.insert(sequence.len(), node(value));
-    root_text(sequence.syntax())
-}
-
-/// The whole file's text, after a mutation through `yaml-edit`.
-fn root_text(node: &SyntaxNode) -> String {
-    node.ancestors().last().expect("a root").to_string()
 }
 
 /// Removes `key` from `mapping`, or returns `None` if it isn't there.
@@ -354,22 +348,7 @@ fn remove(text: &str, entries: &[SyntaxNode], index: usize, flow: bool) -> Strin
     let entry = range(&entries[index]);
     let cut = if !flow {
         let start = text[..entry.start].rfind('\n').map_or(0, |i| i + 1);
-        // A block entry's range can run on over the blank lines, comments
-        // and indentation before the next entry. It ends after its last line
-        // with content.
-        let mut end = entry.start;
-        let mut offset = entry.start;
-        for line in text[entry.clone()].split_inclusive('\n') {
-            offset += line.len();
-            let line = line.trim();
-            if !line.is_empty() && !line.starts_with('#') {
-                end = offset;
-            }
-        }
-        if !text[..end].ends_with('\n') {
-            end = text[end..].find('\n').map_or(text.len(), |i| end + i + 1);
-        }
-        start..end
+        start..block_entry_end(text, &entries[index])
     } else if index + 1 < entries.len() {
         entry.start..range(&entries[index + 1]).start
     } else if index > 0 {
@@ -380,8 +359,77 @@ fn remove(text: &str, entries: &[SyntaxNode], index: usize, flow: bool) -> Strin
     splice(text, cut, "")
 }
 
+/// Replaces the value of a mapping entry or sequence item with `value`. A
+/// value on the key's or dash's line is replaced where it stands. A block
+/// value on the lines below moves up next to it.
+fn replace_value(text: &str, entry: &SyntaxNode, value: &str) -> String {
+    let Some(indicator) = entry
+        .children_with_tokens()
+        .find(|c| matches!(c.kind(), SyntaxKind::COLON | SyntaxKind::DASH))
+    else {
+        // A flow sequence item is all value.
+        let start = range(entry).start;
+        return splice(text, start..flow_content_end(text, entry), value);
+    };
+    let after_indicator = usize::from(indicator.text_range().end());
+    let old = entry
+        .children()
+        .find(|c| c.kind() == SyntaxKind::VALUE)
+        .and_then(|v| v.first_child())
+        .or_else(|| entry.children().last())
+        .map(|v| range(&v));
+    match old {
+        Some(old) if !text[after_indicator..old.start].contains('\n') => {
+            splice(text, old.start..content_end(text, old), value)
+        }
+        Some(old) => splice(
+            text,
+            after_indicator..content_end(text, old),
+            &format!(" {value}"),
+        ),
+        None => splice(text, after_indicator..after_indicator, &format!(" {value}")),
+    }
+}
+
+/// Where the text in `range` ends, before trailing blank lines, comment-only
+/// lines and whitespace.
+fn content_end(text: &str, range: Range<usize>) -> usize {
+    let mut end = range.start;
+    let mut offset = range.start;
+    for line in text[range].split_inclusive('\n') {
+        let content = line.trim();
+        if !content.is_empty() && !content.starts_with('#') {
+            end = offset + line.trim_end().len();
+        }
+        offset += line.len();
+    }
+    end
+}
+
+/// Where a block entry ends: after its last line with content. Its range in
+/// `yaml-edit` can run on over the blank lines, comments and indentation
+/// before the next entry, and those belong to what follows.
+fn block_entry_end(text: &str, entry: &SyntaxNode) -> usize {
+    let end = content_end(text, range(entry));
+    text[end..].find('\n').map_or(text.len(), |i| end + i + 1)
+}
+
+/// Appends `item` as a new line after the last entry of a block collection,
+/// at the entries' indentation.
+fn append_to_block_collection(text: &str, entries: &[SyntaxNode], item: &str) -> String {
+    let first = range(entries.first().expect("a block collection has entries")).start;
+    let indent = first - text[..first].rfind('\n').map_or(0, |i| i + 1);
+    let end = block_entry_end(text, entries.last().expect("an entry"));
+    let newline = if text[..end].ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    splice(text, end..end, &format!("{newline}{:indent$}{item}\n", ""))
+}
+
 /// Appends `item` to a flow collection after its last entry.
-fn append_to_flow(
+fn append_to_flow_collection(
     text: &str,
     collection: &SyntaxNode,
     entries: &[SyntaxNode],
@@ -412,29 +460,11 @@ fn splice(text: &str, range: Range<usize>, with: &str) -> String {
     out
 }
 
-/// A `yaml-edit` node for a JSON value, written in flow style. Building the
-/// text and parsing it, rather than handing `yaml-edit` a `&str`, keeps plain
-/// scalars plain in flow context and multi-line strings on one line.
-fn node(value: &Value) -> YamlNode {
-    parse(&flow(value))
-}
-
-fn parse(text: &str) -> YamlNode {
-    let doc = Document::from_str(text).expect("flow YAML the editor wrote parses");
-    if let Some(m) = doc.as_mapping() {
-        YamlNode::Mapping(m)
-    } else if let Some(s) = doc.as_sequence() {
-        YamlNode::Sequence(s)
-    } else {
-        YamlNode::Scalar(doc.as_scalar().expect("a scalar"))
-    }
-}
-
 /// The order a new Step's keys are written in. Any other key follows them.
 const STEP_KEYS: &[&str] = &["uses", "needs", "with", "when", "timeout", "stall_after"];
 
 /// A new Step as one line of flow YAML, `uses` first.
-fn step_flow(step: &Map<String, Value>) -> String {
+fn new_step_yaml(step: &Map<String, Value>) -> String {
     let rank = |key: &str| {
         STEP_KEYS
             .iter()
@@ -443,13 +473,13 @@ fn step_flow(step: &Map<String, Value>) -> String {
     };
     let mut entries: Vec<(&String, &Value)> = step.iter().collect();
     entries.sort_by_key(|(key, _)| rank(key));
-    flow_mapping(entries)
+    flow_style_mapping(entries)
 }
 
-fn flow_mapping<'a>(entries: impl IntoIterator<Item = (&'a String, &'a Value)>) -> String {
+fn flow_style_mapping<'a>(entries: impl IntoIterator<Item = (&'a String, &'a Value)>) -> String {
     let entries: Vec<String> = entries
         .into_iter()
-        .map(|(k, v)| format!("{}: {}", string(k), flow(v)))
+        .map(|(k, v)| format!("{}: {}", string(k), flow_style(v)))
         .collect();
     if entries.is_empty() {
         "{}".to_owned()
@@ -459,15 +489,15 @@ fn flow_mapping<'a>(entries: impl IntoIterator<Item = (&'a String, &'a Value)>) 
 }
 
 /// `value` as one line of flow YAML.
-fn flow(value: &Value) -> String {
+fn flow_style(value: &Value) -> String {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) => value.to_string(),
         Value::String(s) => string(s),
         Value::Array(items) => {
-            let items: Vec<String> = items.iter().map(flow).collect();
+            let items: Vec<String> = items.iter().map(flow_style).collect();
             format!("[{}]", items.join(", "))
         }
-        Value::Object(map) => flow_mapping(map),
+        Value::Object(map) => flow_style_mapping(map),
     }
 }
 

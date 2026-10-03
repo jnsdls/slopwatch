@@ -391,6 +391,7 @@ fn quotes_strings_that_would_not_read_back_as_strings() {
         json!("*alias"),
         json!(" padded "),
         json!("Ünïcode"),
+        json!("two\nlines"),
     ];
     for value in values {
         let edits = [Edit::SetWith {
@@ -399,6 +400,12 @@ fn quotes_strings_that_would_not_read_back_as_strings() {
             value: value.clone(),
         }];
         let after = edit(FILE, &edits);
+        let (removed, added) = line_diff(FILE, &after);
+        assert_eq!(removed, ["  ci:     { uses: ci }"], "{after}");
+        assert!(
+            added.len() == 1 && added[0].starts_with("  ci:     { uses: ci, with: { v: \""),
+            "{after}"
+        );
         assert_eq!(load_ok(&after).step("ci").unwrap().config["v"], value);
     }
 }
@@ -615,9 +622,11 @@ fn appends_and_removes_terms_of_a_flow_gate() {
 
 #[test]
 fn appends_to_a_block_gate_at_the_end_of_the_file() {
-    let after = edit(FILE, &[Edit::AddGateTerm { term: json!("fix") }]);
-    assert_diff(FILE, &after, &[], &["  - fix"]);
-    assert!(after.ends_with("  - docs: [pass, skipped]\n  - fix\n"));
+    let term = json!({ "human": ["pass", "skipped"] });
+    let after = edit(FILE, &[Edit::AddGateTerm { term }]);
+    assert_diff(FILE, &after, &[], &["  - { human: [pass, skipped] }"]);
+    assert!(after.ends_with("  - docs: [pass, skipped]\n  - { human: [pass, skipped] }\n"));
+    assert_eq!(gate(&load_ok(&after))[4], "{human: [pass, skipped]}");
 }
 
 #[test]
@@ -654,6 +663,66 @@ fn removes_a_middle_flow_item_and_fills_empty_flow_collections() {
         &after,
         "version: 1\nsteps:\n  ci: { uses: ci, with: { job: build } }\n  lint: { uses: ci, needs: [ci] }\n  a: { uses: jev }\ngate: [ci, lint]\n",
     );
+}
+
+#[test]
+fn sets_a_key_on_a_block_step_followed_by_a_blank_line_and_a_comment() {
+    let edits = [Edit::SetKey {
+        step: "human".into(),
+        key: "timeout".into(),
+        value: json!("2h"),
+    }];
+    let after = edit(FILE, &edits);
+    assert_diff(FILE, &after, &[], &["    timeout: 2h"]);
+    assert!(
+        after.contains("    timeout: 2h\n\n  # After the Gate.\n"),
+        "{after}"
+    );
+    assert_eq!(
+        load_ok(&after).step("human").unwrap().timeout,
+        Some(std::time::Duration::from_secs(2 * 3600))
+    );
+}
+
+#[test]
+fn replaces_a_block_value_followed_by_a_blank_line_and_a_comment() {
+    let file = "version: 1\nsteps:\n  ci:\n    uses: ci\n    with:\n      job: lint\n\n  # Later.\n  b: { uses: jev }\ngate: [ci]\n";
+    let edits = [
+        Edit::SetKey {
+            step: "ci".into(),
+            key: "with".into(),
+            value: json!({ "job": "build" }),
+        },
+        Edit::SetWith {
+            step: "ci".into(),
+            key: "os".into(),
+            value: json!("macos"),
+        },
+    ];
+    let after = edit(file, &edits);
+    assert_diff(
+        file,
+        &after,
+        &["    with:", "      job: lint"],
+        &["    with: { job: build, os: macos }"],
+    );
+    assert_loads_as(
+        &after,
+        "version: 1\nsteps:\n  ci: { uses: ci, with: { job: build, os: macos } }\n  b: { uses: jev }\ngate: [ci]\n",
+    );
+}
+
+#[test]
+fn fills_an_empty_flow_gate_that_has_a_comment() {
+    let file = "version: 1\nsteps:\n  ci: { uses: ci }\ngate: []  # none yet\n";
+    let after = edit(file, &[Edit::AddGateTerm { term: json!("ci") }]);
+    assert_diff(
+        file,
+        &after,
+        &["gate: []  # none yet"],
+        &["gate: [ci]  # none yet"],
+    );
+    assert_eq!(gate(&load_ok(&after)), ["ci"]);
 }
 
 // Comments.
@@ -755,18 +824,28 @@ gate:
   - or: [review, codex, human]
 "#,
     );
-    // Every comment survives.
-    for line in FILE
-        .lines()
-        .filter(|l| l.contains('#') && !l.contains("docs/**"))
-    {
-        assert!(
-            after
-                .lines()
-                .any(|a| a.contains(line.split('#').nth(1).unwrap())),
-            "lost `{line}` in\n{after}"
-        );
-    }
+    assert_diff(
+        FILE,
+        &after,
+        &[
+            "  docs:   { uses: jev, when: { files: \"docs/**\" } }",
+            "    when:",
+            "      or:",
+            "        - review",
+            "        - and: [desc, { not: [review] }]",
+            "  fix:    { uses: fix, needs: [gate] }   # agent defaults to claude",
+            "  - or: [review, human]",
+            "  - docs: [pass, skipped]",
+        ],
+        &[
+            "      - codex",
+            "    when: { or: [review, codex] }",
+            "  fix:    { uses: fix, needs: [gate], with: { agent: codex } }   # agent defaults to claude",
+            "  codex: { uses: codex, needs: [ci], with: { model: gpt-5 } }",
+            "  - { or: [review, codex, human] }",
+            "fix_rounds: 4",
+        ],
+    );
 }
 
 // Errors.
