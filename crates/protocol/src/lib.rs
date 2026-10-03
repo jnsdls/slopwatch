@@ -41,8 +41,8 @@ pub use runs::{
 };
 pub use secrets::{SecretInfo, SecretValue, is_secret_name};
 pub use topics::{
-    PollState, PrStatus, PullRequest, RepoName, Topic, TopicUpdate, WatchedPrs, WatchedPrsDelta,
-    WatchedPrsUpdate,
+    PollState, PrStatus, PullRequest, RepoName, StackParent, StackPlace, Topic, TopicUpdate,
+    WatchedPrs, WatchedPrsDelta, WatchedPrsUpdate,
 };
 
 /// The protocol dialect. Both sides must speak exactly the same one. Any
@@ -105,6 +105,7 @@ pub const FEATURES: &[&str] = &[
     "human_steps",
     "pipeline_editor",
     "plugins",
+    "stacks",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

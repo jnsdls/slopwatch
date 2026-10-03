@@ -15,7 +15,7 @@ use gpui_kit::*;
 use slopwatch_core::WaiverCategory;
 use slopwatch_protocol::{
     Command, Flavor, InboxEntry, LogLevel, LogSource, PrRef, PrStatus, PullRequest, Reply,
-    RepoName, ResponseBody, RunView, Scope, StepStatus, StepView, TopicUpdate,
+    RepoName, ResponseBody, RunView, Scope, StackParent, StepStatus, StepView, TopicUpdate,
 };
 
 use crate::agent::Agent;
@@ -32,7 +32,7 @@ use crate::notifications::{
 use crate::pipeline_editor_view::PipelineEditorView;
 use crate::plugins::unapproved_plugin;
 use crate::plugins_view::PluginsView;
-use crate::prs::{Prs, Source, poll_line, status_line, storage_line};
+use crate::prs::{Prs, Row as PrRow, Source, poll_line, status_line, storage_line};
 use crate::run_graph_view::{run_graph, tone_color};
 use crate::run_pane::{
     GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, end_label, gate_tone,
@@ -41,6 +41,15 @@ use crate::run_pane::{
 use crate::secrets::missing_secret;
 use crate::secrets_view::SecretsView;
 use crate::step_log::{self, LogViewer, Row};
+
+/// How see-through a PR list row is when it doesn't open.
+const DIM: f32 = 0.55;
+
+/// A PR list row's left padding: a Stack's PRs step in one level per
+/// parent.
+fn row_indent(row: PrRow<'_>) -> Pixels {
+    px(16.0 + 20.0 * row.depth() as f32)
+}
 
 /// What fills the window right of the sources pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -556,7 +565,7 @@ impl MainView {
             .flex_col()
             .overflow_y_scroll();
 
-        let rows: Vec<&PullRequest> = self.prs.rows().collect();
+        let rows = self.prs.rows();
         if rows.is_empty() {
             let empty = if !self.prs.loaded() {
                 "Loading…"
@@ -573,14 +582,58 @@ impl MainView {
                     .child(empty),
             );
         }
-        for pr in rows {
-            list = list.child(self.pr_row(pr, cx));
+        for row in rows {
+            list = match row {
+                PrRow::Pr { pr, .. } => list.child(self.pr_row(pr, row, cx)),
+                PrRow::Parent { repo, parent, .. } => {
+                    list.child(self.unlisted_parent_row(repo, parent, row, cx))
+                }
+            };
         }
         list
     }
 
-    fn pr_row(&self, pr: &PullRequest, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A Stack parent that isn't one of the developer's PRs: dim, and it
+    /// doesn't open.
+    fn unlisted_parent_row(
+        &self,
+        repo: &RepoName,
+        parent: &StackParent,
+        row: PrRow<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
+        div()
+            .id(SharedString::from(format!(
+                "parent-{repo}-{}",
+                parent.number
+            )))
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .pr_4()
+            .pl(row_indent(row))
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .opacity(DIM)
+            .child(div().text_sm().truncate().child(parent.title.clone()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("{repo}#{} · not yours, not watched", parent.number)),
+            )
+    }
+
+    fn pr_row(
+        &self,
+        pr: &PullRequest,
+        stacked: PrRow<'_>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let selectable = stacked.selectable();
         let tone = match pr.status {
             PrStatus::NotWatched => theme.muted_foreground,
             PrStatus::Waiting => theme.warning,
@@ -609,18 +662,22 @@ impl MainView {
             .flex()
             .items_center()
             .gap_3()
-            .px_4()
+            .pr_4()
+            .pl(row_indent(stacked))
             .py_2()
             .border_b_1()
             .border_color(theme.border)
             .when(selected, |this| this.bg(theme.list_active))
-            .hover(|this| this.bg(theme.list_hover))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                for command in this.run_pane.select_pr(&row) {
-                    this.send(command);
-                }
-                cx.notify();
-            }))
+            .when(!selectable, |this| this.opacity(DIM))
+            .when(selectable, |this| {
+                this.hover(|this| this.bg(theme.list_hover))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        for command in this.run_pane.select_pr(&row) {
+                            this.send(command);
+                        }
+                        cx.notify();
+                    }))
+            })
             .child(
                 div()
                     .flex_1()

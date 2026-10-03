@@ -230,18 +230,20 @@ impl Inbox {
     }
 
     /// Puts `reasons` on the PR's one PR entry, opening it if none is
-    /// open. `run` is the Run whose end raised them.
+    /// open. `run` is the Run whose end raised them, or for a problem
+    /// between Runs, the PR's latest Run if it has one.
     pub(crate) fn raise_pr(
         &self,
         pr: PrRef,
-        run: RunId,
+        run: Option<RunId>,
         title: &str,
         reasons: Vec<String>,
     ) -> Result<(), StoreError> {
         let mut state = self.state();
         let Some(id) = state.find(|entry| entry.scope == Scope::Pr && entry.prs.contains(&pr))
         else {
-            return state.raise(Scope::Pr, title.to_owned(), reasons, pr, vec![run]);
+            let runs = run.into_iter().collect();
+            return state.raise(Scope::Pr, title.to_owned(), reasons, pr, runs);
         };
         let open = state.open.get_mut(&id).expect("found above");
         for reason in reasons {
@@ -249,7 +251,7 @@ impl Inbox {
                 open.entry.reasons.push(reason);
             }
         }
-        state.changed(id, Some(run))
+        state.changed(id, run)
     }
 
     /// Closes the PR's PR entry, if one is open.

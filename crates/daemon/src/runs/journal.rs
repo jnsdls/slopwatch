@@ -173,6 +173,7 @@ mod tests {
                     number: 1,
                     head_sha: "abc",
                     base: "main",
+                    pr_base: "main",
                     base_sha: "def",
                     pipeline: "",
                     files: &[],

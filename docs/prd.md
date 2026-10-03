@@ -218,7 +218,7 @@ Each ticket left these for the build. None of them changes a decision on the map
 - Whether `claude -p` spawned by the launchd agent reads Claude's Keychain login without a prompt ([Secrets for Steps](https://github.com/jnsdls/slopwatch/issues/30)).
 - Whether `claude -p` stream-json emits `rate_limit_event` and fills `total_cost_usd` under a subscription login ([Research: subscription login for headless agent CLIs](https://github.com/jnsdls/slopwatch/issues/29)).
 - Whether `updatePullRequestBranch` with `MERGE` produces signed merge commits ([ADR 0004](adr/0004-merge-rebases-through-update-pull-request-branch.md)). Answered by [#75](https://github.com/jnsdls/slopwatch/issues/75): it does, signed by `web-flow`.
-- Whether `MERGE` comes out clean on a child after its parent was squash-merged ([ADR 0011](adr/0011-a-stack-lands-one-pr-at-a-time-from-the-bottom.md)).
+- Whether `MERGE` comes out clean on a child after its parent was squash-merged ([ADR 0011](adr/0011-a-stack-lands-one-pr-at-a-time-from-the-bottom.md)). Answered by [#76](https://github.com/jnsdls/slopwatch/issues/76): it does unless the child changed what the parent changed, which conflicts and raises a PR entry. `REBASE` fails after a squash even then.
 - Whether `yaml-edit` passes the round-trip suite. It is 0.x, so pin it.
 
 ### Values with no default yet
@@ -229,7 +229,7 @@ Each ticket left these for the build. None of them changes a decision on the map
 
 ### Mechanics to work out in code
 
-- Journal the daemon's Stack retarget and branch update like Effects. They aren't Step-requested, so the intent journal doesn't obviously cover them, and a crash between the two could start a Run on the un-updated diff ([Task: consistency sweep before the PRD](https://github.com/jnsdls/slopwatch/issues/45)).
+- Journal the daemon's Stack retarget and branch update like Effects. They aren't Step-requested, so the intent journal doesn't obviously cover them, and a crash between the two could start a Run on the un-updated diff ([Task: consistency sweep before the PRD](https://github.com/jnsdls/slopwatch/issues/45)). Done in [#76](https://github.com/jnsdls/slopwatch/issues/76): one intent row covers both calls and holds the child's next Run until GitHub pushes the update (ADR 0011's "What the build showed").
 - Load-time validation also rejects a Merge that isn't downstream of the Gate. [ADR 0006](adr/0006-the-gate-is-a-three-valued-node-in-the-pipeline.md) doesn't list that rule, [Pipeline graph semantics and Gate expressions](https://github.com/jnsdls/slopwatch/issues/8) does.
 - How the `jev` Plugin keeps the state under 32k tokens: it measures before sending, and large diffs go per file or filtered. p90 PRs don't fit in one call ([Research: Jev evaluate API for PR judging](https://github.com/jnsdls/slopwatch/issues/3)). [#71](https://github.com/jnsdls/slopwatch/issues/71) filters, keeping one call per Step: it counts 3 bytes per token, and a diff that doesn't fit drops lockfiles, generated and binary files, then cuts every file to an even share of the room left, with a list of every changed file and its line counts kept whole. Per-file calls were left out because a question like "does the diff do what the description says" needs the whole PR in view.
 - The price table for Steps that report tokens but no USD, such as Codex ([Step contract](https://github.com/jnsdls/slopwatch/issues/7)).

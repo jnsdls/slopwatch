@@ -611,6 +611,7 @@ mod tests {
             status: PrStatus::Ready,
             runs,
             blocked: None,
+            stack: None,
         }
     }
 

@@ -2,10 +2,48 @@
 //! `watched_prs` topic, and what it shows for them. No GPUI here, so it
 //! tests without a window.
 
+use std::collections::{BTreeMap, HashSet};
+
 use slopwatch_protocol::{
-    PollState, PrStatus, PullRequest, RepoName, StorageWarning, TopicUpdate, WatchedPrs,
-    WatchedPrsUpdate,
+    PollState, PrStatus, PullRequest, RepoName, StackParent, StorageWarning, TopicUpdate,
+    WatchedPrs, WatchedPrsUpdate,
 };
+
+/// One row of the PR list. A Stack shows as a tree, each PR one level
+/// under its parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row<'a> {
+    Pr {
+        pr: &'a PullRequest,
+        depth: usize,
+        /// Another listed PR is stacked on it.
+        parent: bool,
+    },
+    /// A Stack parent that isn't one of the developer's open PRs, which
+    /// the list knows only by what its child says.
+    Parent {
+        repo: &'a RepoName,
+        parent: &'a StackParent,
+        depth: usize,
+    },
+}
+
+impl Row<'_> {
+    pub fn depth(&self) -> usize {
+        match self {
+            Row::Pr { depth, .. } | Row::Parent { depth, .. } => *depth,
+        }
+    }
+
+    /// Whether clicking the row opens it. An unwatched parent shows dim
+    /// and doesn't open: it has no Runs to show.
+    pub fn selectable(&self) -> bool {
+        match self {
+            Row::Pr { pr, parent, .. } => pr.watched() || !parent,
+            Row::Parent { .. } => false,
+        }
+    }
+}
 
 /// The sources pane's selection: every PR, or one repo's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,12 +110,89 @@ impl Prs {
         self.topic.storage
     }
 
-    /// The rows the PR list shows for the selected source.
-    pub fn rows(&self) -> impl Iterator<Item = &PullRequest> {
+    /// The PRs of the selected source, by repo then number.
+    pub fn prs(&self) -> impl Iterator<Item = &PullRequest> {
         self.topic.prs.iter().filter(|pr| match &self.source {
             Source::All => true,
             Source::Repo(repo) => &pr.repo == repo,
         })
+    }
+
+    /// The rows the PR list shows for the selected source: each Stack as a
+    /// tree in stack order, its PRs under their parents, and a parent that
+    /// isn't one of the developer's PRs as a row of its own.
+    pub fn rows(&self) -> Vec<Row<'_>> {
+        type Key<'a> = (&'a RepoName, u64);
+        let prs: Vec<&PullRequest> = self.prs().collect();
+        let listed: HashSet<Key> = prs.iter().map(|pr| (&pr.repo, pr.number)).collect();
+        let mut children: BTreeMap<Key, Vec<&PullRequest>> = BTreeMap::new();
+        // Parents nobody lists, by repo and number, with the first child's
+        // word on them.
+        let mut unlisted: BTreeMap<Key, &StackParent> = BTreeMap::new();
+        for pr in &prs {
+            if let Some(stack) = &pr.stack {
+                let parent = (&pr.repo, stack.parent.number);
+                children.entry(parent).or_default().push(pr);
+                if !listed.contains(&parent) {
+                    unlisted.entry(parent).or_insert(&stack.parent);
+                }
+            }
+        }
+        for siblings in children.values_mut() {
+            siblings.sort_by_key(|pr| {
+                let position = pr.stack.as_ref().and_then(|stack| stack.position);
+                (position.unwrap_or(u32::MAX), pr.number)
+            });
+        }
+
+        // Roots: unstacked PRs and unlisted parents, by repo then number.
+        let mut roots: Vec<(Key, Option<&PullRequest>)> = prs
+            .iter()
+            .filter(|pr| pr.stack.is_none())
+            .map(|pr| ((&pr.repo, pr.number), Some(*pr)))
+            .chain(unlisted.keys().map(|&key| (key, None)))
+            .collect();
+        roots.sort_by_key(|(key, _)| *key);
+
+        let mut rows = Vec::new();
+        let mut shown: HashSet<Key> = HashSet::new();
+        let mut todo: Vec<(Key, Option<&PullRequest>, usize)> = roots
+            .into_iter()
+            .rev()
+            .map(|(key, pr)| (key, pr, 0))
+            .collect();
+        loop {
+            while let Some((key, pr, depth)) = todo.pop() {
+                if !shown.insert(key) {
+                    continue;
+                }
+                let below = children.get(&key);
+                rows.push(match pr {
+                    Some(pr) => Row::Pr {
+                        pr,
+                        depth,
+                        parent: below.is_some(),
+                    },
+                    None => Row::Parent {
+                        repo: key.0,
+                        parent: unlisted[&key],
+                        depth,
+                    },
+                });
+                for child in below.into_iter().flatten().rev() {
+                    todo.push(((&child.repo, child.number), Some(child), depth + 1));
+                }
+            }
+            // A cycle of bases, which a poll that caught a retarget halfway
+            // could show, has no root. Its PRs still get rows.
+            match prs
+                .iter()
+                .find(|pr| !shown.contains(&(&pr.repo, pr.number)))
+            {
+                Some(pr) => todo.push(((&pr.repo, pr.number), Some(*pr), 0)),
+                None => return rows,
+            }
+        }
     }
 
     /// How many watched PRs a repo has, for its sources entry.
@@ -94,7 +209,7 @@ impl Prs {
 pub fn status_line(pr: &PullRequest) -> String {
     let status = match pr.status {
         PrStatus::NotWatched => "Not watched".to_owned(),
-        PrStatus::Waiting => format!("Waiting for a Pipeline on {}", pr.base),
+        PrStatus::Waiting => format!("Waiting for a Pipeline on {}", pr.root_base()),
         PrStatus::Ready => match (&pr.blocked, pr.runs.first()) {
             (Some(blocked), _) => blocked.clone(),
             (None, Some(run)) => crate::run_pane::run_label(run),
@@ -162,6 +277,7 @@ mod tests {
             status,
             runs: vec![],
             blocked: None,
+            stack: None,
         }
     }
 
@@ -185,7 +301,99 @@ mod tests {
     }
 
     fn numbers(prs: &Prs) -> Vec<u64> {
-        prs.rows().map(|pr| pr.number).collect()
+        prs.prs().map(|pr| pr.number).collect()
+    }
+
+    /// PR `number` stacked on `parent`, at `position` in a native stack.
+    fn stacked(number: u64, parent: u64, position: Option<u32>) -> PullRequest {
+        PullRequest {
+            base: format!("pr-{parent}"),
+            stack: Some(Box::new(slopwatch_protocol::StackPlace {
+                parent: StackParent {
+                    number: parent,
+                    title: format!("PR {parent}"),
+                    url: String::new(),
+                },
+                position,
+                root_base: "main".into(),
+            })),
+            ..pr("a", number, PrStatus::Ready)
+        }
+    }
+
+    /// Each row as its number and depth, with `~` marking a parent that
+    /// isn't listed and `!` a row that doesn't open.
+    fn tree(prs: &Prs) -> Vec<String> {
+        prs.rows()
+            .iter()
+            .map(|row| {
+                let mark = if row.selectable() { "" } else { "!" };
+                match row {
+                    Row::Pr { pr, depth, .. } => format!("{depth}:{}{mark}", pr.number),
+                    Row::Parent { parent, depth, .. } => {
+                        format!("{depth}:~{}{mark}", parent.number)
+                    }
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stack_shows_as_a_tree_in_stack_order() {
+        let mut prs = Prs::default();
+        prs.apply(snapshot(
+            1,
+            &["a"],
+            vec![
+                pr("a", 1, PrStatus::Ready),
+                stacked(2, 1, None),
+                stacked(3, 2, None),
+                pr("a", 4, PrStatus::Ready),
+                stacked(5, 1, None),
+            ],
+        ));
+
+        assert_eq!(tree(&prs), ["0:1", "1:2", "2:3", "1:5", "0:4"]);
+    }
+
+    #[test]
+    fn a_native_stack_orders_by_position_and_an_unlisted_parent_gets_a_dim_row() {
+        let mut prs = Prs::default();
+        let mut unwatched = pr("a", 7, PrStatus::NotWatched);
+        unwatched.base = "pr-9".into();
+        prs.apply(snapshot(
+            1,
+            &["a"],
+            vec![
+                // Someone else's #6 is the bottom, so it isn't listed.
+                stacked(8, 6, Some(3)),
+                stacked(3, 6, Some(2)),
+                pr("a", 5, PrStatus::NotWatched),
+                stacked(9, 5, None),
+            ],
+        ));
+
+        assert_eq!(
+            tree(&prs),
+            ["0:5!", "1:9", "0:~6!", "1:3", "1:8"],
+            "an unwatched parent doesn't open, and an unwatched PR on its own does"
+        );
+        assert!(
+            Row::Pr {
+                pr: &unwatched,
+                depth: 0,
+                parent: false
+            }
+            .selectable()
+        );
+    }
+
+    #[test]
+    fn a_stacked_pr_waits_for_a_pipeline_on_its_root_base() {
+        let mut waiting = stacked(2, 1, None);
+        waiting.status = PrStatus::Waiting;
+
+        assert_eq!(status_line(&waiting), "Waiting for a Pipeline on main");
     }
 
     #[test]

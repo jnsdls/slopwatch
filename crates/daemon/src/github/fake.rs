@@ -19,8 +19,8 @@ use slopwatch_protocol::step::{
 };
 
 use super::{
-    GitHub, GitHubError, GitRemote, Merged, OpenPr, PIPELINE_PATH, Poll, PrDetail, RateLimit,
-    RepoPoll, WATCH_LABEL,
+    Branch, GitHub, GitHubError, GitRemote, Merged, OpenPr, PIPELINE_PATH, ParentPr, Poll,
+    PrDetail, PrFate, RateLimit, RepoPoll, StackLink, WATCH_LABEL,
 };
 
 /// The Pipeline [`FakeGitHub::add_pipeline`] commits: one CI Step and a
@@ -52,6 +52,10 @@ struct State {
     merges: Vec<(u64, String, Option<MergeMethod>)>,
     /// Every branch update, as `(PR, method)`, in order.
     updates: Vec<(u64, UpdateMethod)>,
+    /// Every retarget the daemon asked for, as `(PR, base)`, in order.
+    retargets: Vec<(u64, String)>,
+    /// Branch update calls hang and never return while set.
+    hold_updates: bool,
 }
 
 /// Where a comment call stops and never returns, the way a daemon killed
@@ -91,6 +95,10 @@ struct Pr {
     /// Something outside the Run, such as a missing review, blocks it.
     blocked: bool,
     linked_issues: Vec<LinkedIssue>,
+    /// The PR is in a GitHub native stack.
+    native: bool,
+    /// It merged with a merge commit, which keeps its commits on the base.
+    kept_commits: bool,
 }
 
 const LIMIT: u32 = 5000;
@@ -113,6 +121,8 @@ impl FakeGitHub {
                 next_job: 1_000,
                 merges: Vec::new(),
                 updates: Vec::new(),
+                retargets: Vec::new(),
+                hold_updates: false,
             }),
             origins: tempfile::tempdir().expect("create a directory for the fake's git repos"),
         }
@@ -170,13 +180,52 @@ impl FakeGitHub {
     /// Opens PR `number` by `author` against `main`, from a head branch
     /// with one commit on top of `main`.
     pub fn open_pr(&self, repo: &RepoName, number: u64, author: &str, title: &str) {
+        self.open(repo, number, author, title, "main", false);
+    }
+
+    /// Opens PR `number` stacked on PR `parent`: its base is the parent's
+    /// head branch, and its head branch has one commit on top of it.
+    pub fn open_stacked_pr(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        author: &str,
+        title: &str,
+        parent: u64,
+    ) {
+        self.open(repo, number, author, title, &head_branch(parent), false);
+    }
+
+    /// Like [`FakeGitHub::open_stacked_pr`], in a GitHub native stack. The
+    /// parent must be in the stack too, or be its bottom.
+    pub fn open_native_stacked_pr(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        author: &str,
+        title: &str,
+        parent: u64,
+    ) {
+        self.with(|state| state.pr(repo, parent).native = true);
+        self.open(repo, number, author, title, &head_branch(parent), true);
+    }
+
+    fn open(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        author: &str,
+        title: &str,
+        base: &str,
+        native: bool,
+    ) {
         self.with(|state| {
             let git = state.repo(repo).git.clone();
             let file = format!("change-{number}.txt");
             let head_sha = state.commit(
                 &git,
                 &head_branch(number),
-                Some("main"),
+                Some(base),
                 &[(&file, Some("A change.\n"))],
             );
             pull_ref(&git, number, &head_sha);
@@ -185,7 +234,7 @@ impl FakeGitHub {
                 Pr {
                     author: author.to_owned(),
                     title: title.to_owned(),
-                    base: "main".to_owned(),
+                    base: base.to_owned(),
                     head_sha,
                     open: true,
                     labels: BTreeSet::new(),
@@ -197,6 +246,8 @@ impl FakeGitHub {
                     conflicts: false,
                     blocked: false,
                     linked_issues: Vec::new(),
+                    native,
+                    kept_commits: false,
                 },
             );
         });
@@ -206,6 +257,34 @@ impl FakeGitHub {
     /// would.
     pub fn link_issue(&self, repo: &RepoName, number: u64, issue: LinkedIssue) {
         self.with(|state| state.pr(repo, number).linked_issues.push(issue));
+    }
+
+    /// Merges the PR the way someone on github.com would: with a merge
+    /// commit for [`MergeMethod::Merge`], as one squashed commit
+    /// otherwise.
+    pub fn merge_on_github(&self, repo: &RepoName, number: u64, method: MergeMethod) {
+        self.with(|state| state.land(repo, number, method));
+    }
+
+    /// The PR's base branch.
+    pub fn base(&self, repo: &RepoName, number: u64) -> String {
+        self.with(|state| state.pr(repo, number).base.clone())
+    }
+
+    /// Retargets the PR the way someone on github.com would.
+    pub fn retarget_on_github(&self, repo: &RepoName, number: u64, base: &str) {
+        self.with(|state| state.pr(repo, number).base = base.to_owned());
+    }
+
+    /// Every retarget the daemon asked for so far, as `(PR, base)`.
+    pub fn retargets(&self) -> Vec<(u64, String)> {
+        self.with(|state| state.retargets.clone())
+    }
+
+    /// Makes branch update calls hang, the way a daemon killed mid-call
+    /// leaves them, until cleared. A call already held stays held.
+    pub fn hold_updates(&self, hold: bool) {
+        self.with(|state| state.hold_updates = hold);
     }
 
     pub fn close_pr(&self, repo: &RepoName, number: u64) {
@@ -376,7 +455,7 @@ impl FakeGitHub {
     pub fn land_from_queue(&self, repo: &RepoName, number: u64) {
         self.with(|state| {
             assert!(state.pr(repo, number).in_merge_queue, "the PR isn't queued");
-            state.land(repo, number);
+            state.land(repo, number, MergeMethod::Squash);
         });
     }
 
@@ -430,9 +509,12 @@ impl State {
             .unwrap_or_else(|| panic!("the fake has no PR {repo}#{number}"))
     }
 
-    /// Puts the PR's head tree on its base, in one commit as a squash
-    /// would, and closes the PR as merged.
-    fn land(&mut self, repo: &RepoName, number: u64) {
+    /// Puts the PR's head tree on its base and closes the PR as merged:
+    /// in a merge commit for [`MergeMethod::Merge`], which keeps the PR's
+    /// commits, or in one new commit otherwise, as a squash or a rebase
+    /// merge leaves copies. A native stack's next PR then moves onto the
+    /// base and gets the base merged in, as GitHub does for native stacks.
+    fn land(&mut self, repo: &RepoName, number: u64, method: MergeMethod) {
         let git = self.repo(repo).git.clone();
         let (base, head) = {
             let pr = self.pr(repo, number);
@@ -440,12 +522,104 @@ impl State {
         };
         let parent = tip(&git, &base).expect("the base exists");
         let tree = run_git(&git, &["rev-parse", &format!("{head}^{{tree}}")]);
-        let sha = run_git(&git, &["commit-tree", &tree, "-p", &parent, "-m", "Squash"]);
+        let kept_commits = method == MergeMethod::Merge;
+        let mut args = vec!["commit-tree", &tree, "-p", &parent];
+        if kept_commits {
+            args.extend(["-p", &head]);
+        }
+        args.extend(["-m", "Merge"]);
+        let sha = run_git(&git, &args);
         run_git(&git, &["update-ref", &format!("refs/heads/{base}"), &sha]);
         let pr = self.pr(repo, number);
         pr.open = false;
         pr.merged = true;
+        pr.kept_commits = kept_commits;
         pr.in_merge_queue = false;
+        let native = pr.native;
+        let landed = head_branch(number);
+        let children: Vec<u64> = self
+            .repo(repo)
+            .prs
+            .iter()
+            .filter(|(_, pr)| native && pr.native && pr.open && pr.base == landed)
+            .map(|(&child, _)| child)
+            .collect();
+        for child in children {
+            self.pr(repo, child).base = base.clone();
+            self.bring_up_to_date(repo, child);
+        }
+    }
+
+    /// Merges the PR's base into its head branch, which gets a new head
+    /// with no checks yet.
+    fn bring_up_to_date(&mut self, repo: &RepoName, number: u64) {
+        let git = self.repo(repo).git.clone();
+        let pr = self.pr(repo, number);
+        let head = pr.head_sha.clone();
+        let base = tip(&git, &pr.base.clone()).expect("the base exists");
+        let tree = run_git(&git, &["merge-tree", "--write-tree", &head, &base]);
+        let sha = run_git(
+            &git,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &head,
+                "-p",
+                &base,
+                "-m",
+                "Update branch",
+            ],
+        );
+        run_git(
+            &git,
+            &[
+                "update-ref",
+                &format!("refs/heads/{}", head_branch(number)),
+                &sha,
+            ],
+        );
+        pull_ref(&git, number, &sha);
+        let pr = self.pr(repo, number);
+        pr.head_sha = sha;
+        pr.checks = Checks::default();
+    }
+
+    /// Where an open PR sits in a Stack: the open PR whose head branch is
+    /// its base, and that PR's base.
+    fn stack_link(&self, name: &RepoName, number: u64) -> Option<StackLink> {
+        let repo = &self.repos[name];
+        let pr = &repo.prs[&number];
+        let parent_of = |pr: &Pr| {
+            repo.prs
+                .iter()
+                .find(|(n, parent)| parent.open && head_branch(**n) == pr.base)
+        };
+        let (&parent_number, parent) = parent_of(pr)?;
+        // A native stack's bottom PR is position 1.
+        let position = pr.native.then(|| {
+            let mut position = 2;
+            let mut below = parent;
+            while let Some((_, next)) = parent_of(below).filter(|(_, next)| next.native) {
+                position += 1;
+                below = next;
+            }
+            position
+        });
+        Some(StackLink {
+            parent: ParentPr {
+                number: parent_number,
+                title: parent.title.clone(),
+                url: format!("https://github.com/{name}/pull/{parent_number}"),
+                base: parent.base.clone(),
+            },
+            position,
+            root: Branch {
+                name: parent.base.clone(),
+                sha: tip(&repo.git, &parent.base).unwrap_or_default(),
+                has_pipeline: has_file(&repo.git, &parent.base, PIPELINE_PATH),
+            },
+        })
     }
 
     /// Commits `files` (a `None` text deletes the path) on top of
@@ -606,6 +780,7 @@ impl GitHub for FakeGitHub {
                                 base: pr.base.clone(),
                                 labeled: pr.labels.contains(WATCH_LABEL),
                                 base_has_pipeline: has_file(&repo.git, &pr.base, PIPELINE_PATH),
+                                stack: state.stack_link(name, number),
                                 detail: PrDetail {
                                     body: String::new(),
                                     author: pr.author.clone(),
@@ -817,7 +992,7 @@ impl GitHub for FakeGitHub {
                 pr.in_merge_queue = true;
                 return Ok(Merged::Enqueued);
             }
-            state.land(repo, number);
+            state.land(repo, number, method.unwrap_or(MergeMethod::Squash));
             Ok(Merged::Merged)
         })
     }
@@ -832,8 +1007,11 @@ impl GitHub for FakeGitHub {
         expected_head: &str,
         method: UpdateMethod,
     ) -> Result<(), GitHubError> {
+        let held = self.with(|state| state.hold_updates);
+        if held {
+            std::future::pending::<()>().await;
+        }
         self.with(|state| {
-            let git = state.repo(repo).git.clone();
             let pr = state.pr(repo, number);
             if pr.head_sha != expected_head {
                 return Err(GitHubError::Unprocessable(
@@ -845,35 +1023,40 @@ impl GitHub for FakeGitHub {
                     "merge conflict between base and head".into(),
                 ));
             }
-            let head = pr.head_sha.clone();
-            let base = tip(&git, &pr.base.clone()).expect("the base exists");
-            let tree = run_git(&git, &["merge-tree", "--write-tree", &head, &base]);
-            let sha = run_git(
-                &git,
-                &[
-                    "commit-tree",
-                    &tree,
-                    "-p",
-                    &head,
-                    "-p",
-                    &base,
-                    "-m",
-                    "Update branch",
-                ],
-            );
-            run_git(
-                &git,
-                &[
-                    "update-ref",
-                    &format!("refs/heads/{}", head_branch(number)),
-                    &sha,
-                ],
-            );
-            pull_ref(&git, number, &sha);
+            state.bring_up_to_date(repo, number);
             state.updates.push((number, method));
-            let pr = state.pr(repo, number);
-            pr.head_sha = sha;
-            pr.checks = Checks::default();
+            Ok(())
+        })
+    }
+
+    async fn pr_fate(&self, repo: &RepoName, number: u64) -> Result<PrFate, GitHubError> {
+        self.with(|state| {
+            let pr = state
+                .repos
+                .get(repo)
+                .and_then(|fake| fake.prs.get(&number))
+                .ok_or_else(|| GitHubError::NotFound(format!("{repo}#{number}")))?;
+            Ok(match (pr.merged, pr.open) {
+                (true, _) => PrFate::Merged {
+                    into: pr.base.clone(),
+                    kept_commits: pr.kept_commits,
+                },
+                (false, true) => PrFate::Open,
+                (false, false) => PrFate::Closed,
+            })
+        })
+    }
+
+    async fn set_base(&self, repo: &RepoName, number: u64, base: &str) -> Result<(), GitHubError> {
+        self.with(|state| {
+            let git = state.repo(repo).git.clone();
+            if tip(&git, base).is_none() {
+                return Err(GitHubError::Unprocessable(format!(
+                    "Proposed base branch '{base}' was not found"
+                )));
+            }
+            state.pr(repo, number).base = base.to_owned();
+            state.retargets.push((number, base.to_owned()));
             Ok(())
         })
     }

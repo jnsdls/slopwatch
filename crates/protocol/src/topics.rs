@@ -262,6 +262,10 @@ pub struct PullRequest {
     /// Why the PR can't get a Run right now, such as an invalid Pipeline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<String>,
+    /// Where the PR sits in a Stack, when its base is another open PR's
+    /// head branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<Box<StackPlace>>,
 }
 
 impl PullRequest {
@@ -272,6 +276,35 @@ impl PullRequest {
     pub fn watched(&self) -> bool {
         self.status != PrStatus::NotWatched
     }
+
+    /// The branch whose Pipeline judges the PR: its base, or the root base
+    /// of its Stack.
+    pub fn root_base(&self) -> &str {
+        self.stack
+            .as_ref()
+            .map_or(&self.base, |stack| &stack.root_base)
+    }
+}
+
+/// A stacked PR's place in its Stack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackPlace {
+    /// The open PR whose head branch is this PR's base. It may be anyone's,
+    /// so it may not be in the list.
+    pub parent: StackParent,
+    /// The PR's position in a GitHub native stack, 1 being the bottom.
+    /// Absent for a Stack chained by hand or by another tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+    /// The base of the Stack's bottom PR, whose Pipeline judges the PR.
+    pub root_base: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackParent {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,6 +350,7 @@ mod tests {
             status: PrStatus::NotWatched,
             runs: vec![],
             blocked: None,
+            stack: None,
         }
     }
 
@@ -440,5 +474,33 @@ mod tests {
         state.apply(WatchedPrsDelta::RepoAdded { repo: repo.clone() });
 
         assert_eq!(state.repos, [repo]);
+    }
+
+    #[test]
+    fn a_stacked_pr_names_its_parent_and_root_base_and_an_older_row_reads_unstacked() {
+        let mut stacked = pr("o/r", 2, "Two");
+        stacked.base = "feature".into();
+        stacked.stack = Some(Box::new(StackPlace {
+            parent: StackParent {
+                number: 1,
+                title: "One".into(),
+                url: "u".into(),
+            },
+            position: None,
+            root_base: "main".into(),
+        }));
+
+        let wire = serde_json::to_value(&stacked).unwrap();
+        assert_eq!(
+            wire["stack"],
+            json!({ "parent": { "number": 1, "title": "One", "url": "u" }, "root_base": "main" })
+        );
+        assert_eq!(stacked.root_base(), "main");
+
+        let mut older = wire;
+        older.as_object_mut().unwrap().remove("stack");
+        let older: PullRequest = serde_json::from_value(older).unwrap();
+        assert_eq!(older.stack, None);
+        assert_eq!(older.root_base(), "feature");
     }
 }
