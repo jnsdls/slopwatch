@@ -42,6 +42,15 @@ pub enum RunEvent {
     },
     StepStarted {
         step: String,
+        /// Which attempt this is, counting from 1. Each has its own Step
+        /// log.
+        #[serde(default = "first_attempt")]
+        attempt: u32,
+    },
+    /// A running Step's `progress` line.
+    StepProgress {
+        step: String,
+        message: String,
     },
     /// The Step has its Verdict, from the Step itself or from the daemon.
     StepSettled {
@@ -71,6 +80,16 @@ pub enum RunEvent {
     Ended {
         reason: EndReason,
     },
+    /// The Run's detail is gone: its Step logs, and every journal event
+    /// except the ones that rebuild its record. Always the last event.
+    Pruned {
+        /// Seconds since the Unix epoch.
+        at: i64,
+    },
+}
+
+fn first_attempt() -> u32 {
+    1
 }
 
 /// A Step as the Run lists it.
@@ -97,12 +116,18 @@ pub struct RunView {
     pub gate_text: String,
     pub gate: Option<GateState>,
     pub end: Option<EndReason>,
+    /// When the Run's detail was pruned, in seconds since the Unix epoch.
+    pub pruned_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepView {
     pub info: StepInfo,
     pub status: StepStatus,
+    /// The latest attempt, 0 while the Step hasn't started.
+    pub attempt: u32,
+    /// The latest `progress` line of the running attempt.
+    pub progress: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,14 +170,23 @@ impl RunView {
                     .map(|info| StepView {
                         info,
                         status: StepStatus::Pending,
+                        attempt: 0,
+                        progress: None,
                     })
                     .collect();
                 self.gate_text = gate;
                 self.gate = Some(GateState::Pending);
             }
-            RunEvent::StepStarted { step } => {
+            RunEvent::StepStarted { step, attempt } => {
                 if let Some(view) = self.step_mut(&step) {
                     view.status = StepStatus::Running;
+                    view.attempt = attempt;
+                    view.progress = None;
+                }
+            }
+            RunEvent::StepProgress { step, message } => {
+                if let Some(view) = self.step_mut(&step) {
+                    view.progress = Some(message);
                 }
             }
             RunEvent::StepSettled {
@@ -180,6 +214,7 @@ impl RunView {
             }
             RunEvent::Gate { state } => self.gate = Some(state),
             RunEvent::Ended { reason } => self.end = Some(reason),
+            RunEvent::Pruned { at } => self.pruned_at = Some(at),
         }
     }
 
@@ -229,8 +264,15 @@ mod tests {
         let mut view = RunView::default();
 
         view.apply(1, started());
-        view.apply(2, RunEvent::StepStarted { step: "ci".into() });
+        view.apply(
+            2,
+            RunEvent::StepStarted {
+                step: "ci".into(),
+                attempt: 1,
+            },
+        );
         assert_eq!(view.step("ci").unwrap().status, StepStatus::Running);
+        assert_eq!(view.step("ci").unwrap().attempt, 1);
 
         view.apply(
             3,
@@ -320,6 +362,20 @@ mod tests {
         );
 
         assert_eq!(view.gate, Some(GateState::Fail));
+    }
+
+    #[test]
+    fn a_step_started_before_attempts_were_journalled_reads_as_the_first() {
+        let event: RunEvent =
+            serde_json::from_value(json!({ "kind": "step_started", "step": "ci" })).unwrap();
+
+        assert_eq!(
+            event,
+            RunEvent::StepStarted {
+                step: "ci".into(),
+                attempt: 1
+            }
+        );
     }
 
     #[test]

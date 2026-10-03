@@ -3,7 +3,8 @@
 //! tests without a window.
 
 use slopwatch_protocol::{
-    PollState, PrStatus, PullRequest, RepoName, TopicUpdate, WatchedPrs, WatchedPrsUpdate,
+    PollState, PrStatus, PullRequest, RepoName, StorageWarning, TopicUpdate, WatchedPrs,
+    WatchedPrsUpdate,
 };
 
 /// The sources pane's selection: every PR, or one repo's.
@@ -66,6 +67,11 @@ impl Prs {
         &self.topic.poll
     }
 
+    /// The "storage over cap" daemon warning, while it stands.
+    pub fn storage(&self) -> Option<StorageWarning> {
+        self.topic.storage
+    }
+
     /// The rows the PR list shows for the selected source.
     pub fn rows(&self) -> impl Iterator<Item = &PullRequest> {
         self.topic.prs.iter().filter(|pr| match &self.source {
@@ -100,6 +106,30 @@ pub fn status_line(pr: &PullRequest) -> String {
     } else {
         status
     }
+}
+
+/// What the sources pane says about the storage warning.
+pub fn storage_line(warning: StorageWarning) -> String {
+    format!(
+        "Storage over cap: Step logs the daemon must keep take {}, over the {} cap",
+        size(warning.used_bytes),
+        size(warning.cap_bytes)
+    )
+}
+
+/// A byte count the way people read it.
+pub fn size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 /// What the footer says about the daemon's last poll, if anything.
@@ -142,6 +172,7 @@ mod tests {
                 repos: repos.iter().map(|name| repo(name)).collect(),
                 prs,
                 poll: PollState::Online,
+                storage: None,
             }),
         }
     }

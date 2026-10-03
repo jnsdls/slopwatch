@@ -12,7 +12,7 @@ use slopwatch_daemon::github::{GitHub, GitHubError};
 use slopwatch_daemon::plugins::Plugins;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::in_process::InProcessClient;
-use slopwatch_daemon::{Daemon, Library, Runs, RunsConfig, Watching};
+use slopwatch_daemon::{Daemon, Library, Retention, Runs, RunsConfig, Watching};
 use slopwatch_protocol::step::{Check, CheckState, Checks, ChecksState};
 use slopwatch_protocol::{
     ClientFrame, ClientHello, Command, ErrorCode, PullRequest, Reply, RepoName, ResponseBody,
@@ -78,6 +78,7 @@ fn daemon_running(
             data_dir: data.path().to_owned(),
             plugins: Plugins::new(plugin_exe, Arc::clone(&library)),
             login_path: None,
+            retention: Retention::default(),
         },
     )
     .unwrap();
@@ -154,12 +155,13 @@ impl Client {
                 WatchedPrsUpdate::Snapshot(snapshot) => self.prs = snapshot,
                 WatchedPrsUpdate::Delta(delta) => self.prs.apply(delta),
             },
-            TopicUpdate::Run { id, seq, event } => {
+            TopicUpdate::Run { id, seq, event, .. } => {
                 self.events.push((id, seq));
                 let view = self.runs.entry(id).or_default();
                 assert_eq!(seq, view.seq + 1, "Run events arrive in order, once each");
                 view.apply(seq, event);
             }
+            TopicUpdate::StepLog { .. } => {}
         }
     }
 
@@ -408,10 +410,10 @@ async fn a_client_that_reconnects_mid_run_gets_only_the_events_it_missed() {
 /// The Run as a client that saw its events up to `seq` had it.
 fn view_until(store: &Store, run: RunId, seq: u64) -> RunView {
     let mut view = RunView::default();
-    for (at, text) in store.events_after(run, 0).unwrap() {
-        if at <= seq {
-            let event: RunEvent = serde_json::from_str(&text).unwrap();
-            view.apply(at, event);
+    for stored in store.events_after(run, 0).unwrap() {
+        if stored.seq <= seq {
+            let event: RunEvent = serde_json::from_str(&stored.event).unwrap();
+            view.apply(stored.seq, event);
         }
     }
     view
@@ -658,7 +660,7 @@ impl Restarts {
             .events_after(run, 0)
             .unwrap()
             .into_iter()
-            .map(|(_, text)| serde_json::from_str(&text).unwrap())
+            .map(|stored| serde_json::from_str(&stored.event).unwrap())
             .collect()
     }
 
@@ -666,7 +668,7 @@ impl Restarts {
     fn starts(&self, run: RunId, step: &str) -> usize {
         self.events(run)
             .iter()
-            .filter(|event| matches!(event, RunEvent::StepStarted { step: s } if s == step))
+            .filter(|event| matches!(event, RunEvent::StepStarted { step: s, .. } if s == step))
             .count()
     }
 }
@@ -925,10 +927,12 @@ fn started_steps(store: &Store, run: RunId) -> Vec<String> {
         .events_after(run, 0)
         .unwrap()
         .into_iter()
-        .filter_map(|(_, text)| match serde_json::from_str(&text).unwrap() {
-            RunEvent::StepStarted { step } => Some(step),
-            _ => None,
-        })
+        .filter_map(
+            |stored| match serde_json::from_str(&stored.event).unwrap() {
+                RunEvent::StepStarted { step, .. } => Some(step),
+                _ => None,
+            },
+        )
         .collect()
 }
 

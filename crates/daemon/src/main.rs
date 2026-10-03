@@ -10,7 +10,7 @@ use slopwatch_daemon::plugins::{self, Plugins};
 use slopwatch_daemon::shell_env;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::unix::Listener;
-use slopwatch_daemon::{Daemon, DataDir, Library, Runs, RunsConfig, Watching};
+use slopwatch_daemon::{Daemon, DataDir, Library, Retention, Runs, RunsConfig, Watching};
 use slopwatch_protocol::Flavor;
 
 /// A log past this size starts over when the daemon starts.
@@ -94,6 +94,7 @@ async fn serve() -> ExitCode {
         data_dir: data_dir.path().to_owned(),
         plugins: Plugins::new(exe, Arc::clone(&library)),
         login_path,
+        retention: Retention::default(),
     };
     let runs = match Runs::start(store, github, Arc::clone(&watching), config) {
         Ok(runs) => runs,
@@ -102,6 +103,7 @@ async fn serve() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    tokio::spawn(Arc::clone(&runs).prune_forever());
     let daemon = Arc::new(Daemon::new(watching, library).with_runs(runs));
     eprintln!(
         "slopwatchd: build {} listening on {}",

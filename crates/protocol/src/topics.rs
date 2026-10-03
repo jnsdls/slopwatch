@@ -6,16 +6,20 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::logs::{LogKey, LogRecord, StorageWarning};
 use crate::runs::{RunEvent, RunId, RunSummary};
 
-/// A topic, by its name on the wire: `watched_prs` or `run/<id>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A topic, by its name on the wire: `watched_prs`, `run/<id>` or
+/// `log/<run>/<step>/<attempt>`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Topic {
     /// Added repos, the developer's open PRs in them, and which are watched.
     WatchedPrs,
     /// One Run's event journal.
     Run(RunId),
+    /// One attempt's Step log, as it's written.
+    StepLog(LogKey),
 }
 
 impl fmt::Display for Topic {
@@ -23,6 +27,7 @@ impl fmt::Display for Topic {
         match self {
             Topic::WatchedPrs => f.write_str("watched_prs"),
             Topic::Run(id) => write!(f, "run/{id}"),
+            Topic::StepLog(key) => write!(f, "log/{key}"),
         }
     }
 }
@@ -33,6 +38,9 @@ impl TryFrom<String> for Topic {
     fn try_from(text: String) -> Result<Self, Self::Error> {
         if text == "watched_prs" {
             return Ok(Topic::WatchedPrs);
+        }
+        if let Some(key) = text.strip_prefix("log/").and_then(LogKey::parse) {
+            return Ok(Topic::StepLog(key));
         }
         text.strip_prefix("run/")
             .and_then(|id| id.parse().ok())
@@ -62,7 +70,19 @@ pub enum TopicUpdate {
     Run {
         id: RunId,
         seq: u64,
+        /// When the daemon journalled the event, in milliseconds since the
+        /// Unix epoch. 0 for events journalled before timestamps existed.
+        #[serde(default)]
+        ts: i64,
         event: RunEvent,
+    },
+    /// Records just written to a Step log. A log topic has no snapshot:
+    /// subscribing sends the latest records, then each new one. A gap in
+    /// sequence numbers means records the client didn't get, which it can
+    /// page in with `read_step_log`.
+    StepLog {
+        key: LogKey,
+        records: Vec<LogRecord>,
     },
 }
 
@@ -132,6 +152,10 @@ pub struct WatchedPrs {
     /// repo then number.
     pub prs: Vec<PullRequest>,
     pub poll: PollState,
+    /// Set while Step logs and journals the daemon must keep take more
+    /// room than the storage cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageWarning>,
 }
 
 impl WatchedPrs {
@@ -154,6 +178,7 @@ impl WatchedPrs {
                     .retain(|row| !(row.repo == repo && row.number == number));
             }
             WatchedPrsDelta::Poll { state } => self.poll = state,
+            WatchedPrsDelta::Storage { warning } => self.storage = warning,
         }
     }
 
@@ -182,6 +207,11 @@ pub enum WatchedPrsDelta {
     },
     Poll {
         state: PollState,
+    },
+    /// The storage warning came or went.
+    Storage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<StorageWarning>,
     },
 }
 
@@ -292,6 +322,16 @@ mod tests {
             Topic::Run(RunId(12))
         );
         assert!(serde_json::from_value::<Topic>(json!("run/x")).is_err());
+        let log = Topic::StepLog(LogKey {
+            run: RunId(12),
+            step: "ci".into(),
+            attempt: 1,
+        });
+        assert_eq!(serde_json::to_value(&log).unwrap(), json!("log/12/ci/1"));
+        assert_eq!(
+            serde_json::from_value::<Topic>(json!("log/12/ci/1")).unwrap(),
+            log
+        );
         assert!(serde_json::from_value::<Topic>(json!("inbox")).is_err());
     }
 

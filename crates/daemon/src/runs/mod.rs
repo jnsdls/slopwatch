@@ -28,11 +28,17 @@
 //! which reruns it and every Step after it in the same Run, and can cancel
 //! any Run that's still going.
 //!
+//! Each attempt of a Step writes its own Step log under `logs/`, which
+//! clients follow live and page through ([`log`]). [`Runs::prune`] drops
+//! the detail of old Runs and keeps their record ([`retention`]).
+//!
 //! One lock serializes the engine: a sync and the reports from Step
 //! processes take turns. Reading a Pipeline from git happens outside it.
 
 mod journal;
+pub mod log;
 pub mod process;
+mod retention;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -45,7 +51,9 @@ use slopwatch_core::{
     load, parse_duration,
 };
 use slopwatch_protocol::step::{FromStep, Manifest, Outcome, Outputs, PrSnapshot, Start, ToStep};
-use slopwatch_protocol::{RepoName, RunEvent, RunId, StepInfo};
+use slopwatch_protocol::{
+    LogFilter, LogKey, LogPage, LogRecord, RepoName, RunEvent, RunId, StepInfo, StepLogPage,
+};
 use tokio::sync::mpsc;
 
 use crate::clones::{Clones, PipelineAt};
@@ -56,14 +64,22 @@ use crate::store::{ActiveRun, NewRun, NewStep, StepRow, StepRowState, Store, Sto
 use crate::watching::{RunInfo, Watching};
 
 use journal::Journal;
-pub use journal::Live;
+pub use journal::{Journalled, Live};
+pub use log::LiveLog;
 use process::{Limits, Report, Spawn, StepHandle, Tripped};
+pub use retention::Retention;
 
 /// How many of a PR's newest Runs its row carries, for the history chips.
 pub const HISTORY_ON_ROW: usize = 20;
 
 /// The most Step processes that run at once, across every Run.
 pub const STEP_CAP: usize = 8;
+
+/// How many of a Step log's latest records a new log subscriber gets.
+pub const LOG_TAIL: u32 = 200;
+
+/// How often the daemon looks for detail to prune.
+const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 type PrKey = (RepoName, u64);
 
@@ -73,9 +89,14 @@ pub struct Runs {
     github: Arc<dyn GitHub>,
     clones: Clones,
     live: AtomicBool,
+    store: Store,
+    watching: Arc<Watching>,
+    logs: log::Hub,
+    data_dir: PathBuf,
+    retention: Retention,
 }
 
-/// Where Runs keep their files.
+/// Where Runs keep their files, and for how long.
 pub struct RunsConfig {
     /// Clones under `repos/`, Step directories under `worktrees/`, Step
     /// logs under `logs/`.
@@ -85,6 +106,7 @@ pub struct RunsConfig {
     /// ([`shell_env::login_shell_path`]). Steps get the daemon's own `PATH`
     /// with this one merged after it. `None` leaves them the daemon's.
     pub login_path: Option<String>,
+    pub retention: Retention,
 }
 
 #[derive(Debug)]
@@ -109,6 +131,29 @@ impl From<StoreError> for RunError {
     }
 }
 
+/// Why a Step log can't be read.
+#[derive(Debug)]
+pub enum LogError {
+    /// No such Run, or no such Step in it.
+    NotFound(String),
+    /// The Run's detail was pruned at this time, in seconds.
+    Pruned(i64),
+    Store(StoreError),
+    Io(std::io::Error),
+}
+
+impl From<StoreError> for LogError {
+    fn from(error: StoreError) -> Self {
+        LogError::Store(error)
+    }
+}
+
+impl From<std::io::Error> for LogError {
+    fn from(error: std::io::Error) -> Self {
+        LogError::Io(error)
+    }
+}
+
 impl Runs {
     /// Loads the Runs that hadn't ended and starts taking Step reports.
     /// Their Steps start again on the first sync, once a poll has shown
@@ -126,13 +171,15 @@ impl Runs {
             std::env::var("PATH").ok().as_deref(),
             config.login_path.as_deref(),
         );
+        let logs = log::Hub::default();
         let mut engine = Engine {
-            data_dir: config.data_dir,
+            data_dir: config.data_dir.clone(),
             plugins: config.plugins,
             step_path,
             ready: VecDeque::new(),
             processes: HashMap::new(),
-            store,
+            logs: logs.clone(),
+            store: store.clone(),
             journal: Arc::clone(&journal),
             watching: Arc::clone(&watching),
             reports,
@@ -154,6 +201,11 @@ impl Runs {
             journal,
             github,
             clones,
+            store,
+            watching,
+            logs,
+            data_dir: config.data_dir,
+            retention: config.retention,
         });
         let driver = Arc::clone(&runs);
         tokio::spawn(async move {
@@ -284,7 +336,7 @@ impl Runs {
         &self,
         run: RunId,
         after: u64,
-    ) -> Result<(Vec<(u64, RunEvent)>, Live), SubscribeError> {
+    ) -> Result<(Vec<Journalled>, Live), SubscribeError> {
         if !self.journal.has_run(run).map_err(SubscribeError::Store)? {
             return Err(SubscribeError::NotFound(run));
         }
@@ -295,14 +347,131 @@ impl Runs {
 
     /// The Run's stored events after `after`, for a subscriber that fell
     /// behind the live ones.
-    pub fn replay(&self, run: RunId, after: u64) -> Result<Vec<(u64, RunEvent)>, StoreError> {
+    pub fn replay(&self, run: RunId, after: u64) -> Result<Vec<Journalled>, StoreError> {
         self.journal.replay(run, after)
+    }
+
+    /// The Step log's records after `after`, at most the latest
+    /// [`LOG_TAIL`], then every record written to any log from now on.
+    pub async fn subscribe_log(
+        &self,
+        key: &LogKey,
+        after: u64,
+    ) -> Result<(Vec<LogRecord>, LiveLog), LogError> {
+        self.check_log(key)?;
+        // Subscribing first means a record written while the file is read
+        // arrives twice at worst, and the connection drops the repeat.
+        let live = self.logs.subscribe();
+        let dir = log_dir(&self.data_dir, key);
+        let records = blocking(move || log::read_after(&dir, after, LOG_TAIL)).await?;
+        Ok((records, live))
+    }
+
+    /// One page of a Step log, searched and filtered.
+    pub async fn read_log(
+        &self,
+        key: LogKey,
+        page: LogPage,
+        filter: LogFilter,
+    ) -> Result<StepLogPage, LogError> {
+        let attempt = self.check_log(&key)?;
+        let dir = log_dir(
+            &self.data_dir,
+            &LogKey {
+                attempt,
+                ..key.clone()
+            },
+        );
+        let found = {
+            let filter = filter.clone();
+            blocking(move || log::read_page(&dir, page, &filter)).await?
+        };
+        Ok(StepLogPage {
+            key,
+            page,
+            filter,
+            records: found.records,
+            more_before: found.more_before,
+            more_after: found.more_after,
+            truncated: found.truncated,
+        })
+    }
+
+    /// Checks the log can be read, and returns its attempt: the key's, or
+    /// for attempt 0, the Step's latest.
+    fn check_log(&self, key: &LogKey) -> Result<u32, LogError> {
+        let Some(latest) = self.store.step_attempt(key.run, &key.step)? else {
+            return Err(LogError::NotFound(format!(
+                "Step `{}` in Run {}",
+                key.step, key.run
+            )));
+        };
+        if let Some(at) = self.store.pruned_at(key.run)? {
+            return Err(LogError::Pruned(at));
+        }
+        Ok(if key.attempt == 0 {
+            latest
+        } else {
+            key.attempt
+        })
+    }
+
+    /// Prunes the detail retention says should go at `now`, in seconds
+    /// since the epoch, and shows or clears the storage warning.
+    pub async fn prune(&self, now: i64) -> Result<(), StoreError> {
+        let unpruned = self.store.unpruned_runs()?;
+        let data_dir = self.data_dir.clone();
+        let details = blocking(move || {
+            Ok(unpruned
+                .into_iter()
+                .map(|run| retention::Detail {
+                    run: run.id,
+                    ended_at: run.ended_at,
+                    latest_of_watched: run.latest && run.pr_watched,
+                    reused: run.reused,
+                    pr_closed: !run.pr_open,
+                    bytes: run.journal_bytes + log::disk_usage(&run_logs(&data_dir, run.id)),
+                })
+                .collect::<Vec<_>>())
+        })
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("slopwatchd: can't size Run detail: {error}");
+            Vec::new()
+        });
+        let plan = retention::plan(&details, self.retention, now);
+        for run in plan.prune {
+            let logs = run_logs(&self.data_dir, run);
+            if let Err(error) = tokio::fs::remove_dir_all(&logs).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("slopwatchd: can't prune {}: {error}", logs.display());
+                continue;
+            }
+            let _ = tokio::fs::remove_dir_all(run_dir(&self.data_dir, run)).await;
+            if let Err(error) = self.journal.prune(run, now) {
+                eprintln!("slopwatchd: can't prune Run {run}'s journal: {error}");
+            }
+        }
+        self.watching.set_storage_warning(plan.warning);
+        Ok(())
+    }
+
+    /// Prunes now and then every hour, for good.
+    pub async fn prune_forever(self: Arc<Self>) {
+        loop {
+            if let Err(error) = self.prune(now()).await {
+                eprintln!("slopwatchd: can't prune Run detail: {error}");
+            }
+            tokio::time::sleep(PRUNE_EVERY).await;
+        }
     }
 }
 
 struct Engine {
     store: Store,
     plugins: Plugins,
+    logs: log::Hub,
     journal: Arc<Journal>,
     watching: Arc<Watching>,
     data_dir: PathBuf,
@@ -972,11 +1141,13 @@ impl Engine {
         // Outcome harder to reuse, never easier.
         let version = self.plugins.version(&step.plugin);
         let dir = step_dir(&self.data_dir, run.id, step_id, attempt);
-        let log = self
-            .data_dir
-            .join("logs")
-            .join(run.id.to_string())
-            .join(format!("{step_id}.{attempt}.log"));
+        let log_key = LogKey {
+            run: run.id,
+            step: step_id.to_owned(),
+            attempt,
+        };
+        let log_dir = log_dir(&self.data_dir, &log_key);
+        let logs = self.logs.clone();
         let start = ToStep::Start(Start {
             run: run.id,
             step: step_id.to_owned(),
@@ -996,6 +1167,7 @@ impl Engine {
         let reports = self.reports.clone();
         let (id, name) = (run.id, step_id.to_owned());
         let spawned = std::fs::create_dir_all(&dir).and_then(|()| {
+            let log = log::Writer::create(log_dir, log_key, log::Limits::default(), logs)?;
             process::spawn(
                 Spawn {
                     program,
@@ -1063,6 +1235,7 @@ impl Engine {
             run.id,
             RunEvent::StepStarted {
                 step: step_id.to_owned(),
+                attempt,
             },
         )?;
         Ok(())
@@ -1269,6 +1442,13 @@ impl Engine {
                     )?;
                 }
             }
+            Report::Message(FromStep::Progress {
+                message: Some(message),
+            }) if !reported => {
+                self.journal
+                    .append(report.run, RunEvent::StepProgress { step, message })?;
+                return Ok(());
+            }
             // The process task keeps the stall watchdog on heartbeats, and
             // anything after the Outcome is ignored.
             Report::Message(_) | Report::ProtocolError(_) | Report::Tripped(_) => return Ok(()),
@@ -1413,6 +1593,46 @@ impl Engine {
     }
 }
 
+/// Where a Run's Step logs live.
+fn run_logs(data_dir: &std::path::Path, run: RunId) -> PathBuf {
+    data_dir.join("logs").join(run.to_string())
+}
+
+/// One attempt's Step log.
+fn log_dir(data_dir: &std::path::Path, key: &LogKey) -> PathBuf {
+    run_logs(data_dir, key.run)
+        .join(path_segment(&key.step))
+        .join(key.attempt.to_string())
+}
+
+/// A Step id as one directory name. A Pipeline may name a Step anything,
+/// so an id that isn't plain letters, digits, `-` and `_` goes in as hex
+/// behind a `~`, which no plain id has. `../x` can't climb out, and `a/1`
+/// can't land inside `a`'s directory.
+fn path_segment(step: &str) -> String {
+    let plain = !step.is_empty()
+        && step
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if plain {
+        return step.to_owned();
+    }
+    let mut segment = String::from("~");
+    for byte in step.bytes() {
+        segment.push_str(&format!("{byte:02x}"));
+    }
+    segment
+}
+
+/// Runs file work off the async threads.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+}
+
 /// Where a Run's Steps get their working directories.
 fn run_dir(data_dir: &std::path::Path, run: RunId) -> PathBuf {
     data_dir.join("worktrees").join(run.to_string())
@@ -1422,7 +1642,7 @@ fn run_dir(data_dir: &std::path::Path, run: RunId) -> PathBuf {
 /// Each attempt gets its own, so a retry never shares one with the
 /// cancelled attempt still on its way out.
 fn step_dir(data_dir: &std::path::Path, run: RunId, step: &str, attempt: u32) -> PathBuf {
-    run_dir(data_dir, run).join(format!("{step}.{attempt}"))
+    run_dir(data_dir, run).join(format!("{}.{attempt}", path_segment(step)))
 }
 
 /// Every Step after `step`, in Pipeline order: the Steps that need it, or
@@ -1557,6 +1777,15 @@ fn now() -> i64 {
         .unwrap_or_default()
 }
 
+/// Now in milliseconds since the epoch, the unit of journal and log
+/// timestamps.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1642,5 +1871,14 @@ gate: [ci]
         assert_eq!(duration(Duration::from_secs(7200)), "2h");
         assert_eq!(duration(Duration::from_secs(45)), "45s");
         assert_eq!(duration(Duration::from_millis(300)), "300ms");
+    }
+
+    #[test]
+    fn a_step_id_is_one_directory_name_that_cant_collide_or_climb() {
+        assert_eq!(path_segment("ci"), "ci");
+        assert_eq!(path_segment("claude-review_2"), "claude-review_2");
+        assert_eq!(path_segment("../x"), "~2e2e2f78");
+        assert_eq!(path_segment("a/1"), "~612f31");
+        assert_eq!(path_segment(""), "~");
     }
 }

@@ -96,7 +96,14 @@ pub fn run(input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
             .iter()
             .filter(|check| check.state == CheckState::Pending)
             .count();
-        eprintln!("ci: waiting for {waiting} of {} checks", checks.runs.len());
+        let status = format!("Waiting for {waiting} of {} checks", checks.runs.len());
+        // The Step log keeps every change, the PR pane shows the latest.
+        eprintln!("ci: {status}");
+        let progress = serde_json::to_string(&FromStep::Progress {
+            message: Some(status),
+        })?;
+        writeln!(output, "{progress}")?;
+        output.flush()?;
     }
     Ok(())
 }
@@ -166,9 +173,19 @@ mod tests {
 
         run(input.as_bytes(), &mut output).unwrap();
 
-        let line = String::from_utf8(output).unwrap();
-        let FromStep::Outcome(outcome) = serde_json::from_str(line.trim()).unwrap() else {
-            panic!("expected an outcome, got {line}");
+        let text = String::from_utf8(output).unwrap();
+        let lines: Vec<FromStep> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines[0],
+            FromStep::Progress {
+                message: Some("Waiting for 0 of 0 checks".into())
+            }
+        );
+        let FromStep::Outcome(outcome) = &lines[1] else {
+            panic!("expected an outcome, got {text}");
         };
         assert_eq!(outcome.verdict, Verdict::Pass);
     }
