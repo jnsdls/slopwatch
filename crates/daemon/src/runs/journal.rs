@@ -240,6 +240,7 @@ mod tests {
                 base_sha: "def".into(),
                 steps: vec![],
                 gate: "[ci]".into(),
+                gate_terms: vec![],
             },
             RunEvent::StepStarted {
                 step: "ci".into(),

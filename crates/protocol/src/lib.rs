@@ -27,7 +27,8 @@ pub use logs::{
     StorageWarning, Truncation,
 };
 pub use runs::{
-    EffectView, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView, Waiver,
+    EffectView, GateTerm, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView,
+    Waiver,
 };
 pub use topics::{
     PollState, PrStatus, PullRequest, RepoName, Topic, TopicUpdate, WatchedPrs, WatchedPrsDelta,

@@ -37,6 +37,7 @@ pub struct RunPane {
     viewer: Option<LogViewer>,
     /// The Waiver being filled in.
     waiving: Option<WaiveForm>,
+    mode: RunMode,
 }
 
 /// A Waiver the developer is filling in.
@@ -53,6 +54,17 @@ pub enum WaiveTarget {
     Gate,
 }
 
+/// How the PR pane draws the Run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunMode {
+    /// A Step list with the Gate as a row.
+    #[default]
+    List,
+    /// The node canvas. It needs the room, so the sources column collapses
+    /// while a PR shows in Graph mode.
+    Graph,
+}
+
 impl RunPane {
     pub fn selected(&self) -> Option<&(RepoName, u64)> {
         self.selected.as_ref()
@@ -60,6 +72,22 @@ impl RunPane {
 
     pub fn shown(&self) -> Option<RunId> {
         self.shown
+    }
+
+    pub fn mode(&self) -> RunMode {
+        self.mode
+    }
+
+    /// Switches between the Step list and the graph. The open Step stays
+    /// open, so a Step picked in one shows in the other.
+    pub fn set_mode(&mut self, mode: RunMode) {
+        self.mode = mode;
+    }
+
+    /// Whether a PR shows its Run as a graph, which collapses the sources
+    /// column.
+    pub fn graph_shown(&self) -> bool {
+        self.mode == RunMode::Graph && self.selected.is_some()
     }
 
     /// The Run shown, once its first event arrived.
@@ -468,6 +496,20 @@ pub fn step_line(step: &StepView) -> String {
     }
 }
 
+/// A Step's status in one word, as its node in the graph says it.
+pub fn step_state(step: &StepView) -> String {
+    match &step.status {
+        StepStatus::Pending => "pending".to_owned(),
+        StepStatus::Running => "running".to_owned(),
+        StepStatus::Settled {
+            verdict,
+            reused_from: Some(_),
+            ..
+        } => format!("{verdict} (reused)"),
+        StepStatus::Settled { verdict, .. } => verdict.to_string(),
+    }
+}
+
 pub fn step_tone(step: &StepView) -> Tone {
     if step.waiver.is_some() {
         return Tone::Neutral;
@@ -561,8 +603,11 @@ mod tests {
                     plugin: "ci".into(),
                     needs: vec![],
                     gated: true,
+                    write: false,
+                    condition: None,
                 }],
                 gate: "[ci]".into(),
+                gate_terms: vec![],
             },
         }
     }
@@ -750,6 +795,8 @@ mod tests {
                 plugin: "ci".into(),
                 needs: vec![],
                 gated: true,
+                write: false,
+                condition: None,
             },
             status: StepStatus::Settled {
                 verdict: Verdict::Fail,
@@ -773,6 +820,31 @@ mod tests {
     }
 
     #[test]
+    fn graph_mode_collapses_the_sources_only_while_a_pr_is_shown_and_keeps_the_open_step() {
+        let mut pane = RunPane::default();
+        pane.set_mode(RunMode::Graph);
+        assert!(!pane.graph_shown(), "no PR, nothing to draw");
+
+        pane.select_pr(&pr(vec![summary(5, None)]));
+        pane.apply(started(5));
+        pane.toggle_step("ci");
+        assert!(pane.graph_shown());
+
+        pane.set_mode(RunMode::List);
+        assert!(!pane.graph_shown());
+        assert_eq!(
+            pane.open_step(),
+            Some("ci"),
+            "the list opens the Step the graph picked"
+        );
+
+        pane.set_mode(RunMode::Graph);
+        pane.pr_changed(None);
+        assert!(!pane.graph_shown(), "the PR went away");
+        assert_eq!(pane.mode(), RunMode::Graph, "the next PR opens as a graph");
+    }
+
+    #[test]
     fn labels_say_where_a_run_and_its_steps_stand() {
         assert_eq!(run_label(&summary(1, None)), "Running");
         assert_eq!(
@@ -790,6 +862,8 @@ mod tests {
                 plugin: "ci".into(),
                 needs: vec![],
                 gated: true,
+                write: false,
+                condition: None,
             },
             status: StepStatus::Settled {
                 verdict: Verdict::Cancelled,
@@ -802,6 +876,7 @@ mod tests {
             waiver: None,
         };
         assert_eq!(step_line(&step), "cancelled: the Run ended superseded");
+        assert_eq!(step_state(&step), "cancelled");
 
         let reused = StepView {
             status: StepStatus::Settled {
@@ -819,6 +894,7 @@ mod tests {
             step_line(&reused),
             "pass: 1 check passed (reused from Run 3)"
         );
+        assert_eq!(step_state(&reused), "pass (reused)");
     }
 
     fn event(id: u64, seq: u64, event: RunEvent) -> TopicUpdate {

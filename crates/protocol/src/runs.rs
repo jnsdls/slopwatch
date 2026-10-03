@@ -7,7 +7,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use slopwatch_core::{EndReason, GateState, Verdict, WaiverCategory};
+use slopwatch_core::{EndReason, Expr, GateState, StepTerm, Verdict, WaiverCategory};
 
 use crate::step::{Effect, EffectResult, Outputs};
 use crate::{Actor, InboxEntry, RepoName};
@@ -39,6 +39,10 @@ pub enum RunEvent {
         steps: Vec<StepInfo>,
         /// The Gate as the Pipeline file writes it.
         gate: String,
+        /// The Gate's terms, which hold together as an AND, for drawing
+        /// the Gate node. Empty from a daemon that predates them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        gate_terms: Vec<GateTerm>,
     },
     StepStarted {
         step: String,
@@ -134,6 +138,45 @@ pub struct StepInfo {
     pub needs: Vec<String>,
     /// The Gate reads this Step. A Step it doesn't read is advisory.
     pub gated: bool,
+    /// The Step declares `workspace: write`, so it is terminal: its commit
+    /// ends the Run (ADR 0001).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub write: bool,
+    /// The Condition the file wrote, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+}
+
+/// One term of the Gate, as the Gate node lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GateTerm {
+    /// The Step must pass, or also be skipped when it accepts that.
+    Step { id: String, accepts_skipped: bool },
+    /// An `or:` block: one of its terms must hold.
+    AnyOf { terms: Vec<GateTerm> },
+    /// Any other expression, as the Pipeline file writes it.
+    Other { text: String },
+}
+
+impl From<&Expr> for GateTerm {
+    fn from(expr: &Expr) -> GateTerm {
+        match expr {
+            Expr::Step(StepTerm {
+                id,
+                accepts_skipped,
+            }) => GateTerm::Step {
+                id: id.clone(),
+                accepts_skipped: *accepts_skipped,
+            },
+            Expr::Any(terms) => GateTerm::AnyOf {
+                terms: terms.iter().map(GateTerm::from).collect(),
+            },
+            other => GateTerm::Other {
+                text: other.to_string(),
+            },
+        }
+    }
 }
 
 /// One Run, rebuilt from its events.
@@ -148,6 +191,7 @@ pub struct RunView {
     pub base_sha: String,
     pub steps: Vec<StepView>,
     pub gate_text: String,
+    pub gate_terms: Vec<GateTerm>,
     pub gate: Option<GateState>,
     pub end: Option<EndReason>,
     /// When the Run's detail was pruned, in seconds since the Unix epoch.
@@ -208,6 +252,7 @@ impl RunView {
                 base_sha,
                 steps,
                 gate,
+                gate_terms,
             } => {
                 self.repo = Some(repo);
                 self.number = number;
@@ -225,6 +270,7 @@ impl RunView {
                     })
                     .collect();
                 self.gate_text = gate;
+                self.gate_terms = gate_terms;
                 self.gate = Some(GateState::Pending);
             }
             RunEvent::StepStarted { step, attempt } => {
@@ -317,6 +363,7 @@ pub struct RunSummary {
 mod tests {
     use super::*;
     use serde_json::json;
+    use slopwatch_core::{Expr, StepTerm};
 
     fn started() -> RunEvent {
         RunEvent::Started {
@@ -330,8 +377,11 @@ mod tests {
                 plugin: "ci".into(),
                 needs: vec![],
                 gated: true,
+                write: false,
+                condition: None,
             }],
             gate: "[ci]".into(),
+            gate_terms: vec![],
         }
     }
 
@@ -546,6 +596,67 @@ mod tests {
             serde_json::to_value(&event).unwrap(),
             json!({ "kind": "ended", "reason": "not_shippable" })
         );
+    }
+
+    #[test]
+    fn gate_terms_keep_the_any_of_groups_and_spell_out_the_rest() {
+        let step = |id: &str, accepts_skipped| {
+            Expr::Step(StepTerm {
+                id: id.into(),
+                accepts_skipped,
+            })
+        };
+        let gate = [
+            step("ci", false),
+            step("issue", true),
+            Expr::Any(vec![step("review", false), step("human", false)]),
+            Expr::Not(vec![step("lint", false)]),
+        ];
+
+        let terms: Vec<GateTerm> = gate.iter().map(GateTerm::from).collect();
+
+        let term = |id: &str, accepts_skipped| GateTerm::Step {
+            id: id.into(),
+            accepts_skipped,
+        };
+        assert_eq!(
+            terms,
+            [
+                term("ci", false),
+                term("issue", true),
+                GateTerm::AnyOf {
+                    terms: vec![term("review", false), term("human", false)],
+                },
+                GateTerm::Other {
+                    text: "{not: [lint]}".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&terms[2]).unwrap(),
+            json!({ "kind": "any_of", "terms": [
+                { "kind": "step", "id": "review", "accepts_skipped": false },
+                { "kind": "step", "id": "human", "accepts_skipped": false },
+            ] })
+        );
+    }
+
+    #[test]
+    fn a_started_event_from_an_older_daemon_reads_without_the_graph_fields() {
+        let older: RunEvent = serde_json::from_value(json!({
+            "kind": "started", "repo": "o/r", "number": 7, "head_sha": "abc",
+            "base": "main", "base_sha": "def", "gate": "[ci]",
+            "steps": [{ "id": "ci", "plugin": "ci", "needs": [], "gated": true }],
+        }))
+        .unwrap();
+
+        let mut view = RunView::default();
+        view.apply(1, older);
+
+        let ci = &view.step("ci").unwrap().info;
+        assert!(!ci.write);
+        assert_eq!(ci.condition, None);
+        assert!(view.gate_terms.is_empty());
     }
 
     #[test]
