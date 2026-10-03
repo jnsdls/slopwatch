@@ -239,7 +239,7 @@ Each ticket left these for the build. None of them changes a decision on the map
 ### UI with no prototype
 
 - In Graph mode the canvas doesn't fit the PR pane at 1440 px, so Graph mode should give it more room, for example by collapsing the sources column ([Prototype: main window](https://github.com/jnsdls/slopwatch/issues/14)).
-- On a narrow window the coach card can cover the Steps after the Gate. Placement should prefer the side of the anchor that has room ([Prototype: onboarding a repo](https://github.com/jnsdls/slopwatch/issues/37)).
+- On a narrow window the coach card can cover the Steps after the Gate. Placement should prefer the side of the anchor that has room ([Prototype: onboarding a repo](https://github.com/jnsdls/slopwatch/issues/37)). Done in [#82](https://github.com/jnsdls/slopwatch/issues/82): the card tries the right, left, below and above, and takes the first side with room that covers no Step. The canvas scrolls a spotlit node into sight first.
 - The screens no prototype covered: the Secrets list, the Plugins list with its Approval prompt, the Library editor, and daemon settings for the daily Budget, retention, Step caps and per-Plugin paths. Their contents are decided in their tickets. The layout is the build's call.
 
 ## Out of scope

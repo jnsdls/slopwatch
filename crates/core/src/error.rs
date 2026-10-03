@@ -59,6 +59,20 @@ pub enum LoadError {
     MergeNotAfterGate(String),
 }
 
+impl LoadError {
+    /// Whether this is about what the machine has, a Plugin or Library
+    /// Step it lacks, rather than about the file. Such a Pipeline can still
+    /// be published, since the developer may be about to install them.
+    pub fn is_about_this_machine(&self) -> bool {
+        matches!(
+            self,
+            LoadError::UnknownPlugin { .. }
+                | LoadError::UnknownLibraryStep { .. }
+                | LoadError::InvalidLibraryStep { .. }
+        )
+    }
+}
+
 /// What holds a reference: the Gate, or one Step's Condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Referrer {

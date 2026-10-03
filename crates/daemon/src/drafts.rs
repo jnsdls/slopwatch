@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use slopwatch_core::{
     BUILTIN_PLUGINS, EMPTY_PIPELINE, Edit, Expr, GATE, GateRole, LoadError, Node, Outline,
-    PluginInfo, ReplayError, Resolver, Workspace, apply_edits, check, flow_style,
-    library_step_plugin, replay, resolve_uses, try_edits,
+    PluginInfo, ReplayError, Resolver, Starter, Workspace, apply_edits, check, flow_style,
+    is_library_step_name, library_step_plugin, replay, resolve_uses, try_edits,
 };
 use slopwatch_protocol::pipeline::{
     DraftBase, DraftStep, NodePosition, PaletteItem, PipelineDraft, PipelinePr,
@@ -47,6 +47,12 @@ pub trait PipelineSource: Send + Sync {
     async fn merge(&self, _repo: &RepoName, _pr: &PipelinePr) -> Result<Landed, String> {
         Err("This daemon can't merge Pipeline PRs".to_owned())
     }
+}
+
+/// What a Step's Plugin needs from this machine, beyond being installed.
+pub trait StepNeeds: Send + Sync {
+    /// The Secrets a Step of `plugin` requires that aren't set.
+    fn missing_secrets(&self, plugin: &str) -> Vec<String>;
 }
 
 /// What publishing commits.
@@ -99,6 +105,8 @@ pub struct Drafts {
     resolver: Arc<dyn Resolver + Send + Sync>,
     library: Arc<Library>,
     source: Arc<dyn PipelineSource>,
+    /// What each Step lacks, for its badges. Without it, nothing shows.
+    needs: Option<Arc<dyn StepNeeds>>,
     /// Every change to any draft. Each connection passes on its repos'.
     updates: broadcast::Sender<Arc<PipelineDraft>>,
     /// Edits read, change and write a draft, one at a time.
@@ -120,10 +128,28 @@ impl Drafts {
             resolver,
             library,
             source,
+            needs: None,
             updates: broadcast::Sender::new(64),
             writing: Mutex::new(()),
             publishing: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Shows on each Step what it lacks, as `needs` tells.
+    pub fn with_needs(mut self, needs: Arc<dyn StepNeeds>) -> Self {
+        self.needs = Some(needs);
+        self
+    }
+
+    /// Sends every draft to its clients again, as after a Secret was set,
+    /// which changes what its Steps lack.
+    pub fn refresh(&self) -> Result<(), DraftError> {
+        for repo in self.store.repos()? {
+            if self.store.draft(&repo)?.is_some() {
+                self.broadcast(&repo)?;
+            }
+        }
+        Ok(())
     }
 
     /// Each draft as it changes.
@@ -234,7 +260,7 @@ impl Drafts {
         }
         let problems: Vec<String> = check(&replayed.text, self.resolver.as_ref())
             .iter()
-            .filter(|error| !installed_here(error))
+            .filter(|error| !error.is_about_this_machine())
             .map(LoadError::to_string)
             .collect();
         if !problems.is_empty() {
@@ -334,6 +360,55 @@ impl Drafts {
         edits: &[Edit],
         positions: &BTreeMap<String, NodePosition>,
     ) -> Result<(), DraftError> {
+        self.commit(repo, edits_seen, positions, |text| {
+            let after = try_edits(text, edits, self.resolver.as_ref())
+                .map_err(|refusal| DraftError::Refused(refusal.to_string()))?;
+            Ok((edits.to_vec(), after))
+        })
+    }
+
+    /// Replaces the draft's Steps and Gate with the Starter `key`'s, as
+    /// one change, and lays the canvas out afresh. A Plugin or Library Step
+    /// this machine lacks doesn't refuse it, unlike a single Step dropped
+    /// from the palette: onboarding shows it on the Step instead.
+    pub fn apply_starter(
+        &self,
+        repo: &RepoName,
+        edits_seen: usize,
+        key: &str,
+    ) -> Result<(), DraftError> {
+        let starter = Starter::named(key)
+            .ok_or_else(|| DraftError::NotFound(format!("Not found: a Starter named `{key}`")))?;
+        self.commit(repo, edits_seen, &BTreeMap::new(), |text| {
+            let outline = Outline::parse(text).map_err(DraftError::Refused)?;
+            let edits = outline.use_starter(starter);
+            let after = apply_edits(text, &edits)
+                .map_err(|error| DraftError::Refused(error.to_string()))?;
+            let resolver = self.resolver.as_ref();
+            let before = check(text, resolver);
+            let gained: Vec<String> = check(&after, resolver)
+                .into_iter()
+                .filter(|error| !error.is_about_this_machine() && !before.contains(error))
+                .map(|error| error.to_string())
+                .collect();
+            if !gained.is_empty() {
+                return Err(DraftError::Refused(gained.join("\n")));
+            }
+            self.store.clear_positions(repo)?;
+            Ok((edits, after))
+        })
+    }
+
+    /// Changes the repo's draft by the edits `make` returns for its text,
+    /// with the text they make, under the edit lock. Refuses edits made on
+    /// an older draft, and places the nodes in `positions` they add.
+    fn commit(
+        &self,
+        repo: &RepoName,
+        edits_seen: usize,
+        positions: &BTreeMap<String, NodePosition>,
+        make: impl FnOnce(&str) -> Result<(Vec<Edit>, String), DraftError>,
+    ) -> Result<(), DraftError> {
         {
             let _writing = self.writing.lock().expect("no panics while writing");
             let mut draft = self.stored(repo)?;
@@ -344,14 +419,13 @@ impl Drafts {
                 ));
             }
             let text = draft_text(&draft).map_err(DraftError::Refused)?;
-            let after = try_edits(&text, edits, self.resolver.as_ref())
-                .map_err(|refusal| DraftError::Refused(refusal.to_string()))?;
+            let (edits, after) = make(&text)?;
             for node in positions.keys() {
                 known_node(repo, &after, node)?;
             }
-            draft.edits.extend_from_slice(edits);
+            draft.edits.extend(edits.iter().cloned());
             self.store.save_draft(repo, &draft)?;
-            for edit in edits {
+            for edit in &edits {
                 if let Edit::RemoveStep { id } = edit {
                     self.store.remove_position(repo, id)?;
                 }
@@ -432,7 +506,17 @@ impl Drafts {
                     Some((plugin, info)) => (plugin, Some(info)),
                     None => (step.uses.clone(), None),
                 };
+                let missing_secrets = match (&self.needs, info) {
+                    (Some(needs), Some(_)) => needs.missing_secrets(&plugin),
+                    _ => Vec::new(),
+                };
+                let missing_plugin = match info {
+                    Some(_) => None,
+                    None => self.missing_plugin(&step.uses),
+                };
                 DraftStep {
+                    missing_secrets,
+                    missing_plugin,
                     merge: is_merge(&plugin, info),
                     info: StepInfo {
                         id: step.id.clone(),
@@ -467,6 +551,20 @@ impl Drafts {
             published: draft.published,
             conflicts: draft.conflicts,
         })
+    }
+
+    /// The Plugin a Step that `uses` this runs, if this machine doesn't
+    /// have it. `None` when the Plugin is there, or when a Library Step it
+    /// names is missing or broken, which the draft's problems say.
+    fn missing_plugin(&self, uses: &str) -> Option<String> {
+        let plugin = match uses.strip_prefix("lib/") {
+            Some(name) if is_library_step_name(name) => {
+                library_step_plugin(&self.library.step(name)?)?
+            }
+            Some(_) => return None,
+            None => uses.to_owned(),
+        };
+        self.resolver.plugin(&plugin).is_none().then_some(plugin)
     }
 
     /// The Library Steps that load, then the installed built-in Plugins.
@@ -534,18 +632,6 @@ fn branch_has_edits(draft: &StoredDraft, fresh: &StoredDraft) -> bool {
 
 /// The commit publishing makes, and the title of the PR it opens.
 const PUBLISH_HEADLINE: &str = "Update the slopwatch Pipeline";
-
-/// Whether `error` is about what this machine has installed, not about the
-/// file: a Plugin or Library Step it lacks. Publishing doesn't stop for
-/// those, since the developer may be about to install them.
-fn installed_here(error: &LoadError) -> bool {
-    matches!(
-        error,
-        LoadError::UnknownPlugin { .. }
-            | LoadError::UnknownLibraryStep { .. }
-            | LoadError::InvalidLibraryStep { .. }
-    )
-}
 
 fn source_error(repo: &RepoName, error: &str) -> DraftError {
     DraftError::Source(format!("Can't read the Pipeline of {repo}: {error}"))

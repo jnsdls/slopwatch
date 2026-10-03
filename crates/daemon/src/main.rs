@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use slopwatch_daemon::auth::GhToken;
-use slopwatch_daemon::drafts::{Drafts, PipelineSource};
+use slopwatch_daemon::drafts::{Drafts, PipelineSource, StepNeeds};
 use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::api::Api;
 use slopwatch_daemon::notifications::{self, LaunchPace, OpenApp};
@@ -128,7 +128,8 @@ async fn serve() -> ExitCode {
         Arc::clone(runs.plugins()) as _,
         Arc::clone(&library),
         Arc::clone(&runs) as Arc<dyn PipelineSource>,
-    );
+    )
+    .with_needs(Arc::clone(&runs) as Arc<dyn StepNeeds>);
     let daemon = Arc::new(
         Daemon::new(watching, library)
             .with_runs(runs)

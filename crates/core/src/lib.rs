@@ -16,6 +16,7 @@ mod pipeline;
 mod replay;
 mod reuse;
 mod run;
+mod starter;
 mod validate;
 mod verdict;
 
@@ -33,4 +34,5 @@ pub use pipeline::{
 pub use replay::{Conflict, Node, ReplayError, Replayed, replay};
 pub use reuse::ReuseKey;
 pub use run::{Decision, Plan, PrFacts, RunState, SkipReason};
+pub use starter::{STARTERS, Starter};
 pub use verdict::{EndReason, GateState, StepState, Verdict, WaiverCategory};

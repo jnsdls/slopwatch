@@ -1,0 +1,11 @@
+# Starter "Review and fix": checks, judges and fixes. You merge.
+version: 1
+steps:
+  ci: { uses: ci }
+  desc-matches-diff: { uses: lib/desc-matches-diff }
+  claude-review: { uses: lib/claude-review, needs: [ci] }
+  claude-fix: { uses: lib/claude-fix, needs: [gate] }
+gate:
+  - ci
+  - desc-matches-diff
+  - claude-review

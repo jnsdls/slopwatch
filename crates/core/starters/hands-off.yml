@@ -1,0 +1,16 @@
+# Starter "Hands off": two reviewers, the Fix loop, and a merge once the
+# Gate passes. No Human Step.
+version: 1
+steps:
+  ci: { uses: ci }
+  desc-matches-diff: { uses: lib/desc-matches-diff }
+  resolves-issue: { uses: lib/resolves-issue, when: { linked_issue: true } }
+  claude-review: { uses: lib/claude-review, needs: [ci] }
+  codex-review: { uses: lib/codex-review, needs: [ci] }
+  claude-fix: { uses: lib/claude-fix, needs: [gate, codex-review] }
+  merge: { uses: merge, needs: [gate] }
+gate:
+  - ci
+  - desc-matches-diff
+  - resolves-issue: [pass, skipped]
+  - claude-review

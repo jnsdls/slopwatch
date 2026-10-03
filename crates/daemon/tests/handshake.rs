@@ -80,6 +80,7 @@ async fn a_matching_hello_is_answered_with_the_daemons_build_id() {
                 "plugins".into(),
                 "stacks".into(),
                 "pipeline_publish".into(),
+                "onboarding".into(),
             ],
             build_id: "0123abcd+dirty.feed".into(),
         })
