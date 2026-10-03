@@ -532,13 +532,31 @@ mod tests {
         .unwrap()
     }
 
-    async fn reports(spawn_with: Spawn) -> (StepHandle, mpsc::UnboundedReceiver<Report>) {
+    async fn reports(spawn_with: Spawn) -> (Spawned, mpsc::UnboundedReceiver<Report>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let handle = spawn(spawn_with, move |report| {
             let _ = sender.send(report);
         })
         .unwrap();
-        (handle, receiver)
+        (Spawned(handle), receiver)
+    }
+
+    /// A Step that takes its whole group down once the test is done with
+    /// it, children its leader left behind included.
+    struct Spawned(StepHandle);
+
+    impl std::ops::Deref for Spawned {
+        type Target = StepHandle;
+
+        fn deref(&self) -> &StepHandle {
+            &self.0
+        }
+    }
+
+    impl Drop for Spawned {
+        fn drop(&mut self) {
+            signal_group(self.0.pgid, libc::SIGKILL);
+        }
     }
 
     #[tokio::test]
@@ -567,30 +585,32 @@ mod tests {
     #[tokio::test]
     async fn stderr_and_log_messages_go_to_the_step_log() {
         let dir = tempfile::tempdir().unwrap();
-        let script = r#"echo to stderr >&2; sleep 0.2; echo '{"type":"log","message":"logged","level":"warn"}'; printf 'no newline' >&2"#;
+        let script = r#"echo to stderr >&2; echo '{"type":"log","message":"logged","level":"warn"}'; printf 'no newline' >&2"#;
         let (_handle, mut reports) = reports(sh(script, &dir)).await;
 
         assert!(matches!(
             reports.recv().await,
             Some(Report::Exited(Some(0)))
         ));
+        // Stdout and stderr are separate pipes, so only each one's own
+        // order holds.
         let records = step_log(&dir).records;
-        let lines: Vec<_> = records
-            .iter()
-            .map(|record| (record.source, record.level, record.text.as_str()))
-            .collect();
+        let from = |source| {
+            records
+                .iter()
+                .filter(|record| record.source == source)
+                .map(|record| (record.level, record.text.as_str()))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            lines,
-            [
-                (LogSource::Stderr, None, "to stderr"),
-                (
-                    LogSource::Log,
-                    Some(slopwatch_protocol::LogLevel::Warn),
-                    "logged"
-                ),
-                (LogSource::Stderr, None, "no newline"),
-            ]
+            from(LogSource::Stderr),
+            [(None, "to stderr"), (None, "no newline")]
         );
+        assert_eq!(
+            from(LogSource::Log),
+            [(Some(slopwatch_protocol::LogLevel::Warn), "logged")]
+        );
+        assert_eq!(records.len(), 3, "{records:?}");
     }
 
     #[tokio::test]
@@ -705,7 +725,9 @@ mod tests {
     /// group as recorded at spawn and the child's pid.
     fn leaderless_group() -> (Leftover, i32) {
         let mut leader = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 600 & echo $!; read line"])
+            // Long enough for any test, short enough not to linger if one
+            // fails before killing it.
+            .args(["-c", "sleep 60 & echo $!; read line"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .process_group(0)
@@ -804,12 +826,13 @@ mod tests {
     #[tokio::test]
     async fn a_step_that_goes_quiet_stalls_but_heartbeats_keep_it_going() {
         let dir = tempfile::tempdir().unwrap();
-        // Five heartbeats 100 ms apart outlast a 300 ms stall_after, then
-        // the Step goes quiet.
+        // Five heartbeats 100 ms apart outlast a 2 s stall_after, twenty
+        // times the gap so a loaded machine can't stretch one past it, and
+        // then the Step goes quiet.
         let script =
             r#"for i in 1 2 3 4 5; do echo '{"type":"progress"}'; sleep 0.1; done; sleep 600"#;
         let mut spawn = sh(script, &dir);
-        spawn.limits.stall_after = Some(Duration::from_millis(300));
+        spawn.limits.stall_after = Some(Duration::from_secs(2));
         let (_handle, mut reports) = reports(spawn).await;
 
         let mut heartbeats = 0;

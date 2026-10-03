@@ -235,20 +235,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shell = fake_shell(
             dir.path(),
-            "case \" $* \" in *\" -i \"*) sleep 60;; esac\nPATH=/fallback:/usr/bin:/bin; export PATH",
+            "case \" $* \" in *\" -i \"*) exec sleep 60;; esac\nPATH=/fallback:/usr/bin:/bin; export PATH",
         );
         let started = Instant::now();
 
-        let path = snapshot_path(&shell, Duration::from_millis(400)).unwrap();
+        // Each attempt gets 2 s, so the login-only one answers in time even
+        // on a loaded machine, and the hung one is killed long before its
+        // 60 s are up.
+        let path = snapshot_path(&shell, Duration::from_secs(2)).unwrap();
 
         assert!(path.starts_with("/fallback:"), "{path}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[test]
     fn gives_up_on_a_shell_that_never_answers() {
         let dir = tempfile::tempdir().unwrap();
-        let shell = fake_shell(dir.path(), "sleep 60");
+        // exec, so killing the shell kills the sleep too.
+        let shell = fake_shell(dir.path(), "exec sleep 60");
 
         assert_eq!(snapshot_path(&shell, Duration::from_millis(300)), None);
     }

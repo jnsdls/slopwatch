@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod support;
+
 use serde_json::json;
 use slopwatch_core::{EndReason, GateState, SkipReason, Verdict, Workspace};
 use slopwatch_daemon::github::GitHub;
@@ -22,7 +24,9 @@ use slopwatch_protocol::{
     ServerFrame, StepStatus, Topic, TopicUpdate, WatchedPrs, WatchedPrsUpdate,
 };
 
-const WAIT: Duration = Duration::from_secs(20);
+/// Generous, since a cancel waits out the daemon's 10 s grace before
+/// SIGTERM, and a loaded machine stretches every step.
+const WAIT: Duration = Duration::from_secs(60);
 
 /// The `script` and `solo` Plugins. Each attempt records itself in the
 /// control dir under `<run>-<step>`, then acts on the Step's
@@ -33,8 +37,19 @@ const WAIT: Duration = Duration::from_secs(20);
 /// - `hold`: start a child in its group, then exit on `cancel`.
 /// - anything else: wait until the test writes `<run>-<step>.<attempt>`,
 ///   then report the Verdict it holds, or exit without one for `crash`.
+///
+/// Every wait gives up once the control dir is gone or after about two
+/// minutes, so no Step outlives its test.
 const SCRIPT: &str = r#"
-at="$1/$SLOPWATCH_RUN-$SLOPWATCH_STEP"
+dir=$1
+at="$dir/$SLOPWATCH_RUN-$SLOPWATCH_STEP"
+await() {
+  i=0
+  until "$@"; do
+    [ -d "$dir" ] && [ "$i" -lt 2400 ] || exit 1
+    sleep 0.05; i=$((i + 1))
+  done
+}
 read -r start
 act=$(printf '%s' "$start" | sed -n 's/.*"act":"\([a-z]*\)".*/\1/p')
 n=$(( $(cat "$at.attempts" 2>/dev/null || echo 0) + 1 ))
@@ -44,13 +59,13 @@ echo "$PATH" > "$at.path"
 outcome() { printf '{"type":"outcome","verdict":"%s"}\n' "$1"; }
 case $act in
   pass|fail) outcome "$act" ;;
-  silent) sleep 600 ;;
+  silent) await false ;;
   hold)
-    sleep 600 &
+    ( await false ) &
     echo "$!" > "$at.child"
     while read -r line; do case $line in *cancel*) exit 0 ;; esac; done ;;
   *)
-    while [ ! -f "$at.$n" ]; do sleep 0.05; done
+    await [ -f "$at.$n" ]
     verdict=$(cat "$at.$n")
     [ "$verdict" = crash ] && exit 3
     outcome "$verdict" ;;
@@ -78,6 +93,8 @@ fn manifest(id: &str, concurrency: Option<u32>) -> Manifest {
 }
 
 struct Harness {
+    /// First, so the Steps die before their control dir goes.
+    _reaper: support::Reaper,
     github: Arc<FakeGitHub>,
     daemon: Arc<Daemon>,
     /// Where the script Steps record themselves and read their Verdicts.
@@ -134,6 +151,7 @@ impl Harness {
         .unwrap();
         let daemon = Arc::new(Daemon::with_build_id("test", watching, library).with_runs(runs));
         Harness {
+            _reaper: support::Reaper::new(control.path()),
             github,
             daemon,
             control: control.path().to_owned(),

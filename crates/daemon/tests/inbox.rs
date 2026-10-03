@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod support;
+
 use serde_json::json;
 use slopwatch_core::{EndReason, Workspace};
 use slopwatch_daemon::github::GitHub;
@@ -28,9 +30,11 @@ const WAIT: Duration = Duration::from_secs(20);
 /// control dir under `<run>-<step>`, then acts on `with: { act: ... }`:
 /// `pass` and `fail` report at once, and anything else waits until the
 /// test writes `<run>-<step>.<attempt>`, then reports the Verdict it holds,
-/// or exits without one for `crash`.
+/// or exits without one for `crash`. The wait gives up once the control
+/// dir is gone or after about two minutes, so no Step outlives its test.
 const SCRIPT: &str = r#"
-at="$1/$SLOPWATCH_RUN-$SLOPWATCH_STEP"
+dir=$1
+at="$dir/$SLOPWATCH_RUN-$SLOPWATCH_STEP"
 read -r start
 act=$(printf '%s' "$start" | sed -n 's/.*"act":"\([a-z]*\)".*/\1/p')
 n=$(( $(cat "$at.attempts" 2>/dev/null || echo 0) + 1 ))
@@ -39,7 +43,11 @@ outcome() { printf '{"type":"outcome","verdict":"%s"}\n' "$1"; }
 case $act in
   pass|fail) outcome "$act" ;;
   *)
-    while [ ! -f "$at.$n" ]; do sleep 0.05; done
+    i=0
+    until [ -f "$at.$n" ]; do
+      [ -d "$dir" ] && [ "$i" -lt 2400 ] || exit 1
+      sleep 0.05; i=$((i + 1))
+    done
     verdict=$(cat "$at.$n")
     [ "$verdict" = crash ] && exit 3
     outcome "$verdict" ;;
@@ -107,6 +115,8 @@ fn manifest() -> Manifest {
 }
 
 struct Harness {
+    /// First, so the Steps die before their control dir goes.
+    _reaper: support::Reaper,
     github: Arc<FakeGitHub>,
     daemon: Arc<Daemon>,
     store: Store,
@@ -130,6 +140,7 @@ impl Harness {
         let store = Store::open(&data.path().join("state.db")).unwrap();
         let daemon = daemon(&github, &store, data.path(), control.path());
         Harness {
+            _reaper: support::Reaper::new(control.path()),
             github,
             daemon,
             store,
