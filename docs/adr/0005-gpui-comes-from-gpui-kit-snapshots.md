@@ -5,7 +5,7 @@ The client depends on `gpui-kit` from crates.io and gets GPUI through the `gpui-
 ## Considered options
 
 - A raw Zed git rev, with gpui-kit `[patch]`ed onto it, as tty7 does. It decouples us from Longbridge's cadence, but we would own the plumbing and gain nothing from it until we need an unreleased upstream change.
-- Our own fork from day one, as zeron and sonora do. Nothing settled so far needs a GPUI patch. Notifications come from the daemon, whose crates stay GPUI-free (see below), and the Dock badge and `SMAppService` are AppKit calls outside GPUI.
+- Our own fork from day one, as zeron and sonora do. Nothing settled so far needs a GPUI patch. Notifications use GPUI's own `show_system_notification` in the client (ADR 0013), and the Dock badge and `SMAppService` are AppKit calls outside GPUI.
 
 ## Consequences
 
