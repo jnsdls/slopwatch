@@ -3,8 +3,10 @@
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use slopwatch_daemon::Daemon;
+use slopwatch_daemon::github::fake::FakeGitHub;
+use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::unix::Listener;
+use slopwatch_daemon::{Daemon, Watching};
 use slopwatch_protocol::{ClientFrame, ClientHello, LOCAL_URL, ServerFrame};
 use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -14,7 +16,9 @@ async fn a_client_on_the_socket_running_as_the_same_user_is_admitted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("daemon.sock");
     let listener = Listener::bind(&path).unwrap();
-    tokio::spawn(listener.run(Arc::new(Daemon::with_build_id("socket-build"))));
+    let github = Arc::new(FakeGitHub::new("me"));
+    let watching = Arc::new(Watching::new(Store::in_memory(), github).unwrap());
+    tokio::spawn(listener.run(Arc::new(Daemon::with_build_id("socket-build", watching))));
 
     let stream = UnixStream::connect(&path).await.unwrap();
     let (mut ws, _) = tokio_tungstenite::client_async(LOCAL_URL, stream)

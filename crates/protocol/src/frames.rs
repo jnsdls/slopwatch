@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::{RepoName, Topic, TopicUpdate};
+
 /// A frame a client sends to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -17,6 +19,8 @@ pub enum ServerFrame {
     /// the socket right after.
     Refused(Refusal),
     Response(Response),
+    /// An update on a topic the client subscribed to.
+    Topic(TopicUpdate),
 }
 
 /// The first frame a client sends.
@@ -47,7 +51,10 @@ impl ClientHello {
     pub fn local() -> Self {
         Self {
             dialect: crate::DIALECT,
-            features: Vec::new(),
+            features: crate::FEATURES
+                .iter()
+                .map(|&feature| feature.to_owned())
+                .collect(),
             build_id: crate::BUILD_ID.to_owned(),
             auth: Auth::Local,
         }
@@ -119,6 +126,30 @@ pub enum Actor {
 #[serde(tag = "name", rename_all = "snake_case")]
 pub enum Command {
     Ping,
+    /// The repos the developer can push to, to pick one to add.
+    ListAvailableRepos,
+    /// Adds a repo. Its open PRs by the developer then show up on the
+    /// `watched_prs` topic.
+    AddRepo {
+        repo: RepoName,
+    },
+    /// Watches a PR: the daemon adds the `slopwatch` label on GitHub.
+    Watch {
+        repo: RepoName,
+        number: u64,
+    },
+    /// Unwatches a PR: the daemon removes the `slopwatch` label.
+    Unwatch {
+        repo: RepoName,
+        number: u64,
+    },
+    /// Polls GitHub now instead of waiting for the next tick.
+    Refresh,
+    /// Starts sending updates on `topic`: a snapshot, then deltas in
+    /// sequence order. Subscribing again restarts with a fresh snapshot.
+    Subscribe {
+        topic: Topic,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +169,11 @@ pub enum ResponseBody {
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum Reply {
     Pong,
+    /// The command was carried out. What it changed arrives on topics.
+    Done,
+    AvailableRepos {
+        repos: Vec<RepoName>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +187,12 @@ pub struct ErrorBody {
 pub enum ErrorCode {
     /// The frame wasn't one this dialect defines, such as an unknown command.
     BadRequest,
+    /// The command named a repo or PR the daemon doesn't know.
+    NotFound,
+    /// GitHub couldn't be reached or refused the call.
+    GitHub,
+    /// The daemon failed on its side, such as its database.
+    Internal,
 }
 
 #[cfg(test)]

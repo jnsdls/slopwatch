@@ -2,15 +2,19 @@
 
 use std::sync::Arc;
 
+use slopwatch_daemon::github::fake::FakeGitHub;
+use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::in_process::InProcessClient;
-use slopwatch_daemon::{Daemon, Peer};
+use slopwatch_daemon::{Daemon, Peer, Watching};
 use slopwatch_protocol::{
     Auth, ClientFrame, ClientHello, Command, DIALECT, ErrorCode, Refusal, RefusalReason, Reply,
     RequestId, Response, ResponseBody, ServerFrame, ServerHello,
 };
 
 fn daemon() -> Arc<Daemon> {
-    Arc::new(Daemon::with_build_id("0123abcd+dirty.feed"))
+    let github = Arc::new(FakeGitHub::new("me"));
+    let watching = Arc::new(Watching::new(Store::in_memory(), github).unwrap());
+    Arc::new(Daemon::with_build_id("0123abcd+dirty.feed", watching))
 }
 
 async fn hello(client: &mut InProcessClient, hello: ClientHello) -> ServerFrame {
@@ -53,7 +57,7 @@ async fn a_matching_hello_is_answered_with_the_daemons_build_id() {
         answer,
         ServerFrame::Hello(ServerHello {
             dialect: DIALECT,
-            features: vec![],
+            features: vec!["watched_prs".into()],
             build_id: "0123abcd+dirty.feed".into(),
         })
     );
