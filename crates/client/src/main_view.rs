@@ -1,6 +1,6 @@
-//! The main window: the sources pane, then either the Watched PR list with
-//! the PR pane or the Library editor, or the link state while the daemon
-//! isn't reachable.
+//! The main window: the sources pane, then either the Watched PR list or
+//! the Inbox, each with the PR pane, or the Library editor, or the link
+//! state while the daemon isn't reachable.
 
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -12,11 +12,13 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_core::WaiverCategory;
 use slopwatch_protocol::{
-    Command, LogLevel, LogSource, PrStatus, PullRequest, Reply, RepoName, ResponseBody, RunView,
-    StepStatus, StepView, TopicUpdate,
+    Command, InboxEntry, LogLevel, LogSource, PrStatus, PullRequest, Reply, RepoName, ResponseBody,
+    RunView, StepStatus, StepView, TopicUpdate,
 };
 
 use crate::agent::Agent;
+use crate::dock;
+use crate::inbox::{InboxModel, actions, badge, held_line, history_line};
 use crate::library_view::LibraryView;
 use crate::link::{LinkEvent, LinkState};
 use crate::link_view::LinkView;
@@ -31,6 +33,7 @@ use crate::step_log::{self, LogViewer, Row};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Prs,
+    Inbox,
     Library,
 }
 
@@ -39,6 +42,7 @@ pub struct MainView {
     link_view: Entity<LinkView>,
     pane: Pane,
     prs: Prs,
+    inbox: InboxModel,
     library: Entity<LibraryView>,
     run_pane: RunPane,
     /// Repos the developer can add, while the picker is open.
@@ -96,6 +100,7 @@ impl MainView {
             link_view: cx.new(|_| LinkView::new(agent, reregister)),
             pane: Pane::Prs,
             prs: Prs::default(),
+            inbox: InboxModel::default(),
             library: cx.new(|cx| LibraryView::new(commands.clone(), window, cx)),
             run_pane: RunPane::default(),
             picker: None,
@@ -114,7 +119,7 @@ impl MainView {
                     self.library.read(cx).refresh();
                 }
                 if connected && !matches!(self.link, LinkState::Connected { .. }) {
-                    // The new connection subscribes to `watched_prs` itself.
+                    // The new connection subscribes to `watched_prs` and `inbox` itself.
                     for command in self.run_pane.reconnected() {
                         self.send(command);
                     }
@@ -122,6 +127,10 @@ impl MainView {
                 self.link = state.clone();
                 self.link_view
                     .update(cx, |view, cx| view.set_state(state, cx));
+            }
+            LinkEvent::Topic(update @ TopicUpdate::Inbox { .. }) => {
+                self.inbox.apply(update);
+                dock::set_badge(badge(self.inbox.count()).as_deref());
             }
             LinkEvent::Topic(update @ (TopicUpdate::Run { .. } | TopicUpdate::StepLog { .. })) => {
                 for command in self.run_pane.apply(update) {
@@ -228,6 +237,18 @@ impl MainView {
             .border_r_1()
             .border_color(theme.border)
             .overflow_y_scroll()
+            .child(
+                entry(
+                    "source-inbox".into(),
+                    "Inbox".to_owned(),
+                    Some(self.inbox.count()),
+                    self.pane == Pane::Inbox,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.pane = Pane::Inbox;
+                    cx.notify();
+                })),
+            )
             .child(
                 entry(
                     "source-all".into(),
@@ -456,6 +477,101 @@ impl MainView {
             .child(toggle)
     }
 
+    /// Every open entry, oldest first. Clicking one opens its first PR in
+    /// the PR pane.
+    fn inbox_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let mut list = div()
+            .id("inbox-list")
+            .flex_1()
+            .h_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .overflow_y_scroll();
+        if self.inbox.entries().is_empty() {
+            list = list.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Nothing needs you."),
+            );
+        }
+        for entry in self.inbox.entries() {
+            let held = entry
+                .prs
+                .first()
+                .and_then(|pr| self.prs.pr(&pr.repo, pr.number))
+                .cloned();
+            let card = self
+                .entry_card(entry, "inbox", cx)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(held_line(entry)),
+                )
+                .hover(|this| this.bg(theme.list_hover))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(pr) = &held {
+                        for command in this.run_pane.select_pr(pr) {
+                            this.send(command);
+                        }
+                    }
+                    cx.notify();
+                }));
+            list = list.child(card);
+        }
+        list
+    }
+
+    /// An open entry: its title, reasons and the buttons it offers.
+    fn entry_card(
+        &self,
+        entry: &InboxEntry,
+        prefix: &str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = cx.theme().clone();
+        let mut buttons = div().flex().gap_1();
+        for (label, command) in actions(entry) {
+            let id = SharedString::from(format!("{prefix}-{label}-{}", entry.id));
+            buttons = buttons.child(Button::new(id).label(label).small().ghost().on_click(
+                cx.listener(move |this, _: &ClickEvent, _, _| {
+                    this.send(command.clone());
+                }),
+            ));
+        }
+        let mut card = div()
+            .id(SharedString::from(format!("{prefix}-entry-{}", entry.id)))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.warning)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(div().text_sm().child(entry.title.clone()))
+                    .child(buttons),
+            );
+        for reason in &entry.reasons {
+            card = card.child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(format!("• {reason}")),
+            );
+        }
+        card
+    }
+
     /// The selected PR: its Run history chips, newest first, then the Run
     /// shown as a Step list with the Gate as its last row.
     fn pr_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -509,6 +625,9 @@ impl MainView {
                     .text_color(theme.warning)
                     .child(blocked.clone()),
             );
+        }
+        for entry in self.inbox.for_pr(&pr.repo, pr.number) {
+            pane = pane.child(self.entry_card(entry, "pr", cx));
         }
         if pr.runs.is_empty() {
             return pane.child(
@@ -732,6 +851,19 @@ impl MainView {
                     .text_color(theme.muted_foreground)
                     .child(format!("Ended: {}", end_label(end, view.waived))),
             );
+        }
+        if !view.inbox.is_empty() {
+            let mut history = div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child("Inbox history");
+            for entry in &view.inbox {
+                history = history.child(format!("• {}", history_line(entry)));
+            }
+            pane = pane.child(history);
         }
         pane
     }
@@ -1106,6 +1238,7 @@ impl Render for MainView {
                     .child(self.sources(cx))
                     .map(|this| match self.pane {
                         Pane::Prs => this.child(self.pr_list(cx)).child(self.pr_pane(cx)),
+                        Pane::Inbox => this.child(self.inbox_list(cx)).child(self.pr_pane(cx)),
                         Pane::Library => this.child(self.library.clone()),
                     }),
             )

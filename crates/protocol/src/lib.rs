@@ -8,6 +8,7 @@
 
 mod flavor;
 mod frames;
+mod inbox;
 pub mod logs;
 pub mod runs;
 pub mod step;
@@ -17,6 +18,9 @@ pub use flavor::{DATA_DIR_ENV, Flavor, socket_path};
 pub use frames::{
     Actor, Auth, ClientFrame, ClientHello, Command, ErrorBody, ErrorCode, LibraryStep, Refusal,
     RefusalReason, Reply, Request, RequestId, Response, ResponseBody, ServerFrame, ServerHello,
+};
+pub use inbox::{
+    Cause, Closed, Closing, EntryId, Inbox, InboxDelta, InboxEntry, InboxUpdate, PrRef, Scope,
 };
 pub use logs::{
     LogFilter, LogKey, LogLevel, LogPage, LogRecord, LogSource, MAX_PAGE, StepLogPage,
@@ -54,8 +58,12 @@ pub const DIALECT: u32 = 1;
 ///
 /// `step_logs`: the `log/<run>/<step>/<attempt>` topics, `read_step_log`,
 /// timestamps on Run events, and the storage warning on `watched_prs`.
+///
 /// `waivers`: the `waive_step` and `override_gate` commands, the
 /// `step_waived` Run event, and the `waived` mark on an ended Run.
+///
+/// `inbox`: the `inbox` topic, the `dismiss_entry` command, and the
+/// `inbox` Run event.
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -64,6 +72,7 @@ pub const FEATURES: &[&str] = &[
     "run_control",
     "step_logs",
     "waivers",
+    "inbox",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

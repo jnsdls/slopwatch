@@ -229,6 +229,8 @@ impl Client {
                 WatchedPrsUpdate::Snapshot(snapshot) => self.prs = snapshot,
                 WatchedPrsUpdate::Delta(delta) => self.prs.apply(delta),
             },
+            // These tests don't subscribe to the Inbox.
+            TopicUpdate::Inbox { .. } => {}
             TopicUpdate::Run { id, seq, event, .. } => {
                 let view = self.runs.entry(id).or_default();
                 assert_eq!(seq, view.seq + 1, "Run events arrive in order, once each");
@@ -480,7 +482,10 @@ gate: [held, waiting]
         .until("both to run", |c| c.running(run).len() == 2)
         .await;
     let deadline = tokio::time::Instant::now() + WAIT;
-    while !harness.file(run, "held", "child").exists() {
+    // A Step shows as running before its script has written its pid.
+    while !harness.file(run, "held", "child").exists()
+        || !harness.file(run, "waiting", "pid").exists()
+    {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

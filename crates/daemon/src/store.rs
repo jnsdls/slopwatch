@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, params};
 use slopwatch_core::{EndReason, GateState, ReuseKey, Verdict};
 use slopwatch_protocol::step::{Effect, EffectResult, Outputs};
-use slopwatch_protocol::{RepoName, RunId, RunSummary, Waiver};
+use slopwatch_protocol::{EntryId, InboxEntry, RepoName, RunId, RunSummary, Waiver};
 
 use crate::github::OpenPr;
 
@@ -137,6 +137,22 @@ const MIGRATIONS: &[&str] = &[
     );
     ALTER TABLE runs ADD COLUMN waived INTEGER NOT NULL DEFAULT 0;
 ",
+    // The Inbox. An entry is kept forever, open or closed, as part of the
+    // record of every Run it touched.
+    "
+    CREATE TABLE inbox_entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entry TEXT NOT NULL,
+        open INTEGER NOT NULL
+    );
+    CREATE INDEX inbox_open ON inbox_entries (open, id);
+    CREATE TABLE inbox_runs (
+        entry_id INTEGER NOT NULL REFERENCES inbox_entries(id),
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        PRIMARY KEY (entry_id, run_id)
+    );
+    CREATE INDEX inbox_runs_by_run ON inbox_runs (run_id, entry_id);
+",
 ];
 
 #[derive(Clone)]
@@ -169,6 +185,7 @@ pub struct NewStep {
 /// The newest Run of a PR, as a sync compares it with the PR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatestRun {
+    pub id: RunId,
     pub head_sha: String,
     pub base_sha: String,
     pub pipeline: String,
@@ -756,14 +773,15 @@ impl Store {
     ) -> Result<Option<LatestRun>, StoreError> {
         self.db()
             .query_row(
-                "SELECT head_sha, base_sha, pipeline FROM runs
+                "SELECT id, head_sha, base_sha, pipeline FROM runs
                  WHERE repo = ?1 AND number = ?2 ORDER BY id DESC LIMIT 1",
                 params![repo.to_string(), number as i64],
                 |row| {
                     Ok(LatestRun {
-                        head_sha: row.get(0)?,
-                        base_sha: row.get(1)?,
-                        pipeline: row.get(2)?,
+                        id: RunId(row.get::<_, i64>(0)? as u64),
+                        head_sha: row.get(1)?,
+                        base_sha: row.get(2)?,
+                        pipeline: row.get(3)?,
                     })
                 },
             )
@@ -1025,6 +1043,83 @@ impl Store {
             .map(|found| found.is_some())
     }
 
+    /// Records a new Inbox entry and the Runs it touches, and returns its
+    /// id. The id in `entry` is ignored.
+    pub fn insert_entry(&self, entry: &InboxEntry, runs: &[RunId]) -> Result<EntryId, StoreError> {
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
+        tx.execute("INSERT INTO inbox_entries (entry, open) VALUES ('', 1)", [])?;
+        let id = EntryId(tx.last_insert_rowid() as u64);
+        let entry = InboxEntry {
+            id,
+            ..entry.clone()
+        };
+        tx.execute(
+            "UPDATE inbox_entries SET entry = ?2, open = ?3 WHERE id = ?1",
+            params![id.0 as i64, entry_json(&entry), entry.closed.is_none()],
+        )?;
+        for run in runs {
+            link_entry(&tx, id, *run)?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Stores what changed in an entry, and links it to `run`, a Run it
+    /// now touches too.
+    pub fn put_entry(&self, entry: &InboxEntry, run: Option<RunId>) -> Result<(), StoreError> {
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE inbox_entries SET entry = ?2, open = ?3 WHERE id = ?1",
+            params![entry.id.0 as i64, entry_json(entry), entry.closed.is_none()],
+        )?;
+        if let Some(run) = run {
+            link_entry(&tx, entry.id, run)?;
+        }
+        tx.commit()
+    }
+
+    /// Every open Inbox entry, oldest first, with the Runs it touches.
+    pub fn open_entries(&self) -> Result<Vec<(InboxEntry, Vec<RunId>)>, StoreError> {
+        let db = self.db();
+        let mut entries =
+            db.prepare("SELECT id, entry FROM inbox_entries WHERE open = 1 ORDER BY id")?;
+        let mut runs =
+            db.prepare("SELECT run_id FROM inbox_runs WHERE entry_id = ?1 ORDER BY run_id")?;
+        let rows = entries
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut open = Vec::new();
+        for (id, text) in rows {
+            let Ok(entry) = serde_json::from_str::<InboxEntry>(&text) else {
+                eprintln!("slopwatchd: Inbox entry {id} doesn't read back");
+                continue;
+            };
+            let touched = runs
+                .query_map(params![id], |row| Ok(RunId(row.get::<_, i64>(0)? as u64)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            open.push((entry, touched));
+        }
+        Ok(open)
+    }
+
+    /// The Inbox entries that touched `run`, open or closed, oldest first:
+    /// its Inbox history.
+    pub fn run_entries(&self, run: RunId) -> Result<Vec<InboxEntry>, StoreError> {
+        let db = self.db();
+        let mut query = db.prepare(
+            "SELECT e.entry FROM inbox_entries e JOIN inbox_runs r ON r.entry_id = e.id
+             WHERE r.run_id = ?1 ORDER BY e.id",
+        )?;
+        let rows = query.query_map(params![run.0 as i64], |row| row.get::<_, String>(0))?;
+        Ok(rows
+            .filter_map(|text| serde_json::from_str(&text.ok()?).ok())
+            .collect())
+    }
+
     /// Records a SHA slopwatch pushed.
     pub fn record_push(&self, repo: &RepoName, sha: &str) -> Result<(), StoreError> {
         self.db().execute(
@@ -1175,6 +1270,22 @@ fn append_event(db: &Connection, run: RunId, ts: i64, event: &str) -> Result<u64
         params![run.0 as i64, seq, ts, event],
     )?;
     Ok(seq as u64)
+}
+
+fn link_entry(
+    tx: &rusqlite::Transaction<'_>,
+    entry: EntryId,
+    run: RunId,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT OR IGNORE INTO inbox_runs (entry_id, run_id) VALUES (?1, ?2)",
+        params![entry.0 as i64, run.0 as i64],
+    )?;
+    Ok(())
+}
+
+fn entry_json(entry: &InboxEntry) -> String {
+    serde_json::to_string(entry).expect("Inbox entries always serialize")
 }
 
 /// A [`StepRow`]'s state as `run_steps` columns.

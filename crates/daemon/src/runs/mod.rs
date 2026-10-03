@@ -43,7 +43,7 @@
 //! processes take turns. Reading a Pipeline from git happens outside it.
 
 mod effects;
-mod journal;
+pub(crate) mod journal;
 pub mod log;
 pub mod process;
 mod retention;
@@ -60,12 +60,14 @@ use slopwatch_core::{
 };
 use slopwatch_protocol::step::{FromStep, Manifest, Outcome, Outputs, PrSnapshot, Start, ToStep};
 use slopwatch_protocol::{
-    LogFilter, LogKey, LogPage, LogRecord, RepoName, RunEvent, RunId, StepInfo, StepLogPage, Waiver,
+    Actor, Cause, Closing, LogFilter, LogKey, LogPage, LogRecord, PrRef, RepoName, RunEvent, RunId,
+    StepInfo, StepLogPage, Waiver,
 };
 use tokio::sync::mpsc;
 
 use crate::clones::{Clones, PipelineAt};
 use crate::github::{GitHub, OpenPr};
+use crate::inbox::Inbox;
 use crate::plugins::Plugins;
 use crate::shell_env;
 use crate::store::{ActiveRun, NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
@@ -102,6 +104,7 @@ pub struct Runs {
     logs: log::Hub,
     data_dir: PathBuf,
     retention: Retention,
+    inbox: Arc<Inbox>,
 }
 
 /// Where Runs keep their files, and for how long.
@@ -180,7 +183,9 @@ impl Runs {
             config.login_path.as_deref(),
         );
         let logs = log::Hub::default();
+        let inbox = Arc::new(Inbox::load(store.clone(), Arc::clone(&journal))?);
         let mut engine = Engine {
+            inbox: Arc::clone(&inbox),
             data_dir: config.data_dir.clone(),
             plugins: config.plugins,
             step_path,
@@ -216,6 +221,7 @@ impl Runs {
             logs,
             data_dir: config.data_dir,
             retention: config.retention,
+            inbox,
         });
         let driver = Arc::clone(&runs);
         tokio::spawn(async move {
@@ -304,9 +310,14 @@ impl Runs {
     }
 
     /// Runs the errored Step `step` again in its Run, with every Step
-    /// after it.
-    pub async fn retry(&self, run: RunId, step: &str) -> Result<(), RunError> {
-        self.command(|engine| engine.retry(run, step)).await
+    /// after it. That answers the Run entries of those Steps.
+    pub async fn retry(&self, run: RunId, step: &str, actor: &Actor) -> Result<(), RunError> {
+        self.command(|engine| engine.retry(run, step, actor)).await
+    }
+
+    /// The Inbox, which these Runs raise and close entries in.
+    pub fn inbox(&self) -> &Arc<Inbox> {
+        &self.inbox
     }
 
     /// Waives Step `step`'s settled, non-pass Verdict for the Run's head
@@ -498,6 +509,7 @@ impl Runs {
 
 struct Engine {
     store: Store,
+    inbox: Arc<Inbox>,
     plugins: Plugins,
     logs: log::Hub,
     journal: Arc<Journal>,
@@ -547,11 +559,19 @@ struct Inputs {
 }
 
 struct Blocked {
-    /// The base commit whose Pipeline is invalid, so nothing is tried
-    /// again until the base moves. `None` when the read itself failed,
-    /// and the next sync tries again.
-    invalid_at: Option<String>,
+    /// The Pipeline that doesn't load, and the base commit it's on. The
+    /// next sync loads the same text again, which comes out different
+    /// only after a Library edit, and reads the base again once it
+    /// moves. `None` when the read itself failed, and the next sync
+    /// tries again.
+    invalid: Option<Invalid>,
     message: String,
+}
+
+struct Invalid {
+    base: String,
+    base_sha: String,
+    text: String,
 }
 
 /// A Run that hasn't ended.
@@ -572,6 +592,9 @@ struct Active {
     /// an earlier Run's Outcome.
     rerun: HashSet<String>,
     outcomes: HashMap<String, Outcome>,
+    /// Why the daemon gave a settled Step its Verdict, such as an error's
+    /// cause, for the Inbox.
+    reasons: HashMap<String, String>,
     attempts: HashMap<String, u32>,
     running: HashMap<String, Running>,
     /// Steps a restart killed before they reported, with how many restarts
@@ -728,6 +751,7 @@ impl Engine {
                 snapshot: None,
                 files: stored.files,
                 outcomes: HashMap::new(),
+                reasons: HashMap::new(),
                 attempts: HashMap::new(),
                 running: HashMap::new(),
                 interrupted: BTreeMap::new(),
@@ -740,8 +764,13 @@ impl Engine {
                 active.attempts.insert(row.step.clone(), row.attempt);
                 match row.state {
                     StepRowState::Settled {
-                        verdict, outputs, ..
+                        verdict,
+                        outputs,
+                        reason,
                     } => {
+                        if let Some(reason) = reason {
+                            active.reasons.insert(row.step.clone(), reason);
+                        }
                         active
                             .state
                             .steps
@@ -761,6 +790,8 @@ impl Engine {
                 self.end_run(older, EndReason::Superseded)?;
             }
         }
+        let going = self.active.values().map(|run| run.id).collect();
+        self.inbox.keep_runs(&going)?;
         for (repo, number) in self.store.prs_with_runs()? {
             self.publish(&repo, number)?;
         }
@@ -810,7 +841,13 @@ impl Engine {
             },
         )?;
         let _ = std::fs::remove_dir_all(run_dir(&self.data_dir, run.id));
-        Ok(())
+        self.inbox.run_ended(run.id)?;
+        self.inbox.raise_pr(
+            pr_ref(&run.repo, run.number),
+            run.id,
+            NOT_SHIPPABLE,
+            vec![reason.to_owned()],
+        )
     }
 
     /// Ends the Runs the poll says are over, passes PR updates to running
@@ -879,27 +916,40 @@ impl Engine {
             self.reconciled = true;
         }
 
+        let gone: Vec<PrKey> = self
+            .blocked
+            .keys()
+            .filter(|key| !open.get(key).is_some_and(|(_, pr)| pr.labeled))
+            .cloned()
+            .collect();
+        for key in gone {
+            self.unblock(&key, Closing::LeftWatched)?;
+        }
         let mut starts = Vec::new();
         for (key, (repo, pr)) in &open {
-            if !pr.labeled {
-                self.blocked.remove(key);
+            if !pr.labeled || self.active.contains_key(key) {
                 continue;
             }
-            if !pr.base_has_pipeline || self.active.contains_key(key) {
+            if !pr.base_has_pipeline {
+                // A Pipeline that's gone holds nothing back: the PR waits.
+                self.unblock(key, Closing::NothingHeld)?;
                 continue;
             }
-            let still_invalid = self
-                .blocked
-                .get(key)
-                .and_then(|blocked| blocked.invalid_at.as_ref())
-                .is_some_and(|sha| *sha == pr.detail.base_sha);
-            if still_invalid {
-                continue;
+            // An invalid Pipeline on a base that hasn't moved comes out
+            // different only once the Library changed under it.
+            let mut cleared = false;
+            if let Some(invalid) = self.blocked.get(key).and_then(|b| b.invalid.as_ref())
+                && invalid.base_sha == pr.detail.base_sha
+            {
+                if load(&invalid.text, &self.plugins).is_err() {
+                    continue;
+                }
+                cleared = true;
             }
             let newly_watched = !self.watched.contains(key);
             let latest = self.store.latest_run(repo, pr.number)?;
             let when = match latest {
-                Some(run) if !newly_watched && run.head_sha == pr.head_sha => {
+                Some(run) if !cleared && !newly_watched && run.head_sha == pr.head_sha => {
                     // The base moved since the latest Run read it, so its
                     // Pipeline may have changed. An empty SHA is a PR no
                     // poll has seen yet.
@@ -923,6 +973,12 @@ impl Engine {
             .filter(|(_, (_, pr))| pr.labeled)
             .map(|(key, _)| key)
             .collect();
+        let watched = self
+            .watched
+            .iter()
+            .map(|(repo, number)| pr_ref(repo, *number))
+            .collect();
+        self.inbox.keep_watched(&watched)?;
         Ok(starts)
     }
 
@@ -988,21 +1044,29 @@ impl Engine {
             self.checked_base
                 .insert(key.clone(), pr.detail.base_sha.clone());
             if *from == text {
-                // A Pipeline that was invalid and is now back as it was.
-                if self.blocked.remove(&key).is_some() {
-                    self.publish(repo, pr.number)?;
-                }
-                return Ok(());
+                // A Pipeline that was invalid and is now back as it was,
+                // perhaps while the daemon was down.
+                self.inbox.clear(invalid_pipeline(repo, base))?;
+                return self.unblock(&key, Closing::NothingHeld);
             }
         }
         let pipeline = match load(&text, &self.plugins) {
             Ok(pipeline) => pipeline,
             Err(errors) => {
                 let message = format!("The Pipeline on {base} is invalid: {}", join(&errors));
-                return self.block(&key, Some(pr.detail.base_sha.clone()), message);
+                let invalid = Invalid {
+                    base: base.clone(),
+                    base_sha: pr.detail.base_sha.clone(),
+                    text,
+                };
+                let reasons = errors.iter().map(ToString::to_string).collect();
+                return self.block_invalid(&key, invalid, message, reasons);
             }
         };
-        self.blocked.remove(&key);
+        // The Pipeline on this base loads, so every PR it held back may
+        // start.
+        self.inbox.clear(invalid_pipeline(repo, base))?;
+        self.unblock(&key, Closing::NothingHeld)?;
 
         let steps: Vec<_> = pipeline.ordered_steps().collect();
         let id = self.store.insert_run(
@@ -1043,6 +1107,8 @@ impl Engine {
             gate: gate_text(&pipeline),
         };
         self.journal.append(id, started)?;
+        self.inbox
+            .close_pr(&pr_ref(repo, pr.number), Closing::NextRunStarted)?;
 
         let snapshot = snapshot(repo, pr);
         self.active.insert(
@@ -1061,6 +1127,7 @@ impl Engine {
                 snapshot: Some(snapshot),
                 files,
                 outcomes: HashMap::new(),
+                reasons: HashMap::new(),
                 attempts: HashMap::new(),
                 running: HashMap::new(),
                 interrupted: BTreeMap::new(),
@@ -1117,19 +1184,50 @@ impl Engine {
     fn block(
         &mut self,
         key: &PrKey,
-        base_sha: Option<String>,
+        invalid: Option<Invalid>,
         message: String,
     ) -> Result<(), StoreError> {
         let changed = self.blocked.get(key).map(|old| &old.message) != Some(&message);
-        self.blocked.insert(
-            key.clone(),
-            Blocked {
-                invalid_at: base_sha,
-                message,
-            },
-        );
+        self.blocked
+            .insert(key.clone(), Blocked { invalid, message });
         if changed {
             self.publish(&key.0, key.1)?;
+        }
+        Ok(())
+    }
+
+    /// Blocks the PR on a Pipeline that doesn't load, which holds it back
+    /// through the base's shared Inbox entry.
+    fn block_invalid(
+        &mut self,
+        key: &PrKey,
+        invalid: Invalid,
+        message: String,
+        reasons: Vec<String>,
+    ) -> Result<(), StoreError> {
+        let (repo, number) = key;
+        let pr = pr_ref(repo, *number);
+        let cause = invalid_pipeline(repo, &invalid.base);
+        // A PR that moved to another base no longer hits the old one's.
+        self.inbox.release(&pr, Closing::NothingHeld, |held| {
+            is_invalid_pipeline(held) && *held != cause
+        })?;
+        let title = format!("Invalid Pipeline on {}", invalid.base);
+        let latest = self.store.latest_run(repo, *number)?.map(|run| run.id);
+        self.inbox.hold(cause, pr, latest, &title, reasons)?;
+        self.block(key, Some(invalid), message)
+    }
+
+    /// Lets the PR's next Run start. A PR an invalid Pipeline held back
+    /// leaves that cause's entry, which closes as `how` if it was the last.
+    /// The entry may come from before a restart, which `blocked` doesn't
+    /// remember, so the Inbox is asked either way.
+    fn unblock(&mut self, key: &PrKey, how: Closing) -> Result<(), StoreError> {
+        let (repo, number) = key;
+        self.inbox
+            .release(&pr_ref(repo, *number), how, is_invalid_pipeline)?;
+        if self.blocked.remove(key).is_some() {
+            self.publish(repo, *number)?;
         }
         Ok(())
     }
@@ -1204,7 +1302,17 @@ impl Engine {
                 GateState::Fail | GateState::Pending => EndReason::NotShippable,
             };
             let run = self.active.remove(key).expect("checked above");
-            self.end_run(run, reason)?;
+            return self.end_run(run, reason);
+        }
+        // An errored Step holds up a Run that goes on, until the developer
+        // retries it or the Run ends.
+        let pr = pr_ref(&key.0, key.1);
+        for step in run.pipeline.steps() {
+            if run.state.steps.get(&step.id) == Some(&StepState::Settled(Verdict::Error)) {
+                let reason = run.reasons.get(&step.id).map_or("error", String::as_str);
+                self.inbox
+                    .raise_step_error(run.id, pr.clone(), &step.id, reason)?;
+            }
         }
         Ok(())
     }
@@ -1475,6 +1583,10 @@ impl Engine {
                 outputs: outputs.clone(),
             },
         );
+        match &reason {
+            Some(reason) => run.reasons.insert(step.to_owned(), reason.clone()),
+            None => run.reasons.remove(step),
+        };
         if let Some(running) = run.running.get_mut(step) {
             running.reported = true;
         }
@@ -1662,6 +1774,17 @@ impl Engine {
         // A cancelled Step's process may take a moment to go, and its
         // directory with it; the Run's own directory goes now.
         let _ = std::fs::remove_dir_all(run_dir(&self.data_dir, run.id));
+        self.inbox.run_ended(run.id)?;
+        // A Run the developer cancelled, or one a push or close ended,
+        // needs nothing from them.
+        if reason == EndReason::NotShippable {
+            self.inbox.raise_pr(
+                pr_ref(&run.repo, run.number),
+                run.id,
+                NOT_SHIPPABLE,
+                not_shippable(&run),
+            )?;
+        }
         self.publish(&run.repo, run.number)
     }
 
@@ -1676,7 +1799,7 @@ impl Engine {
     /// go back to pending, and the plan starts them again in this Run.
     /// The Steps after it that still run are cancelled first, since what
     /// they read is about to change.
-    fn retry(&mut self, id: RunId, step: &str) -> Result<(), RunError> {
+    fn retry(&mut self, id: RunId, step: &str, actor: &Actor) -> Result<(), RunError> {
         let key = self.going(id)?;
         let run = &self.active[&key];
         if run.pipeline.step(step).is_none() {
@@ -1691,6 +1814,11 @@ impl Engine {
         for reset in std::iter::once(step).chain(dependents.iter().map(String::as_str)) {
             self.reset(&key, reset)?;
         }
+        let answered: Vec<String> = std::iter::once(step.to_owned())
+            .chain(dependents.iter().cloned())
+            .collect();
+        self.inbox
+            .answer(id, &answered, &format!("retry `{step}`"), actor)?;
         self.journal.append(
             id,
             RunEvent::StepRetried {
@@ -1884,6 +2012,56 @@ async fn blocking<T: Send + 'static>(
         .unwrap_or_else(|error| Err(std::io::Error::other(error)))
 }
 
+/// The title of the PR entry a not-shippable Run raises.
+const NOT_SHIPPABLE: &str = "Not shippable";
+
+/// Why a Run ended not shippable, one line per Step: every errored Step,
+/// and every Step the Gate reads that settled other than pass or skipped.
+fn not_shippable(run: &Active) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for step in run.pipeline.ordered_steps() {
+        let Some(StepState::Settled(verdict)) = run.state.steps.get(&step.id) else {
+            continue;
+        };
+        let counts = match verdict {
+            Verdict::Error => true,
+            Verdict::Pass | Verdict::Skipped => false,
+            _ => run.pipeline.gate_reads(&step.id),
+        };
+        if !counts {
+            continue;
+        }
+        let id = &step.id;
+        reasons.push(match (verdict, run.reasons.get(id)) {
+            (Verdict::Error, Some(reason)) => format!("`{id}`: {reason}"),
+            (_, Some(reason)) => format!("`{id}`: {verdict} ({reason})"),
+            (_, None) => format!("`{id}`: {verdict}"),
+        });
+    }
+    if reasons.is_empty() {
+        reasons.push("The Gate didn't pass".to_owned());
+    }
+    reasons
+}
+
+fn pr_ref(repo: &RepoName, number: u64) -> PrRef {
+    PrRef {
+        repo: repo.clone(),
+        number,
+    }
+}
+
+fn is_invalid_pipeline(cause: &Cause) -> bool {
+    matches!(cause, Cause::InvalidPipeline { .. })
+}
+
+fn invalid_pipeline(repo: &RepoName, base: &str) -> Cause {
+    Cause::InvalidPipeline {
+        repo: repo.clone(),
+        base: base.to_owned(),
+    }
+}
+
 /// Where a Run's Steps get their working directories.
 fn run_dir(data_dir: &std::path::Path, run: RunId) -> PathBuf {
     data_dir.join("worktrees").join(run.to_string())
@@ -2021,7 +2199,7 @@ fn join(errors: &[slopwatch_core::LoadError]) -> String {
         .join("; ")
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|since| since.as_secs() as i64)

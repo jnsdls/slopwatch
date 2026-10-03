@@ -3,15 +3,16 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use slopwatch_protocol::{
-    Actor, ClientFrame, Command, ErrorBody, ErrorCode, LogKey, LogRecord, Reply, Request,
-    RequestId, Response, ResponseBody, RunId, ServerFrame, Topic, TopicUpdate, Waiver,
-    WatchedPrsDelta, WatchedPrsUpdate,
+    Actor, ClientFrame, Command, ErrorBody, ErrorCode, InboxDelta, InboxUpdate, LogKey, LogRecord,
+    Reply, Request, RequestId, Response, ResponseBody, RunId, ServerFrame, Topic, TopicUpdate,
+    Waiver, WatchedPrsDelta, WatchedPrsUpdate,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
+use crate::inbox::InboxSubscription;
 use crate::runs::{Journalled, Live, LiveLog, LogError, RunError, Runs, SubscribeError};
 use crate::{Daemon, LibraryError, Peer, Subscription, WatchError};
 
@@ -22,6 +23,7 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Default)]
 struct Subscriptions {
     watched_prs: Option<broadcast::Receiver<(u64, WatchedPrsDelta)>>,
+    inbox: Option<broadcast::Receiver<(u64, InboxDelta)>>,
     /// Each subscribed Run, with the last sequence number sent for it.
     runs: HashMap<RunId, u64>,
     /// Events appended to any Run. Only subscribed Runs' get through.
@@ -37,6 +39,9 @@ enum Next {
     WatchedPrs(u64, WatchedPrsDelta),
     /// The subscriber fell behind on `watched_prs` and lost deltas.
     WatchedPrsLagged,
+    Inbox(u64, InboxDelta),
+    /// The subscriber fell behind on `inbox` and lost deltas.
+    InboxLagged,
     Run(RunId, Journalled),
     /// The subscriber fell behind on Run events. The journal has them.
     RunsLagged,
@@ -92,6 +97,7 @@ impl Daemon {
                         Command::Unsubscribe { topic } => {
                             match topic {
                                 Topic::WatchedPrs => subs.watched_prs = None,
+                                Topic::Inbox => subs.inbox = None,
                                 Topic::Run(run) => {
                                     subs.runs.remove(&run);
                                     if subs.runs.is_empty() {
@@ -147,6 +153,7 @@ impl Daemon {
     ) -> Result<Vec<ServerFrame>, ErrorBody> {
         match topic {
             Topic::WatchedPrs => Ok(vec![self.subscribe_watched_prs(subs)]),
+            Topic::Inbox => Ok(vec![self.subscribe_inbox(subs)]),
             Topic::Run(run) => {
                 let Some(runs) = &self.runs else {
                     return Err(run_not_found(run));
@@ -200,6 +207,27 @@ impl Daemon {
         })
     }
 
+    /// The `inbox` snapshot. A daemon that doesn't run Pipelines has
+    /// nothing in its Inbox, ever.
+    fn subscribe_inbox(&self, subs: &mut Subscriptions) -> ServerFrame {
+        let Some(runs) = &self.runs else {
+            return ServerFrame::Topic(TopicUpdate::Inbox {
+                seq: 0,
+                update: InboxUpdate::Snapshot(Default::default()),
+            });
+        };
+        let InboxSubscription {
+            seq,
+            snapshot,
+            deltas,
+        } = runs.inbox().subscribe();
+        subs.inbox = Some(deltas);
+        ServerFrame::Topic(TopicUpdate::Inbox {
+            seq,
+            update: InboxUpdate::Snapshot(snapshot),
+        })
+    }
+
     /// The frames for `next`. A subscriber that fell too far behind to
     /// catch up starts over: from a fresh snapshot on `watched_prs`, and
     /// from the journal on a Run.
@@ -210,6 +238,11 @@ impl Daemon {
                 update: WatchedPrsUpdate::Delta(delta),
             })],
             Next::WatchedPrsLagged => vec![self.subscribe_watched_prs(subs)],
+            Next::Inbox(seq, delta) => vec![ServerFrame::Topic(TopicUpdate::Inbox {
+                seq,
+                update: InboxUpdate::Delta(delta),
+            })],
+            Next::InboxLagged => vec![self.subscribe_inbox(subs)],
             Next::Run(run, event) => run_frame(subs, run, event).into_iter().collect(),
             Next::Log(key, record) => log_frame(subs, key, vec![record]).into_iter().collect(),
             Next::LogsLagged => {
@@ -335,7 +368,12 @@ impl Daemon {
                 );
             }
             Command::SaveLibraryStep { step, text } => {
-                return respond(self.library.save(&step, &text).map(|()| Reply::Done));
+                let saved = self.library.save(&step, &text);
+                if saved.is_ok() {
+                    // The Step may be the one an invalid Pipeline lacked.
+                    self.sync_runs().await;
+                }
+                return respond(saved.map(|()| Reply::Done));
             }
             Command::DeleteLibraryStep { step } => {
                 return respond(self.library.delete(&step).map(|()| Reply::Done));
@@ -348,7 +386,13 @@ impl Daemon {
             }
             Command::RetryStep { run, step } => {
                 return respond(match self.runs_or_refuse() {
-                    Ok(runs) => runs.retry(run, &step).await.map(|()| Reply::Done),
+                    Ok(runs) => runs.retry(run, &step, &actor).await.map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
+            Command::DismissEntry { entry } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs.inbox().dismiss(entry, &actor).map(|()| Reply::Done),
                     Err(error) => Err(error),
                 });
             }
@@ -458,6 +502,13 @@ fn try_next(subs: &mut Subscriptions) -> Next {
             Err(_) => {}
         }
     }
+    if let Some(deltas) = &mut subs.inbox {
+        match deltas.try_recv() {
+            Ok((seq, delta)) => return Next::Inbox(seq, delta),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => return Next::InboxLagged,
+            Err(_) => {}
+        }
+    }
     if let Some(live) = &mut subs.live {
         match live.try_recv() {
             Ok((run, event)) => return Next::Run(run, event),
@@ -480,6 +531,7 @@ fn try_next(subs: &mut Subscriptions) -> Next {
 async fn recv(subs: &mut Subscriptions) -> Next {
     let Subscriptions {
         watched_prs,
+        inbox,
         live,
         live_logs,
         ..
@@ -493,6 +545,16 @@ async fn recv(subs: &mut Subscriptions) -> Next {
         } => match received {
             Ok((seq, delta)) => Next::WatchedPrs(seq, delta),
             Err(broadcast::error::RecvError::Lagged(_)) => Next::WatchedPrsLagged,
+            Err(broadcast::error::RecvError::Closed) => Next::Nothing,
+        },
+        received = async {
+            match inbox {
+                Some(deltas) => deltas.recv().await,
+                None => std::future::pending().await,
+            }
+        } => match received {
+            Ok((seq, delta)) => Next::Inbox(seq, delta),
+            Err(broadcast::error::RecvError::Lagged(_)) => Next::InboxLagged,
             Err(broadcast::error::RecvError::Closed) => Next::Nothing,
         },
         received = async {

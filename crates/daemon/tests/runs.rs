@@ -156,6 +156,8 @@ impl Client {
                 WatchedPrsUpdate::Snapshot(snapshot) => self.prs = snapshot,
                 WatchedPrsUpdate::Delta(delta) => self.prs.apply(delta),
             },
+            // These tests don't subscribe to the Inbox.
+            TopicUpdate::Inbox { .. } => {}
             TopicUpdate::Run { id, seq, event, .. } => {
                 self.events.push((id, seq));
                 let view = self.runs.entry(id).or_default();
@@ -832,6 +834,18 @@ fn a_step_interrupted_by_two_restarts_in_a_row_ends_in_error() {
     });
 
     assert_eq!(restarts.slow_pids().len(), 2, "no third start");
+    let store = Store::open(&restarts.data.path().join("state.db")).unwrap();
+    let open = store.open_entries().unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    let (entry, _) = &open[0];
+    assert_eq!(entry.title, "Not shippable");
+    assert!(
+        entry
+            .reasons
+            .iter()
+            .any(|r| r.contains("error(daemon_restart)")),
+        "the PR entry names it: {entry:?}"
+    );
 }
 
 #[test]

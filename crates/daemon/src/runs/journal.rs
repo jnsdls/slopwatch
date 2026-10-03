@@ -77,15 +77,17 @@ impl Journal {
 
     /// Prunes an ended Run's journal down to the events that rebuild its
     /// record: the start, each Step's last settle, the Waivers, the last
-    /// Gate, the Effects and the end. Then appends [`RunEvent::Pruned`], so
-    /// a client that already had the Run learns its detail is gone.
-    /// Folding what's left still gives the Run's final state, for a client
-    /// starting from scratch or from any sequence number it had.
+    /// Gate, the Effects, the end and each Inbox entry's last state. Then
+    /// appends [`RunEvent::Pruned`], so a client that already had the Run
+    /// learns its detail is gone. Folding what's left still gives the Run's
+    /// final state, for a client starting from scratch or from any sequence
+    /// number it had.
     pub fn prune(&self, run: RunId, at: i64) -> Result<(), StoreError> {
         let live = self.live.lock().expect("no panics while appending");
         let mut keep = Vec::new();
         let mut settled = std::collections::HashMap::new();
         let mut gate = None;
+        let mut inbox = std::collections::HashMap::new();
         for Journalled { seq, event, .. } in self.replay(run, 0)? {
             match event {
                 // What a Step did on GitHub and what the developer waived
@@ -98,6 +100,9 @@ impl Journal {
                     settled.insert(step, seq);
                 }
                 RunEvent::Gate { .. } => gate = Some(seq),
+                RunEvent::Inbox { entry } => {
+                    inbox.insert(entry.id, seq);
+                }
                 RunEvent::StepStarted { .. }
                 | RunEvent::StepProgress { .. }
                 | RunEvent::StepRetried { .. }
@@ -106,6 +111,7 @@ impl Journal {
         }
         keep.extend(settled.into_values());
         keep.extend(gate);
+        keep.extend(inbox.into_values());
         let event = RunEvent::Pruned { at };
         let text = serde_json::to_string(&event).expect("Run events always serialize");
         let ts = now_ms();

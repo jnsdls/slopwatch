@@ -305,9 +305,9 @@ pub struct Controls<'a> {
 }
 
 /// Keeps a link to the daemon on `path` as this build's client. Each
-/// connection subscribes to `watched_prs` and sends the commands that
-/// arrive on `controls.commands`. Commands sent while the daemon is down
-/// are dropped. Returns once `report` returns false.
+/// connection subscribes to `watched_prs` and `inbox`, and sends the
+/// commands that arrive on `controls.commands`. Commands sent while the
+/// daemon is down are dropped. Returns once `report` returns false.
 ///
 /// A daemon from another build, or another dialect, gets replaced through
 /// `agent`: `restart`, then `unregister` and `register` (ADR 0009), and
@@ -451,11 +451,12 @@ fn serve(
     report: &mut dyn FnMut(LinkEvent) -> bool,
 ) -> bool {
     let commands = controls.commands;
-    let subscribe = Command::Subscribe {
-        topic: Topic::WatchedPrs,
-        since: None,
-    };
-    if session.send(subscribe).is_err()
+    let subscribed = [Topic::WatchedPrs, Topic::Inbox].into_iter().all(|topic| {
+        session
+            .send(Command::Subscribe { topic, since: None })
+            .is_ok()
+    });
+    if !subscribed
         || session
             .ws
             .get_ref()
