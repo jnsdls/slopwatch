@@ -54,6 +54,20 @@ pub enum WaiveTarget {
     Gate,
 }
 
+/// In Graph mode the sources column collapses and the PR list narrows to
+/// this, leaving the rest of the window to the PR pane.
+pub const GRAPH_MODE_LIST_WIDTH: f32 = 300.;
+/// The PR pane's padding on each side.
+pub const PANE_PADDING: f32 = 16.;
+/// The graph's border, on each side.
+pub const GRAPH_BORDER: f32 = 1.;
+
+/// The width the graph gets in Graph mode in a window `window_width` wide.
+pub fn canvas_width(window_width: f32) -> f32 {
+    // The pane's left border takes one more pixel.
+    window_width - GRAPH_MODE_LIST_WIDTH - 1. - 2. * (PANE_PADDING + GRAPH_BORDER)
+}
+
 /// How the PR pane draws the Run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RunMode {
@@ -63,6 +77,18 @@ pub enum RunMode {
     /// The node canvas. It needs the room, so the sources column collapses
     /// while a PR shows in Graph mode.
     Graph,
+}
+
+impl RunMode {
+    /// In the order the toggle lists them.
+    pub const ALL: [RunMode; 2] = [RunMode::List, RunMode::Graph];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RunMode::List => "List",
+            RunMode::Graph => "Graph",
+        }
+    }
 }
 
 impl RunPane {

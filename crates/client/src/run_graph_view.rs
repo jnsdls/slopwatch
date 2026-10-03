@@ -11,9 +11,19 @@ use slopwatch_core::{GateState, Verdict};
 use slopwatch_protocol::{GateTerm, RunView, StepStatus, StepView};
 
 use crate::run_graph::{
-    self, ANY_OF_HEADER, EdgeKind, GATE_PADDING, Layout, NodeId, Rect, Role, TERM_HEIGHT,
+    self, ALL_OF_HEIGHT, ANY_OF_HEADER, EdgeKind, GATE_BORDER, GATE_PADDING, GATE_TITLE_HEIGHT,
+    Layout, NodeId, Rect, Role, TERM_HEIGHT,
 };
-use crate::run_pane::{Tone, gate_tone, step_state, step_tone};
+use crate::run_pane::{GRAPH_BORDER, Tone, gate_tone, step_state, step_tone};
+
+/// The color a [`Tone`] reads in.
+pub fn tone_color(theme: &Theme, tone: Tone) -> Hsla {
+    match tone {
+        Tone::Good => theme.success,
+        Tone::Bad => theme.danger,
+        Tone::Neutral => theme.muted_foreground,
+    }
+}
 
 /// What a click on a Step's node does.
 pub type OnSelect = Rc<dyn Fn(&str, &mut Window, &mut App)>;
@@ -64,7 +74,7 @@ pub fn run_graph(
         .w_full()
         .flex_none()
         .rounded_md()
-        .border_1()
+        .border(px(GRAPH_BORDER))
         .border_color(theme.border)
         .bg(theme.muted)
         .overflow_x_scroll()
@@ -85,9 +95,9 @@ struct Colors {
 impl Colors {
     fn new(theme: &Theme) -> Self {
         Colors {
-            good: theme.success,
-            bad: theme.danger,
-            neutral: theme.muted_foreground,
+            good: tone_color(theme, Tone::Good),
+            bad: tone_color(theme, Tone::Bad),
+            neutral: tone_color(theme, Tone::Neutral),
             running: theme.info,
             edge: theme.muted_foreground.opacity(0.7),
             gate: hsla(250. / 360., 0.5, 0.62, 1.),
@@ -247,7 +257,11 @@ fn step_node(
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .truncate()
-                .child(info.plugin.clone()),
+                .child(if info.write {
+                    format!("{} · terminal", info.plugin)
+                } else {
+                    info.plugin.clone()
+                }),
         )
         .child(chips)
 }
@@ -269,12 +283,12 @@ fn gate_node(view: &RunView, terms: &[GateTerm], rect: Rect, theme: &Theme, colo
         .p(px(GATE_PADDING))
         .rounded_xl()
         .bg(theme.background)
-        .border_2()
+        .border(px(GATE_BORDER))
         .border_color(color)
         .overflow_hidden()
         .child(
             div()
-                .h(px(22.))
+                .h(px(GATE_TITLE_HEIGHT))
                 .flex()
                 .items_center()
                 .justify_between()
@@ -292,7 +306,7 @@ fn gate_node(view: &RunView, terms: &[GateTerm], rect: Rect, theme: &Theme, colo
         )
         .child(
             div()
-                .h(px(18.))
+                .h(px(ALL_OF_HEIGHT))
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child("ALL OF"),

@@ -24,11 +24,10 @@ use crate::library_view::LibraryView;
 use crate::link::{LinkEvent, LinkState};
 use crate::link_view::LinkView;
 use crate::prs::{Prs, Source, poll_line, status_line, storage_line};
-use crate::run_graph::GRAPH_MODE_LIST_WIDTH;
-use crate::run_graph_view::run_graph;
+use crate::run_graph_view::{run_graph, tone_color};
 use crate::run_pane::{
-    RunMode, RunPane, Tone, WaiveTarget, end_label, gate_tone, run_label, run_tone, step_line,
-    step_tone, waiver_line,
+    GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, end_label, gate_tone,
+    run_label, run_tone, step_line, step_tone, waiver_line,
 };
 use crate::step_log::{self, LogViewer, Row};
 
@@ -585,11 +584,7 @@ impl MainView {
     /// shown as a Step list with the Gate as its last row, or as a graph.
     fn pr_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let color = |tone: Tone| match tone {
-            Tone::Good => theme.success,
-            Tone::Bad => theme.danger,
-            Tone::Neutral => theme.muted_foreground,
-        };
+        let color = |tone| tone_color(&theme, tone);
         let mut pane = div()
             .id("pr-pane")
             .map(|this| {
@@ -603,7 +598,7 @@ impl MainView {
             .flex()
             .flex_col()
             .gap_3()
-            .p_4()
+            .p(px(PANE_PADDING))
             .border_l_1()
             .border_color(theme.border)
             .overflow_y_scroll();
@@ -645,24 +640,17 @@ impl MainView {
                     ButtonGroup::new("run-mode")
                         .small()
                         .outline()
-                        .child(
-                            Button::new("run-mode-list")
-                                .label("List")
-                                .selected(mode == RunMode::List),
-                        )
-                        .child(
-                            Button::new("run-mode-graph")
-                                .label("Graph")
-                                .selected(mode == RunMode::Graph),
-                        )
+                        .children(RunMode::ALL.map(|each| {
+                            Button::new(SharedString::from(format!("run-mode-{}", each.label())))
+                                .label(each.label())
+                                .selected(mode == each)
+                        }))
                         .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
-                            let mode = if clicked.contains(&1) {
-                                RunMode::Graph
-                            } else {
-                                RunMode::List
-                            };
-                            this.run_pane.set_mode(mode);
-                            cx.notify();
+                            if let Some(&mode) = clicked.first().and_then(|&i| RunMode::ALL.get(i))
+                            {
+                                this.run_pane.set_mode(mode);
+                                cx.notify();
+                            }
                         })),
                 ),
         );
@@ -947,16 +935,12 @@ impl MainView {
             )
     }
 
-    /// A Step's row: its Verdict and reason, Findings, and when open, its
-    /// log tail. The list shows one per Step, and the graph shows the open
+    /// A Step's row with its Verdict and reason, its Findings, and its log
+    /// tail while open. The list shows one per Step, and the graph shows the open
     /// Step's below the canvas.
     fn step_row(&self, step: &StepView, view: &RunView, cx: &mut Context<Self>) -> Stateful<Div> {
         let theme = cx.theme().clone();
-        let color = |tone: Tone| match tone {
-            Tone::Good => theme.success,
-            Tone::Bad => theme.danger,
-            Tone::Neutral => theme.muted_foreground,
-        };
+        let color = |tone| tone_color(&theme, tone);
         let open = self.run_pane.open_step() == Some(step.info.id.as_str());
         let toggled = step.info.id.clone();
         let mut row = div()

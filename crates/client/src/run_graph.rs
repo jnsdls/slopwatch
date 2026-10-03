@@ -1,9 +1,11 @@
 //! Lays a Pipeline out as a left-to-right graph: each Step in the column
 //! after the Steps it needs, the Gate after the Steps it reads, and the
 //! Steps that need the Gate (Merge, Fix) after it. No GPUI here, so the
-//! layout tests without a window. The Run graph draws it today, and the
-//! Pipeline editor's canvas builds on the same layout.
+//! layout tests without a window. It takes only Step ids, `needs` and the
+//! Gate's terms, so the Pipeline editor's canvas can place nodes with it
+//! too.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use slopwatch_core::GATE;
@@ -16,25 +18,15 @@ pub const COLUMN_GAP: f32 = 40.;
 pub const ROW_GAP: f32 = 14.;
 /// Room around the graph, so selection outlines and arrowheads aren't cut.
 pub const MARGIN: f32 = 8.;
-/// The Gate node's padding on each side.
+/// The Gate node's border and padding, on each side.
+pub const GATE_BORDER: f32 = 2.;
 pub const GATE_PADDING: f32 = 8.;
-/// The Gate's title row plus its "ALL OF" label.
-pub const GATE_HEADER: f32 = 40.;
+/// The Gate's title row, then its "ALL OF" label.
+pub const GATE_TITLE_HEIGHT: f32 = 22.;
+pub const ALL_OF_HEIGHT: f32 = 18.;
 pub const TERM_HEIGHT: f32 = 20.;
-/// The "ANY OF" label atop an any-of group, plus the gap below the group.
+/// The "ANY OF" label atop an any-of group.
 pub const ANY_OF_HEADER: f32 = 20.;
-
-/// In Graph mode the sources column collapses and the PR list narrows to
-/// this, leaving the rest of the window to the PR pane.
-pub const GRAPH_MODE_LIST_WIDTH: f32 = 300.;
-/// The PR pane's padding on each side.
-pub const PANE_PADDING: f32 = 16.;
-
-/// The width the canvas gets in Graph mode in a window `window_width` wide.
-pub fn canvas_width(window_width: f32) -> f32 {
-    // The pane's left border takes one more pixel.
-    window_width - GRAPH_MODE_LIST_WIDTH - 2. * PANE_PADDING - 1.
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeId {
@@ -117,7 +109,7 @@ pub enum Role {
     Gated,
     /// It runs after the Gate, like Merge and Fix.
     AfterGate,
-    /// Neither: it only advises, and draws dashed.
+    /// Neither. It only advises, and draws dashed.
     Advisory,
 }
 
@@ -157,7 +149,8 @@ pub fn gate_terms(view: &RunView) -> Vec<GateTerm> {
 
 /// The Gate node's height for `terms`.
 pub fn gate_height(terms: &[GateTerm]) -> f32 {
-    let height = GATE_HEADER + 2. * GATE_PADDING + terms.iter().map(term_height).sum::<f32>();
+    let frame = 2. * (GATE_BORDER + GATE_PADDING) + GATE_TITLE_HEIGHT + ALL_OF_HEIGHT;
+    let height = frame + terms.iter().map(term_height).sum::<f32>();
     height.max(NODE_HEIGHT)
 }
 
@@ -176,28 +169,34 @@ pub fn layout(steps: &[StepInfo], terms: &[GateTerm]) -> Layout {
 
     // Each column's nodes, top to bottom: the Gate, then the Steps the Gate
     // reads or that follow it, then advisory Steps, each in Pipeline order.
-    let mut columns: Vec<Vec<(NodeId, f32, f32)>> = Vec::new();
-    let mut place = |column: usize, node: (NodeId, f32, f32)| {
+    let mut columns: Vec<Vec<Sized>> = Vec::new();
+    let mut place = |column: usize, node: Sized| {
         if columns.len() <= column {
             columns.resize_with(column + 1, Vec::new);
         }
         columns[column].push(node);
     };
-    place(
-        graph.gate_column(),
-        (NodeId::Gate, GATE_WIDTH, gate_height(terms)),
-    );
+    let gate = Sized {
+        id: NodeId::Gate,
+        width: GATE_WIDTH,
+        height: gate_height(terms),
+    };
+    place(graph.gate_column(), gate);
     for advisory in [false, true] {
         for step in steps {
             if (roles[step.id.as_str()] == Role::Advisory) == advisory {
-                let node = (NodeId::Step(step.id.clone()), NODE_WIDTH, NODE_HEIGHT);
+                let node = Sized {
+                    id: NodeId::Step(step.id.clone()),
+                    width: NODE_WIDTH,
+                    height: NODE_HEIGHT,
+                };
                 place(graph.column(&step.id), node);
             }
         }
     }
 
-    let column_height = |nodes: &[(NodeId, f32, f32)]| {
-        let heights: f32 = nodes.iter().map(|(_, _, height)| height).sum();
+    let column_height = |nodes: &[Sized]| {
+        let heights: f32 = nodes.iter().map(|node| node.height).sum();
         heights + ROW_GAP * nodes.len().saturating_sub(1) as f32
     };
     let tallest = columns
@@ -209,19 +208,19 @@ pub fn layout(steps: &[StepInfo], terms: &[GateTerm]) -> Layout {
     for column in &columns {
         let mut y = MARGIN + (tallest - column_height(column)) / 2.;
         let mut width: f32 = 0.;
-        for (id, node_width, height) in column {
+        for node in column {
             let rect = Rect {
                 x,
                 y,
-                width: *node_width,
-                height: *height,
+                width: node.width,
+                height: node.height,
             };
             nodes.push(Node {
-                id: id.clone(),
+                id: node.id.clone(),
                 rect,
             });
-            y += height + ROW_GAP;
-            width = width.max(*node_width);
+            y += node.height + ROW_GAP;
+            width = width.max(node.width);
         }
         if !column.is_empty() {
             x += width + COLUMN_GAP;
@@ -270,15 +269,24 @@ pub fn layout(steps: &[StepInfo], terms: &[GateTerm]) -> Layout {
     layout
 }
 
+/// A node before it has a place.
+struct Sized {
+    id: NodeId,
+    width: f32,
+    height: f32,
+}
+
 /// The Steps by id, for walking `needs`.
 struct Graph<'a> {
     steps: HashMap<&'a str, &'a StepInfo>,
+    columns: RefCell<HashMap<&'a str, usize>>,
 }
 
 impl<'a> Graph<'a> {
     fn new(steps: &'a [StepInfo]) -> Self {
         Graph {
             steps: steps.iter().map(|step| (step.id.as_str(), step)).collect(),
+            columns: RefCell::default(),
         }
     }
 
@@ -306,9 +314,16 @@ impl<'a> Graph<'a> {
     /// The column after every Step `id` needs, and after the Gate when it
     /// needs the Gate.
     fn column(&self, id: &str) -> usize {
+        if let Some(&column) = self.columns.borrow().get(id) {
+            return column;
+        }
         let after_needs = self.needs(id).map(|need| self.column(&need.id) + 1);
         let after_gate = self.needs_gate(id).then(|| self.gate_column() + 1);
-        after_needs.chain(after_gate).max().unwrap_or(0)
+        let column = after_needs.chain(after_gate).max().unwrap_or(0);
+        if let Some((&key, _)) = self.steps.get_key_value(id) {
+            self.columns.borrow_mut().insert(key, column);
+        }
+        column
     }
 
     /// The column after every Step the Gate reads.
@@ -495,7 +510,7 @@ mod tests {
         assert_eq!(three - two, TERM_HEIGHT);
         assert_eq!(grouped - two, ANY_OF_HEADER + 2. * TERM_HEIGHT);
         assert_eq!(
-            gate_height(&[term("ci")]),
+            gate_height(&[]),
             NODE_HEIGHT,
             "the Gate is never shorter than a Step"
         );
@@ -505,7 +520,7 @@ mod tests {
     fn a_starter_sized_pipeline_fits_the_canvas_at_1440_px() {
         let (steps, terms) = ask_me_then_merge();
 
-        assert!(layout(&steps, &terms).width <= canvas_width(1440.));
+        assert!(layout(&steps, &terms).width <= crate::run_pane::canvas_width(1440.));
     }
 
     #[test]

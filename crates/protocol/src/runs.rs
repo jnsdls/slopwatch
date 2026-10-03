@@ -138,7 +138,7 @@ pub struct StepInfo {
     pub needs: Vec<String>,
     /// The Gate reads this Step. A Step it doesn't read is advisory.
     pub gated: bool,
-    /// The Step declares `workspace: write`, so it is terminal: its commit
+    /// The Step declares `workspace: write`, so it is terminal. Its commit
     /// ends the Run (ADR 0001).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub write: bool,
@@ -153,7 +153,7 @@ pub struct StepInfo {
 pub enum GateTerm {
     /// The Step must pass, or also be skipped when it accepts that.
     Step { id: String, accepts_skipped: bool },
-    /// An `or:` block: one of its terms must hold.
+    /// An `or:` block. One of its terms must hold.
     AnyOf { terms: Vec<GateTerm> },
     /// Any other expression, as the Pipeline file writes it.
     Other { text: String },
