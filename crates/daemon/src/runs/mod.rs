@@ -63,8 +63,8 @@ use slopwatch_protocol::step::{
     ToStep,
 };
 use slopwatch_protocol::{
-    Actor, Cause, Closing, GateTerm, LogFilter, LogKey, LogPage, LogRecord, PrRef, RepoName,
-    RunEvent, RunId, SecretInfo, SecretValue, StepInfo, StepLogPage, Waiver,
+    Actor, Answer, Cause, Closing, GateTerm, LogFilter, LogKey, LogPage, LogRecord, PrRef,
+    RepoName, RunEvent, RunId, SecretInfo, SecretValue, StepInfo, StepLogPage, Waiver,
 };
 use tokio::sync::mpsc;
 
@@ -73,7 +73,7 @@ use crate::clones::{Clones, PipelineAt};
 use crate::github::{GitHub, GitHubError, OpenPr};
 use crate::inbox::Inbox;
 use crate::notifications::Notifications;
-use crate::plugins::Plugins;
+use crate::plugins::{Plugins, human};
 use crate::secrets::{Keychain, Mask, SecretError, Secrets, held_by_cause, missing_secret};
 use crate::shell_env;
 use crate::store::{ActiveRun, NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
@@ -431,6 +431,20 @@ impl Runs {
                     "Secret work failed: {error}"
                 )))
             })
+    }
+
+    /// Answers the Human Step `step`, which waits in Run `run`. The note,
+    /// if not blank, goes into the Step's Outcome for later Steps to read.
+    pub async fn answer(
+        &self,
+        run: RunId,
+        step: &str,
+        answer: Answer,
+        note: Option<String>,
+        actor: &Actor,
+    ) -> Result<(), RunError> {
+        self.command(|engine| engine.answer_step(run, step, answer, note, actor))
+            .await
     }
 
     /// The Inbox, which these Runs raise and close entries in.
@@ -827,6 +841,19 @@ struct Running {
     reported: bool,
     /// The request ids of Effects it asked for that haven't finished.
     awaiting: HashSet<String>,
+    /// Where it stands with the developer, for a Step that asks.
+    question: Question,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Question {
+    NotAsked,
+    /// In the Inbox, waiting for the developer.
+    Asked,
+    /// The developer answered, and the Step's Outcome is on its way. Its
+    /// Inbox entry closes this way once the Outcome is in, so an answer a
+    /// restart lost leaves the entry open to answer again.
+    Answered(Closing),
 }
 
 /// What the engine hears from the tasks around it.
@@ -1564,7 +1591,7 @@ impl Engine {
     }
 
     fn try_schedule(&mut self) -> Result<(), StoreError> {
-        while self.processes.len() < STEP_CAP {
+        while self.working().count() < STEP_CAP {
             let Some(index) = self.ready.iter().position(|(run, step)| {
                 let Some(step) = self.run(*run).and_then(|run| run.pipeline.step(step)) else {
                     return true;
@@ -1575,7 +1602,7 @@ impl Engine {
                     .and_then(|manifest| manifest.concurrency);
                 // A cap of 0 would hold the Plugin's Steps forever.
                 cap.is_none_or(|cap| {
-                    let running = self.processes.values().filter(|p| **p == step.plugin);
+                    let running = self.working().filter(|plugin| **plugin == step.plugin);
                     running.count() < cap.max(1) as usize
                 })
             }) else {
@@ -1592,6 +1619,23 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// The Plugins of the Step processes that count toward the caps: all
+    /// but the ones waiting for the developer, which may wait for days.
+    fn working(&self) -> impl Iterator<Item = &String> {
+        self.processes
+            .iter()
+            .filter(|((run, step, attempt), _)| {
+                let waiting = self
+                    .run(*run)
+                    .and_then(|run| run.running.get(step))
+                    .is_some_and(|running| {
+                        running.attempt == *attempt && running.question == Question::Asked
+                    });
+                !waiting
+            })
+            .map(|(_, plugin)| plugin)
     }
 
     fn key_of(&self, run: RunId) -> Option<PrKey> {
@@ -1754,6 +1798,7 @@ impl Engine {
                 handle,
                 reported: false,
                 awaiting: HashSet::new(),
+                question: Question::NotAsked,
             },
         );
         self.journal.append(
@@ -1858,10 +1903,15 @@ impl Engine {
             Some(reason) => run.reasons.insert(step.to_owned(), reason.clone()),
             None => run.reasons.remove(step),
         };
+        let mut closing = Closing::StepSettled;
         if let Some(running) = run.running.get_mut(step) {
             running.reported = true;
+            if let Question::Answered(how) = &running.question {
+                closing = how.clone();
+            }
         }
         run.interrupted.remove(step);
+        self.inbox.close_human(run.id, step, closing)?;
         self.journal.append(
             run.id,
             RunEvent::StepSettled {
@@ -1967,6 +2017,9 @@ impl Engine {
                     )?;
                 }
             }
+            Report::Message(FromStep::Ask { prompt }) if !reported => {
+                self.on_ask(&key, &step, &prompt)?;
+            }
             Report::Message(FromStep::Progress {
                 message: Some(message),
             }) if !reported => {
@@ -1989,6 +2042,79 @@ impl Engine {
         if let Some(running) = self.active[key].running.get(step) {
             running.handle.cancel();
         }
+        Ok(())
+    }
+
+    /// A Human Step asked the developer, so it goes in the Inbox and stops
+    /// counting toward the Step caps. A Step that got this far didn't bring
+    /// the daemon down, so the restarts that interrupted it stop counting.
+    fn on_ask(&mut self, key: &PrKey, step: &str, prompt: &str) -> Result<(), StoreError> {
+        let run = self
+            .active
+            .get_mut(key)
+            .expect("only active Runs get reports");
+        let plugin = &run
+            .pipeline
+            .step(step)
+            .expect("running Steps are Pipeline Steps")
+            .plugin;
+        if plugin != human::ID {
+            let message = format!("asked the developer, which only `{}` may", human::ID);
+            return self.protocol_error(key, step, &message);
+        }
+        let running = run.running.get_mut(step).expect("the report matched it");
+        if running.question != Question::NotAsked {
+            return Ok(());
+        }
+        running.question = Question::Asked;
+        let id = run.id;
+        self.store.clear_restarts(id, step)?;
+        self.inbox.ask(id, pr_ref(&key.0, key.1), step, prompt)
+    }
+
+    /// The developer answers the Human Step `step` in Run `id`. The Step
+    /// hears the answer and reports its Outcome, which closes the entry.
+    fn answer_step(
+        &mut self,
+        id: RunId,
+        step: &str,
+        answer: Answer,
+        note: Option<String>,
+        actor: &Actor,
+    ) -> Result<(), RunError> {
+        let key = self.going(id)?;
+        let run = self.active.get_mut(&key).expect("found above");
+        if run.pipeline.step(step).is_none() {
+            return Err(RunError::NotFound(format!("Run {id} has no Step `{step}`")));
+        }
+        if run.interrupted.contains_key(step) {
+            return Err(RunError::Invalid(format!(
+                "Step `{step}` is starting again after a daemon restart. Answer once it asks \
+                 again."
+            )));
+        }
+        let Some(running) = run
+            .running
+            .get_mut(step)
+            .filter(|running| running.question == Question::Asked && !running.reported)
+        else {
+            return Err(RunError::Invalid(format!(
+                "Step `{step}` isn't waiting for an answer"
+            )));
+        };
+        let note = note
+            .map(|note| note.trim().to_owned())
+            .filter(|note| !note.is_empty());
+        running.handle.send(ToStep::Answer {
+            answer,
+            note: note.clone(),
+            actor: actor.clone(),
+        });
+        running.question = Question::Answered(Closing::Answered {
+            action: answer.to_string(),
+            actor: actor.clone(),
+            note,
+        });
         Ok(())
     }
 
@@ -2048,7 +2174,8 @@ impl Engine {
         self.inbox.run_ended(run.id)?;
         // A Run the developer cancelled, or one a push or close ended,
         // needs nothing from them.
-        // Nor does one whose every failure a shared cause's entry explains.
+        // Nor does one whose every failure a shared cause's entry explains,
+        // or one their rejection ended.
         if reason == EndReason::NotShippable {
             let raised = match couldnt_merge(&run) {
                 Some(reasons) => Some((COULDNT_MERGE, reasons)),
@@ -2454,15 +2581,23 @@ const NOT_SHIPPABLE: &str = "Not shippable";
 
 /// Why a Run ended not shippable, one line per Step: every errored Step,
 /// and every Step the Gate reads that settled other than pass or skipped.
-/// `None` when a shared cause, such as a missing Secret, explains every
-/// one of them, and its own entry asks the developer.
+/// A Human Step the developer rejected isn't news to them, so it isn't
+/// listed. `None` when a rejection or a shared cause, such as a missing
+/// Secret, explains every failure, since the developer already knows or
+/// the cause's own entry asks.
 fn not_shippable(run: &Active) -> Option<Vec<String>> {
     let mut reasons = Vec::new();
     let mut all_held = true;
+    let mut rejected = false;
     for step in run.pipeline.ordered_steps() {
         let Some(StepState::Settled(verdict)) = run.state.steps.get(&step.id) else {
             continue;
         };
+        // A Human Step fails only when the developer rejects it.
+        if *verdict == Verdict::Fail && step.plugin == human::ID {
+            rejected = true;
+            continue;
+        }
         let counts = match verdict {
             Verdict::Error => true,
             Verdict::Pass | Verdict::Skipped => false,
@@ -2483,6 +2618,9 @@ fn not_shippable(run: &Active) -> Option<Vec<String>> {
         });
     }
     if reasons.is_empty() {
+        if rejected {
+            return None;
+        }
         reasons.push("The Gate didn't pass".to_owned());
         all_held = false;
     }

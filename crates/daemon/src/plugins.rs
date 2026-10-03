@@ -3,10 +3,12 @@
 //! Built-in Plugins run from the daemon's own executable, as
 //! `slopwatchd plugin <name> describe` and `slopwatchd plugin <name> run`,
 //! so they ship and update with the app and speak the Step contract like
-//! any third-party Plugin. `ci` and `merge` are built so far. Third-party Plugins
-//! and their Approval come with their own ticket (ADR 0012).
+//! any third-party Plugin. `ci`, `human` and `merge` are built so far.
+//! Third-party Plugins and their Approval come with their own ticket
+//! (ADR 0012).
 
 pub mod ci;
+pub mod human;
 pub mod merge;
 
 use std::collections::HashMap;
@@ -157,7 +159,7 @@ fn file_hash(path: &Path) -> Option<String> {
 
 /// The manifests of the Plugins that ship with the app.
 fn builtins() -> Vec<Manifest> {
-    vec![ci::manifest(), merge::manifest()]
+    vec![ci::manifest(), merge::manifest(), human::manifest()]
 }
 
 fn builtin_manifest(plugin: &str) -> Option<Manifest> {
@@ -198,6 +200,7 @@ pub fn main(args: &[String]) -> ExitCode {
         "run" => match name.as_str() {
             "ci" => ci::run(std::io::stdin().lock(), std::io::stdout().lock()),
             "merge" => merge::run(std::io::stdin().lock(), std::io::stdout().lock()),
+            "human" => human::run(std::io::stdin().lock(), std::io::stdout().lock()),
             _ => unreachable!("every built-in manifest has a session"),
         },
         _ => {

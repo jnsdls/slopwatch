@@ -570,6 +570,17 @@ impl Store {
         Ok(restarts)
     }
 
+    /// Forgets the restarts that interrupted a running Step, once it shows
+    /// it got past whatever might have brought the daemon down, such as a
+    /// Human Step that asked and now only waits.
+    pub fn clear_restarts(&self, run: RunId, step: &str) -> Result<(), StoreError> {
+        self.db().execute(
+            "UPDATE run_steps SET restarts = 0 WHERE run_id = ?1 AND step = ?2",
+            params![run.0 as i64, step],
+        )?;
+        Ok(())
+    }
+
     /// Records the Plugin version a Step is about to run with, which its
     /// Outcome is reused under.
     pub fn set_plugin_version(

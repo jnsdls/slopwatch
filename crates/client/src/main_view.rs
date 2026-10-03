@@ -14,12 +14,14 @@ use gpui_kit::*;
 use slopwatch_core::WaiverCategory;
 use slopwatch_protocol::{
     Command, Flavor, InboxEntry, LogLevel, LogSource, PrRef, PrStatus, PullRequest, Reply,
-    RepoName, ResponseBody, RunView, StepStatus, StepView, TopicUpdate,
+    RepoName, ResponseBody, RunView, Scope, StepStatus, StepView, TopicUpdate,
 };
 
 use crate::agent::Agent;
 use crate::dock;
-use crate::inbox::{InboxModel, actions, badge, held_line, history_line};
+use crate::inbox::{
+    ANSWERS, InboxModel, actions, answer as answer_entry, badge, held_line, history_line,
+};
 use crate::library_view::LibraryView;
 use crate::link::{LinkEvent, LinkState};
 use crate::link_view::LinkView;
@@ -67,6 +69,8 @@ pub struct MainView {
     log_search: Entity<InputState>,
     /// The Waiver form's reason field.
     waiver_reason: Entity<InputState>,
+    /// The note that goes with an answer to a Human Step.
+    answer_note: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -83,6 +87,8 @@ impl MainView {
         let log_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search the log"));
         let waiver_reason =
             cx.new(|cx| InputState::new(window, cx).placeholder("Why it doesn't block this PR"));
+        let answer_note = cx
+            .new(|cx| InputState::new(window, cx).placeholder("A note for later Steps (optional)"));
         let _subscriptions = vec![
             cx.subscribe_in(
                 &log_search,
@@ -115,6 +121,7 @@ impl MainView {
         Self {
             log_search,
             waiver_reason,
+            answer_note,
             _subscriptions,
             link: LinkState::Connecting,
             link_view: cx.new(|_| LinkView::new(agent, reregister)),
@@ -639,7 +646,7 @@ impl MainView {
                 .and_then(|pr| self.prs.pr(&pr.repo, pr.number))
                 .cloned();
             let card = self
-                .entry_card(entry, "inbox", cx)
+                .entry_card(entry, "inbox", false, cx)
                 .child(
                     div()
                         .text_xs()
@@ -665,6 +672,7 @@ impl MainView {
         &self,
         entry: &InboxEntry,
         prefix: &str,
+        with_answers: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let theme = cx.theme().clone();
@@ -692,6 +700,24 @@ impl MainView {
                         cx.notify();
                     })),
             );
+        }
+        // A Human Step is answered next to the note field, which only the
+        // PR pane draws.
+        if with_answers && matches!(entry.scope, Scope::Human { .. }) {
+            for (label, answer) in ANSWERS {
+                let id = SharedString::from(format!("{prefix}-{label}-{}", entry.id));
+                let entry = entry.clone();
+                buttons = buttons.child(Button::new(id).label(label).small().ghost().on_click(
+                    cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        let note = this.answer_note.read(cx).value().to_string();
+                        if let Some(command) = answer_entry(&entry, answer, &note) {
+                            this.send(command);
+                            this.answer_note
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                        }
+                    }),
+                ));
+            }
         }
         let mut card = div()
             .id(SharedString::from(format!("{prefix}-entry-{}", entry.id)))
@@ -804,8 +830,16 @@ impl MainView {
                     .child(blocked.clone()),
             );
         }
-        for entry in self.inbox.for_pr(&pr.repo, pr.number) {
-            pane = pane.child(self.entry_card(entry, "pr", cx));
+        let entries = self.inbox.for_pr(&pr.repo, pr.number);
+        for entry in &entries {
+            pane = pane.child(self.entry_card(entry, "pr", true, cx));
+        }
+        // One field, drawn once, for whichever Human Step gets answered.
+        if entries
+            .iter()
+            .any(|entry| matches!(entry.scope, Scope::Human { .. }))
+        {
+            pane = pane.child(Input::new(&self.answer_note).small());
         }
         if pr.runs.is_empty() {
             return pane.child(

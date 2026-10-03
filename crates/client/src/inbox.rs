@@ -2,7 +2,9 @@
 //! what it shows for each entry. No GPUI here, so it tests without a
 //! window.
 
-use slopwatch_protocol::{Command, Inbox, InboxEntry, InboxUpdate, RepoName, Scope, TopicUpdate};
+use slopwatch_protocol::{
+    Answer, Command, Inbox, InboxEntry, InboxUpdate, RepoName, Scope, TopicUpdate,
+};
 
 #[derive(Debug, Default)]
 pub struct InboxModel {
@@ -54,7 +56,8 @@ pub fn badge(count: usize) -> Option<String> {
 
 /// The buttons an open entry offers, with the command each sends. A Run
 /// entry about a Step is answered by retrying it, and only a PR entry can
-/// be dismissed. A cause offers nothing: it clears when its cause does.
+/// be dismissed. A cause offers nothing: it clears when its cause does. A
+/// Human Step's answers need a note, so they come from [`answer`].
 pub fn actions(entry: &InboxEntry) -> Vec<(&'static str, Command)> {
     match &entry.scope {
         Scope::Run {
@@ -68,8 +71,26 @@ pub fn actions(entry: &InboxEntry) -> Vec<(&'static str, Command)> {
             },
         )],
         Scope::Pr => vec![("Dismiss", Command::DismissEntry { entry: entry.id })],
-        Scope::Run { step: None, .. } | Scope::Cause { .. } => Vec::new(),
+        Scope::Run { step: None, .. } | Scope::Cause { .. } | Scope::Human { .. } => Vec::new(),
     }
+}
+
+/// The ways a Human Step can be answered, with their button labels.
+pub const ANSWERS: [(&str, Answer); 2] = [("Approve", Answer::Approve), ("Reject", Answer::Reject)];
+
+/// The command that answers a Human Step entry with `note`, the text in
+/// the note field. A blank note goes as none. `None` for any other entry.
+pub fn answer(entry: &InboxEntry, answer: Answer, note: &str) -> Option<Command> {
+    let Scope::Human { run, step } = &entry.scope else {
+        return None;
+    };
+    let note = note.trim();
+    Some(Command::AnswerStep {
+        run: *run,
+        step: step.clone(),
+        answer,
+        note: (!note.is_empty()).then(|| note.to_owned()),
+    })
 }
 
 /// The PRs an entry holds back, as one line.
@@ -189,6 +210,39 @@ mod tests {
         );
         assert!(actions(&cause).is_empty());
         assert_eq!(held_line(&cause), "o/r#1, o/r#2");
+    }
+
+    #[test]
+    fn a_human_step_is_approved_or_rejected_with_the_note_typed_in() {
+        let human = entry(
+            4,
+            Scope::Human {
+                run: RunId(7),
+                step: "sign-off".into(),
+            },
+            &[1],
+        );
+        let command = |answer, note: Option<&str>| Command::AnswerStep {
+            run: RunId(7),
+            step: "sign-off".into(),
+            answer,
+            note: note.map(str::to_owned),
+        };
+
+        assert!(actions(&human).is_empty(), "its answers take a note");
+        assert_eq!(
+            answer(&human, Answer::Approve, "  rename the flag "),
+            Some(command(Answer::Approve, Some("rename the flag")))
+        );
+        assert_eq!(
+            answer(&human, Answer::Reject, " "),
+            Some(command(Answer::Reject, None)),
+            "a blank note is none"
+        );
+        assert_eq!(
+            answer(&entry(2, Scope::Pr, &[1]), Answer::Approve, ""),
+            None
+        );
     }
 
     #[test]

@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use slopwatch_core::WaiverCategory;
 
 use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
-use crate::{EntryId, Notification, RepoName, RunId, SecretInfo, SecretValue, Topic, TopicUpdate};
+use crate::{
+    Answer, EntryId, Notification, RepoName, RunId, SecretInfo, SecretValue, Topic, TopicUpdate,
+};
 
 /// A frame a client sends to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +252,17 @@ pub enum Command {
     /// from its next spawn on.
     DeleteSecret {
         secret: String,
+    },
+    /// Answers the Human Step `step`, which waits in a Run that's still
+    /// going. Approving passes the Step and rejecting fails it, and later
+    /// Steps read `note` from its Outcome. The answer covers only the
+    /// Run's head SHA (ADR 0001).
+    AnswerStep {
+        run: RunId,
+        step: String,
+        answer: Answer,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
 }
 
