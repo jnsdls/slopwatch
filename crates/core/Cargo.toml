@@ -13,6 +13,10 @@ serde-saphyr = { version = "1.3.0", default-features = false, features = ["deser
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 thiserror = "2.0.21"
+# 0.x, so pinned exactly; a bump has to pass tests/round_trip.rs (ADR 0007).
+yaml-edit = { version = "=0.3.2", default-features = false }
+# yaml-edit's tree, for the byte ranges of its nodes. Moves with yaml-edit.
+rowan = "=0.16.1"
 
 [lints]
 workspace = true
