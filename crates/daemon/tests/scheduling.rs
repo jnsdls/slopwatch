@@ -157,12 +157,18 @@ impl Harness {
             .unwrap_or(0)
     }
 
+    /// The pid the script wrote. The shell creates the file before it
+    /// writes the number, so a read can catch it empty.
     fn pid(&self, run: RunId, step: &str, what: &str) -> i32 {
-        std::fs::read_to_string(self.file(run, step, what))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap()
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            let text = std::fs::read_to_string(self.file(run, step, what)).unwrap_or_default();
+            if let Ok(pid) = text.trim().parse() {
+                return pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "no pid in `{what}`");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
