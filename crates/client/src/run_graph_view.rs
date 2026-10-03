@@ -331,7 +331,8 @@ fn gate_term(view: &RunView, term: &GateTerm, theme: &Theme, colors: Colors) -> 
                         ..
                     }
                 );
-                if skipped && *accepts_skipped {
+                // A Waiver counts as pass in the Gate.
+                if (skipped && *accepts_skipped) || step.waiver.is_some() {
                     colors.good
                 } else {
                     colors.step(step)

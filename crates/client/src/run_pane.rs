@@ -524,6 +524,11 @@ pub fn step_line(step: &StepView) -> String {
 
 /// A Step's status in one word, as its node in the graph says it.
 pub fn step_state(step: &StepView) -> String {
+    if let StepStatus::Settled { verdict, .. } = &step.status
+        && step.waiver.is_some()
+    {
+        return format!("{verdict} (waived)");
+    }
     match &step.status {
         StepStatus::Pending => "pending".to_owned(),
         StepStatus::Running => "running".to_owned(),
@@ -843,6 +848,7 @@ mod tests {
             Some("Waived, doesn't apply: docs-only PR")
         );
         assert_eq!(step_tone(&step), Tone::Neutral);
+        assert_eq!(step_state(&step), "fail (waived)");
     }
 
     #[test]
