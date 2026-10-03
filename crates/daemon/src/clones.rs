@@ -275,6 +275,19 @@ impl Clones {
         Ok(blob(&fork).await? != blob(base_sha).await?)
     }
 
+    /// The parents of `sha`, a commit the clone has fetched.
+    pub async fn parents(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        sha: &str,
+    ) -> Result<Vec<String>, GitError> {
+        let _turn = self.turn(repo).await;
+        let path = self.cloned(repo, remote).await?;
+        let listed = git(&path, remote, &["log", "-1", "--format=%P", sha]).await?;
+        Ok(listed.split_whitespace().map(str::to_owned).collect())
+    }
+
     /// Waits for the repo's turn: one git operation per repo at a time.
     async fn turn(&self, repo: &RepoName) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = self

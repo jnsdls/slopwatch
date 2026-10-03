@@ -15,3 +15,11 @@ The Pipeline file (`.slopwatch/pipeline.yml`) that judges a PR is the one at the
 - When the Pipeline changes on a root base, every Watched PR on that root base, stacked or not, whose latest Run has ended gets a new Run on the same SHA. Outcome reuse keys on the Step's resolved settings and Plugin version, so only new or changed Steps actually run.
 - A draft records the blob SHA it started from. Publishing applies its edits (add a Step, set a key, rewire `needs`) to the file as it is now. If the same node was edited on both sides, publishing stops and shows both versions.
 - Editing the file means a lossless tree (`yaml-edit`) that only touches changed nodes, so hand-written comments and ordering survive GUI edits. The daemon loads the file with a separate typed parser, and a round-trip test suite keeps the two in agreement. `yaml-edit` 0.3.2 passed the suite as the tree, not as the editor: its own mutations damage blank lines and comments next to an edit, so core finds nodes in its tree and splices the text at their byte ranges ([#58](https://github.com/jnsdls/slopwatch/issues/58)). YAML stays, and the KDL fallback isn't needed.
+
+## What the build settled
+
+[#81](https://github.com/jnsdls/slopwatch/issues/81) built publishing.
+
+- A node is a Step, the Gate or `fix_rounds`. Each edit touches one. A node counts as changed on the branch when the loader reads it differently, so a comment doesn't count. A node both sides changed to the same thing isn't a conflict, and the draft's edits on it are dropped. That's also how a draft notices its PR merged: once the branch has every edit, the draft starts over from it.
+- The daemon refuses to publish a Pipeline that wouldn't load, except for Plugins or Library Steps this machine lacks.
+- Besides `createCommitOnBranch`, publishing moves the `slopwatch/pipeline` ref through the REST refs API, but only when no PR from it is open: it creates the branch, or resets one left by a merged or closed PR, at the base commit the draft was replayed onto. While a PR is open, the branch only gains commits. If the Pipeline file on the base changed since the branch forked, the daemon first merges the base in with `updatePullRequestBranch` (ADR 0004), so the PR's diff stays the draft's edits. Both commits go in the push journal.

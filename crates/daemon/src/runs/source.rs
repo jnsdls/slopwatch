@@ -192,6 +192,9 @@ impl Runs {
                 .await
                 .map_err(git)?;
             if let Some(now) = now.filter(|now| now != tip) {
+                // GitHub made it at the daemon's asking (ADR 0004), so it's
+                // slopwatch's own push.
+                self.store.record_push(repo, &now).map_err(store)?;
                 return Ok(now);
             }
             tokio::time::sleep(UPDATE_POLL_EVERY).await;
@@ -238,9 +241,10 @@ impl Runs {
     }
 
     /// Settles the commits a crash or a failed call left open, with the
-    /// branch at `tip`. If the branch moved on from where a commit expected
-    /// it, to a commit with its file, that's the one GitHub made. Any other
-    /// didn't happen.
+    /// branch at `tip`. If the tip is a commit on top of the head one
+    /// expected, writing its file, that's the one GitHub made. Any other
+    /// didn't happen. Each publish settles before it commits, so the one
+    /// GitHub made is still the tip.
     async fn settle_commits(
         &self,
         repo: &RepoName,
@@ -252,20 +256,28 @@ impl Runs {
             return Ok(());
         }
         let at = match tip {
-            Some(_) => Some(
-                self.clones
+            Some(_) => {
+                let at = self
+                    .clones
                     .pipeline_at(repo, remote, PIPELINE_BRANCH)
                     .await
-                    .map_err(git)?,
-            ),
+                    .map_err(git)?;
+                let parents = self
+                    .clones
+                    .parents(repo, remote, &at.sha)
+                    .await
+                    .map_err(git)?;
+                Some((at, parents))
+            }
             None => None,
         };
         for open in open {
-            let made = at.as_ref().filter(|at| {
-                at.sha != open.expected_head && at.text.as_deref() == Some(open.text.as_str())
+            let made = at.as_ref().filter(|(at, parents)| {
+                *parents == [open.expected_head.as_str()]
+                    && at.text.as_deref() == Some(open.text.as_str())
             });
             self.store
-                .finish_pipeline_commit(repo, open.id, made.map(|at| at.sha.as_str()))
+                .finish_pipeline_commit(repo, open.id, made.map(|(at, _)| at.sha.as_str()))
                 .map_err(store)?;
         }
         Ok(())

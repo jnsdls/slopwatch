@@ -226,6 +226,10 @@ fn nodes_sort_steps_by_id_before_the_gate() {
 
     assert_eq!(touched, ["Step `lint`", "Step `review`", "the Gate"]);
     assert_eq!(
+        Node::describe(&Node::touched(&edits())),
+        "Steps `lint` and `review` and the Gate"
+    );
+    assert_eq!(
         serde_json::to_value(Node::Step("ci".into())).unwrap(),
         json!({ "step": "ci" })
     );

@@ -52,6 +52,31 @@ impl Node {
         edits.iter().map(Node::of).collect()
     }
 
+    /// `nodes` in a sentence: "Step `a`", "Steps `a` and `b` and the
+    /// Gate".
+    pub fn describe(nodes: &BTreeSet<Node>) -> String {
+        let steps: Vec<String> = nodes
+            .iter()
+            .filter_map(|node| match node {
+                Node::Step(id) => Some(format!("`{id}`")),
+                _ => None,
+            })
+            .collect();
+        let mut parts = Vec::new();
+        match steps.as_slice() {
+            [] => {}
+            [one] => parts.push(format!("Step {one}")),
+            many => parts.push(format!("Steps {}", join(many))),
+        }
+        parts.extend(
+            nodes
+                .iter()
+                .filter(|node| !matches!(node, Node::Step(_)))
+                .map(ToString::to_string),
+        );
+        join(&parts)
+    }
+
     /// The node's text in the Pipeline file `text`, as written.
     pub fn source(&self, text: &str) -> Option<String> {
         match self {

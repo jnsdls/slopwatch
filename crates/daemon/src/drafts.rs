@@ -7,7 +7,7 @@
 //! Every edit goes through core's [`try_edits`], so a gesture that would
 //! make the Pipeline invalid is refused with the loader's own reason.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -157,7 +157,9 @@ impl Drafts {
 
     /// Starts the repo's draft over from `file`, the default branch as it
     /// is now, if the draft has no edits, or only edits the branch has
-    /// too, or if `discard` drops them. Returns whether a draft clients
+    /// too, or if `discard` drops them. Discarding also forgets the Pipeline
+    /// PR, so "Merge it now" can't merge what the developer threw away; the
+    /// next publish finds the PR again. Returns whether a draft clients
     /// already saw changed.
     fn follow(&self, repo: &RepoName, file: BaseFile, discard: bool) -> Result<bool, DraftError> {
         let _writing = self.writing.lock().expect("no panics while writing");
@@ -166,12 +168,13 @@ impl Drafts {
         let fresh = StoredDraft::fresh(file.base, file.text);
         let fresh = match &now {
             None => fresh,
-            Some(draft) if draft.edits.is_empty() || discard => StoredDraft {
+            Some(_) if discard => fresh,
+            Some(draft) if draft.edits.is_empty() => StoredDraft {
                 published: draft.published.clone(),
                 ..fresh
             },
             // The Pipeline PR merged, so it's done with.
-            Some(draft) if landed(draft, &fresh) => fresh,
+            Some(draft) if branch_has_edits(draft, &fresh) => fresh,
             Some(_) => return Ok(false),
         };
         if now.as_ref() == Some(&fresh) {
@@ -220,7 +223,7 @@ impl Drafts {
                 return Err(DraftError::Refused(format!("Publishing stopped: {error}.")));
             }
         };
-        if replayed.edits.is_empty() {
+        if replayed.text == now_text {
             let branch = now.base.branch.clone();
             self.follow(repo, now, false)?;
             self.broadcast(repo)?;
@@ -242,7 +245,7 @@ impl Drafts {
         }
         let body = format!(
             "Changes {} in the slopwatch Pipeline editor.",
-            describe(&Node::touched(&replayed.edits))
+            Node::describe(&Node::touched(&replayed.edits))
         );
         let pr = self
             .source
@@ -521,12 +524,12 @@ fn draft_text(draft: &StoredDraft) -> Result<String, String> {
     apply_edits(base, &draft.edits).map_err(|error| error.to_string())
 }
 
-/// Whether the branch file in `fresh` has every edit of `draft`, as once the
-/// draft's Pipeline PR merged.
-fn landed(draft: &StoredDraft, fresh: &StoredDraft) -> bool {
+/// Whether the branch file in `fresh` has every edit of `draft` already, as
+/// once the draft's Pipeline PR merged, so publishing would change nothing.
+fn branch_has_edits(draft: &StoredDraft, fresh: &StoredDraft) -> bool {
     let base = draft.base_text.as_deref().unwrap_or(EMPTY_PIPELINE);
     let now = fresh.base_text.as_deref().unwrap_or(EMPTY_PIPELINE);
-    replay(base, &draft.edits, now).is_ok_and(|replayed| replayed.edits.is_empty())
+    replay(base, &draft.edits, now).is_ok_and(|replayed| replayed.text == now)
 }
 
 /// The commit publishing makes, and the title of the PR it opens.
@@ -542,39 +545,6 @@ fn installed_here(error: &LoadError) -> bool {
             | LoadError::UnknownLibraryStep { .. }
             | LoadError::InvalidLibraryStep { .. }
     )
-}
-
-/// "Step `a`", "Step `a` and the Gate", "Steps `a`, `b` and the Gate".
-fn describe(nodes: &BTreeSet<Node>) -> String {
-    let steps: Vec<String> = nodes
-        .iter()
-        .filter_map(|node| match node {
-            Node::Step(id) => Some(format!("`{id}`")),
-            _ => None,
-        })
-        .collect();
-    let mut parts = Vec::new();
-    match steps.as_slice() {
-        [] => {}
-        [one] => parts.push(format!("Step {one}")),
-        many => parts.push(format!("Steps {}", join(many))),
-    }
-    parts.extend(
-        nodes
-            .iter()
-            .filter(|node| !matches!(node, Node::Step(_)))
-            .map(ToString::to_string),
-    );
-    join(&parts)
-}
-
-/// "a", "a and b", "a, b and c".
-fn join(items: &[String]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => one.clone(),
-        [init @ .., last] => format!("{} and {last}", init.join(", ")),
-    }
 }
 
 fn source_error(repo: &RepoName, error: &str) -> DraftError {

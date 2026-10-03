@@ -327,6 +327,25 @@ async fn publishing_again_updates_the_same_pr() {
     // Publishing what the branch has already makes no commit.
     client.publish().await;
     assert_eq!(harness.github.api_commits().len(), 2);
+
+    // Discarding the draft forgets the PR, so "Merge it now" can't merge
+    // what was thrown away. The PR itself stays open on GitHub.
+    client
+        .ok(Command::DiscardPipelineDraft { repo: repo() })
+        .await;
+    assert_eq!(client.draft().published, None);
+    let error = client
+        .refused(Command::MergePipeline { repo: repo() })
+        .await;
+    assert!(error.message.contains("Publish it first"), "{error:?}");
+    assert!(harness.github.is_open(&repo(), first[0]));
+    client.edit(review_timeout("2h")).await;
+    client.publish().await;
+    assert_eq!(
+        client.draft().published.as_ref().unwrap().number,
+        first[0],
+        "the next publish finds it again"
+    );
 }
 
 #[tokio::test]
