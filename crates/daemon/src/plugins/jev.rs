@@ -32,7 +32,7 @@ use slopwatch_protocol::step::{
     Severity, Start, ToStep, Usage,
 };
 
-/// The Secret the gateway key comes in.
+/// The Secret the Step calls the AI Gateway with.
 pub const KEY_SECRET: &str = "AI_GATEWAY_API_KEY";
 
 pub const ENDPOINT: &str = "https://ai-gateway.vercel.sh/v1/evaluate";
@@ -242,7 +242,7 @@ pub fn build_state(
 
     let mut whole = state.clone();
     whole.insert("diff".into(), json!(diff));
-    if size(&whole) <= budget {
+    if size_of(&whole) <= budget {
         return Ok(State {
             value: Value::Object(whole),
             condensed: None,
@@ -270,7 +270,7 @@ pub fn build_state(
     state.insert("diff_note".into(), json!(note));
     state.insert("diff".into(), json!(""));
 
-    let mut room = budget.saturating_sub(size(&state));
+    let mut room = budget.saturating_sub(size_of(&state));
     let mut cut = 0;
     // JSON escaping makes the text a little longer than its bytes, so the
     // room shrinks by the overshoot until the state fits.
@@ -278,7 +278,7 @@ pub fn build_state(
         let (text, files_cut) = fit_files(&shown, room);
         cut = files_cut;
         state.insert("diff".into(), json!(text));
-        let over = size(&state).saturating_sub(budget);
+        let over = size_of(&state).saturating_sub(budget);
         if over == 0 {
             break;
         }
@@ -307,7 +307,7 @@ fn fit_texts(
     budget: usize,
     note: Option<String>,
 ) -> Result<State, String> {
-    if size(&state) <= budget {
+    if size_of(&state) <= budget {
         return Ok(State {
             value: Value::Object(state),
             condensed: note,
@@ -331,15 +331,15 @@ fn fit_texts(
         files.push(json!(format!("... and {} more files", total - files.len())));
         cut = true;
     }
-    if size(&state) > budget {
+    if size_of(&state) > budget {
         // Whatever is still too long is the diff, which gets what's left.
         if let Some(Value::String(diff)) = state.get("diff").cloned() {
-            let over = size(&state) - budget;
+            let over = size_of(&state) - budget;
             let keep = diff.len().saturating_sub(over + 512);
             state.insert("diff".into(), json!(cut_text(&diff, keep)));
         }
     }
-    if size(&state) > budget {
+    if size_of(&state) > budget {
         return Err(format!(
             "the PR's evidence doesn't fit in Jev's {TOKEN_CAP}-token limit even cut down"
         ));
@@ -517,11 +517,8 @@ fn state_budget(config: &Config) -> usize {
     tokens * BYTES_PER_TOKEN
 }
 
-fn size(map: &Map<String, Value>) -> usize {
-    serde_json::to_string(map).map_or(usize::MAX, |text| text.len())
-}
-
-fn size_of(value: &Value) -> usize {
+/// The bytes `value` takes as JSON.
+fn size_of(value: &impl serde::Serialize) -> usize {
     serde_json::to_string(value).map_or(usize::MAX, |text| text.len())
 }
 
@@ -678,8 +675,10 @@ pub fn judge(config: &Config, reply: &Reply, condensed: Option<&str>) -> Outcome
             line: None,
         });
     }
-    if !reply.warnings.is_empty() {
-        findings.push(Finding {
+    let total = config.questions.len();
+    let (verdict, mut note) = if !reply.warnings.is_empty() {
+        // The answers don't count, so neither do the Findings they made.
+        findings = vec![Finding {
             severity: Severity::Warning,
             message: format!(
                 "Jev warned about its answers, so they don't count: {}",
@@ -687,22 +686,26 @@ pub fn judge(config: &Config, reply: &Reply, condensed: Option<&str>) -> Outcome
             ),
             file: None,
             line: None,
-        });
-    }
-    let verdict = if !reply.warnings.is_empty() {
-        Verdict::Inconclusive
-    } else if failed > 0 {
-        Verdict::Fail
-    } else if unsure > 0 {
-        Verdict::Inconclusive
+        }];
+        (
+            Verdict::Inconclusive,
+            "Jev warned about its answers".to_owned(),
+        )
     } else {
-        Verdict::Pass
-    };
-    let total = config.questions.len();
-    let mut note = match (failed, unsure) {
-        (0, 0) => format!("{total} of {total} questions passed"),
-        (0, unsure) => format!("{unsure} of {total} questions inconclusive"),
-        (failed, _) => format!("{failed} of {total} questions failed"),
+        match (failed, unsure) {
+            (0, 0) => (
+                Verdict::Pass,
+                format!("{total} of {total} questions passed"),
+            ),
+            (0, unsure) => (
+                Verdict::Inconclusive,
+                format!("{unsure} of {total} questions inconclusive"),
+            ),
+            (failed, _) => (
+                Verdict::Fail,
+                format!("{failed} of {total} questions failed"),
+            ),
+        }
     };
     if let Some(condensed) = condensed {
         note.push_str(&format!("; {condensed}"));
@@ -724,7 +727,7 @@ pub enum JevError {
     /// The gateway can't route the request to a provider with zero data
     /// retention. It is never sent again without it.
     NoZdr(String),
-    /// The gateway or Jev refused the request, such as for a bad key or a
+    /// The gateway or Jev refused the request, such as for a rejected Secret or a
     /// spent gateway budget.
     Refused { status: u16, body: String },
     /// It kept failing for reasons a retry could fix, until the retries
@@ -823,7 +826,7 @@ impl Gateway {
                 return Err(JevError::Unavailable(why));
             };
             let wait = retry_after
-                .map(|after| after.min(*BACKOFF.last().expect("a backoff")))
+                .map(|after| after.min(self.backoff.iter().copied().max().unwrap_or(after)))
                 .unwrap_or_else(|| jitter(*wait));
             eprintln!("jev: {why}; asking again in {:.1}s", wait.as_secs_f64());
             tokio::time::sleep(wait).await;
@@ -831,17 +834,21 @@ impl Gateway {
     }
 }
 
-/// 429, the gateway's and Jev's 5xx, and TypeSafe's 529 "overloaded".
+/// A timeout (408), a rate limit (429), the gateway's and Jev's 5xx, and
+/// TypeSafe's 529 "overloaded".
 fn retryable(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 /// Up to a quarter more than `wait`, from the clock's nanoseconds.
 fn jitter(wait: Duration) -> Duration {
-    let nanos = SystemTime::now()
+    // macOS clocks tick in microseconds, and the pid sets apart Steps
+    // whose retries come due in the same one.
+    let micros = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |now| now.subsec_nanos());
-    wait + wait.mul_f64(f64::from(nanos % 1000) / 4000.0)
+        .map_or(0, |now| now.subsec_micros());
+    let spread = (u64::from(micros) + u64::from(std::process::id()) * 7919) % 1000;
+    wait + wait.mul_f64(spread as f64 / 4000.0)
 }
 
 /// The start of an error body, enough to say what went wrong.
@@ -854,7 +861,7 @@ fn excerpt(text: &str) -> String {
     text[..end].to_owned()
 }
 
-/// Runs one session with the gateway key from the Step's environment.
+/// Runs one session with the AI Gateway Secret from the Step's environment.
 pub fn run(input: impl BufRead + Send + 'static, output: impl Write) -> std::io::Result<()> {
     let key = std::env::var(KEY_SECRET).ok();
     session(input, output, key, |key| {
@@ -1218,10 +1225,14 @@ mod tests {
         let asked = &body["questions"]["resolves-issue"];
         assert_eq!(asked["type"], "boolean");
         assert_eq!(asked["instructions"]["question"], "Is resolves-issue so?");
-        assert_eq!(
-            asked["instructions"]["inspect"],
-            json!(["diff", "linked_issues", "title"])
-        );
+        let mut inspect: Vec<&str> = asked["instructions"]["inspect"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field.as_str().unwrap())
+            .collect();
+        inspect.sort_unstable();
+        assert_eq!(inspect, ["diff", "linked_issues", "title"]);
         assert_eq!(
             asked["criteria"],
             json!({ "true": "The diff does what the issue asks" })
@@ -1292,10 +1303,15 @@ mod tests {
         assert_eq!(unsure.verdict, Verdict::Inconclusive);
         assert_eq!(unsure.outputs.findings[0].severity, Severity::Warning);
 
-        let mut warned = reply(&[("does", 0.99)]);
+        let mut warned = reply(&[("does", 0.01)]);
         warned.warnings = vec!["state truncated".into()];
         let warned = judge(&config, &warned, None);
         assert_eq!(warned.verdict, Verdict::Inconclusive);
+        assert_eq!(warned.outputs.findings.len(), 1, "the answer doesn't count");
+        assert_eq!(
+            warned.outputs.note.as_deref(),
+            Some("Jev warned about its answers")
+        );
         assert!(
             warned.outputs.findings[0]
                 .message

@@ -291,9 +291,13 @@ impl Client {
         .await;
     }
 
+    /// The listed Secrets, less the ones built-in Plugins ask for.
     async fn secrets(&mut self) -> Vec<SecretInfo> {
         match self.ok(Command::ListSecrets).await {
-            Reply::Secrets { secrets } => secrets,
+            Reply::Secrets { secrets } => secrets
+                .into_iter()
+                .filter(|secret| secret.name != "AI_GATEWAY_API_KEY")
+                .collect(),
             other => panic!("expected Secrets, got {other:?}"),
         }
     }

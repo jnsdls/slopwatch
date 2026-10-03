@@ -661,6 +661,17 @@ impl Runs {
             }
         }
         self.watching.set_storage_warning(plan.warning);
+        // Before GitHub has answered, the PRs are only what the store kept.
+        if self.watching.fresh() {
+            let watched = self
+                .watching
+                .prs()
+                .into_iter()
+                .filter(|(_, pr)| pr.labeled)
+                .map(|(repo, pr)| (repo, pr.number))
+                .collect();
+            prune_diffs(&self.data_dir, &watched).await;
+        }
         Ok(())
     }
 
@@ -733,13 +744,13 @@ struct Inputs {
 /// What a Run's snapshot carries besides what the poll reads, fixed when
 /// the Run starts.
 #[derive(Debug, Clone, Default)]
-struct Evidence {
+struct PrEvidence {
     linked_issues: Vec<LinkedIssue>,
     /// The diff file, when a Step in the Pipeline asks for it.
     diff: Option<PathBuf>,
 }
 
-impl Evidence {
+impl PrEvidence {
     fn fill(&self, snapshot: &mut PrSnapshot) {
         snapshot.linked_issues.clone_from(&self.linked_issues);
         snapshot.diff.clone_from(&self.diff);
@@ -776,7 +787,7 @@ struct Active {
     snapshot: Option<PrSnapshot>,
     /// The paths the head changes, for `files:` Conditions.
     files: Vec<String>,
-    evidence: Evidence,
+    evidence: PrEvidence,
     /// Steps the developer's retry reset. They run again rather than take
     /// an earlier Run's Outcome.
     rerun: HashSet<String>,
@@ -968,7 +979,7 @@ impl Engine {
                 gate: stored.gate,
                 snapshot: None,
                 files: stored.files,
-                evidence: Evidence {
+                evidence: PrEvidence {
                     diff: kept_diff(
                         &self.data_dir,
                         &stored.repo,
@@ -1096,10 +1107,6 @@ impl Engine {
         })
     }
 
-    /// The PRs whose merge state the next sync needs, with the head SHA
-    /// their Run judges: those with a running Step that reads it, and those
-    /// that left the poll after their Run asked to merge them, which may
-    /// mean GitHub merged them.
     /// Whether a Step in the Pipeline `text` asks for the PR's diff
     /// ([`PR_DIFF`]). A Pipeline that doesn't load asks for nothing.
     fn wants_diff(&self, text: &str) -> bool {
@@ -1112,6 +1119,10 @@ impl Engine {
         })
     }
 
+    /// The PRs whose merge state the next sync needs, with the head SHA
+    /// their Run judges: those with a running Step that reads it, and those
+    /// that left the poll after their Run asked to merge them, which may
+    /// mean GitHub merged them.
     fn merge_states_wanted(&self, prs: &[(RepoName, OpenPr)]) -> Vec<(PrKey, MergeRead)> {
         let open: HashSet<PrKey> = prs
             .iter()
@@ -1444,7 +1455,7 @@ impl Engine {
         self.inbox
             .close_pr(&pr_ref(repo, pr.number), Closing::NextRunStarted)?;
 
-        let evidence = Evidence {
+        let evidence = PrEvidence {
             linked_issues,
             diff,
         };
@@ -2916,16 +2927,56 @@ fn kept_diff(
 async fn write_diff(path: &std::path::Path, diff: String) -> std::io::Result<()> {
     let dir = path.parent().expect("diff paths have a parent");
     tokio::fs::create_dir_all(dir).await?;
-    let partial = path.with_extension("partial");
+    // Two syncs can read the same diff at once, so each writes its own.
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |now| now.as_nanos());
+    let partial = path.with_extension(format!("{}-{nanos}.partial", std::process::id()));
     tokio::fs::write(&partial, diff).await?;
     tokio::fs::rename(&partial, path).await?;
     let mut entries = tokio::fs::read_dir(dir).await?;
     while let Some(entry) = entries.next_entry().await? {
-        if entry.path() != path {
-            let _ = tokio::fs::remove_file(entry.path()).await;
+        let older = entry.path();
+        if older != path && older.extension().is_some_and(|ext| ext == "diff") {
+            let _ = tokio::fs::remove_file(older).await;
         }
     }
     Ok(())
+}
+
+/// Drops the kept diffs of every PR that isn't watched any more. A PR
+/// watched again reads its diff afresh.
+async fn prune_diffs(data_dir: &std::path::Path, watched: &HashSet<PrKey>) {
+    let mut kept = Vec::new();
+    let root = data_dir.join("diffs");
+    let Ok(owners) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for owner in owners.flatten() {
+        for name in std::fs::read_dir(owner.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            for number in std::fs::read_dir(name.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let repo = RepoName::new(
+                    owner.file_name().to_string_lossy().into_owned(),
+                    name.file_name().to_string_lossy().into_owned(),
+                );
+                let parsed = number.file_name().to_string_lossy().parse::<u64>();
+                if !parsed.is_ok_and(|n| watched.contains(&(repo, n))) {
+                    kept.push(number.path());
+                }
+            }
+        }
+    }
+    for dir in kept {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
 }
 
 /// What Conditions can read about the PR: the snapshot, plus the files
@@ -3131,6 +3182,32 @@ gate: [ci]
         assert_eq!(duration(Duration::from_secs(7200)), "2h");
         assert_eq!(duration(Duration::from_secs(45)), "45s");
         assert_eq!(duration(Duration::from_millis(300)), "300ms");
+    }
+
+    #[tokio::test]
+    async fn a_kept_diff_replaces_the_prs_older_one_and_goes_once_the_pr_isnt_watched() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = RepoName::new("o", "r");
+        let old = diff_path(dir.path(), &repo, 1, "base", "head1");
+        let new = diff_path(dir.path(), &repo, 1, "base", "head2");
+        let other = diff_path(dir.path(), &repo, 2, "base", "head");
+        write_diff(&old, "old".into()).await.unwrap();
+        write_diff(&other, "other".into()).await.unwrap();
+
+        write_diff(&new, "new".into()).await.unwrap();
+
+        assert_eq!(kept_diff(dir.path(), &repo, 1, "base", "head1"), None);
+        assert_eq!(std::fs::read_to_string(&new).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_dir(new.parent().unwrap()).unwrap().count(),
+            1,
+            "no partial file left behind"
+        );
+
+        prune_diffs(dir.path(), &HashSet::from([(repo.clone(), 1)])).await;
+
+        assert!(new.exists());
+        assert!(!pr_diffs(dir.path(), &repo, 2).exists());
     }
 
     #[test]
