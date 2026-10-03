@@ -176,8 +176,8 @@ pub enum PrStatus {
     /// Watched, but its base branch has no Pipeline yet. Its first Run
     /// starts once one lands.
     Waiting,
-    /// Watched, and its base branch has a Pipeline.
-    Watched,
+    /// Watched, and its base branch has a Pipeline, so a Run can start.
+    Ready,
 }
 
 /// How the daemon's last poll of GitHub went.

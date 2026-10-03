@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use slopwatch_protocol::{PollState, PrStatus, PullRequest, RepoName, WatchedPrs, WatchedPrsDelta};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::broadcast;
 
 use crate::github::{GitHub, GitHubError, OpenPr, Poll, RepoPoll};
 use crate::pace::Pace;
@@ -29,7 +29,6 @@ pub struct Watching {
     /// that started before a watch can't undo it with stale labels.
     github_turn: tokio::sync::Mutex<()>,
     pace: Mutex<Pace>,
-    poll_now: Notify,
 }
 
 struct State {
@@ -93,7 +92,6 @@ impl Watching {
             }),
             github_turn: tokio::sync::Mutex::new(()),
             pace: Mutex::new(Pace::default()),
-            poll_now: Notify::new(),
         })
     }
 
@@ -120,6 +118,9 @@ impl Watching {
     pub async fn add_repo(&self, repo: RepoName) -> Result<(), WatchError> {
         let _turn = self.github_turn.lock().await;
         let poll = self.github.poll(std::slice::from_ref(&repo)).await?;
+        if let Some(rate) = poll.rate {
+            self.pace().record(Instant::now(), rate);
+        }
         let Some(RepoPoll { prs: Some(prs), .. }) = poll.repos.into_iter().next() else {
             return Err(WatchError::NotFound(repo.to_string()));
         };
@@ -181,12 +182,10 @@ impl Watching {
             }
         }
 
-        let now = Instant::now();
+        let rates: Vec<_> = polls.iter().filter_map(|poll| poll.rate).collect();
+        self.pace().record_poll(Instant::now(), &rates);
         let mut state = self.state();
-        for Poll { repos, rate } in polls {
-            if let Some(rate) = rate {
-                self.pace().record(now, rate);
-            }
+        for Poll { repos, .. } in polls {
             for RepoPoll { repo, prs } in repos {
                 // A repo that vanished keeps its last known PRs.
                 if let Some(prs) = prs {
@@ -202,12 +201,6 @@ impl Watching {
         self.pace.lock().expect("no panics while holding the pace")
     }
 
-    /// Wakes the poll loop for a poll right away, such as after the Mac
-    /// wakes.
-    pub fn poll_soon(&self) {
-        self.poll_now.notify_one();
-    }
-
     /// Polls forever, at the pace the rate budget allows.
     pub async fn run(self: Arc<Self>) {
         loop {
@@ -216,10 +209,7 @@ impl Watching {
             }
             // No Runs exist yet, so nothing is ever live.
             let next = self.pace().next_poll(Instant::now(), false);
-            tokio::select! {
-                () = tokio::time::sleep_until(next.into()) => {}
-                () = self.poll_now.notified() => {}
-            }
+            tokio::time::sleep_until(next.into()).await;
         }
     }
 }
@@ -297,7 +287,7 @@ fn row(repo: &RepoName, pr: &OpenPr) -> PullRequest {
         status: match (pr.labeled, pr.base_has_pipeline) {
             (false, _) => PrStatus::NotWatched,
             (true, false) => PrStatus::Waiting,
-            (true, true) => PrStatus::Watched,
+            (true, true) => PrStatus::Ready,
         },
     }
 }

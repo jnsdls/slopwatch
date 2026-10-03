@@ -83,7 +83,7 @@ pub fn status_line(pr: &PullRequest) -> String {
     let status = match pr.status {
         PrStatus::NotWatched => "Not watched".to_owned(),
         PrStatus::Waiting => format!("Waiting for a Pipeline on {}", pr.base),
-        PrStatus::Watched => "Watched".to_owned(),
+        PrStatus::Ready => "Watched".to_owned(),
     };
     if pr.draft {
         format!("Draft · {status}")
@@ -154,7 +154,7 @@ mod tests {
             vec![
                 pr("a", 1, PrStatus::Waiting),
                 pr("b", 2, PrStatus::NotWatched),
-                pr("b", 5, PrStatus::Watched),
+                pr("b", 5, PrStatus::Ready),
             ],
         ));
 

@@ -20,7 +20,8 @@ mod watching;
 use std::sync::Arc;
 
 use slopwatch_protocol::{
-    Auth, BUILD_ID, ClientFrame, ClientHello, DIALECT, Refusal, RefusalReason, ServerHello,
+    Auth, BUILD_ID, ClientFrame, ClientHello, DIALECT, FEATURES, Refusal, RefusalReason,
+    ServerHello,
 };
 
 pub use watching::{Subscription, WatchError, Watching};
@@ -62,10 +63,6 @@ impl Daemon {
         self.uid
     }
 
-    pub fn watching(&self) -> &Arc<Watching> {
-        &self.watching
-    }
-
     /// Answers a client's first frame. A stranger learns nothing about the
     /// daemon, and the dialect is read before the rest of the hello, so a
     /// client from another dialect gets the restart hint even if its hello
@@ -102,7 +99,7 @@ impl Daemon {
         match hello.auth {
             Auth::Local => Ok(ServerHello {
                 dialect: DIALECT,
-                features: Vec::new(),
+                features: FEATURES.iter().map(|&feature| feature.to_owned()).collect(),
                 build_id: self.build_id.clone(),
             }),
             Auth::Unsupported => Err(Refusal {

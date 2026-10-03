@@ -167,12 +167,12 @@ pub fn run(
     mut report: impl FnMut(LinkEvent) -> bool,
 ) {
     let mut last = LinkState::Connecting;
+    // Reports a state only when it differs from the last one.
     let mut changed = |state: LinkState, report: &mut dyn FnMut(LinkEvent) -> bool| {
-        if state == last {
-            return true;
+        state == last || {
+            last = state.clone();
+            report(LinkEvent::State(state))
         }
-        last = state.clone();
-        report(LinkEvent::State(state))
     };
 
     loop {

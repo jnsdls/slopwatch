@@ -25,6 +25,13 @@ pub use topics::{
 /// feature strings instead.
 pub const DIALECT: u32 = 1;
 
+/// What this build adds on top of its dialect. Each side lists them in its
+/// hello, and a peer ignores the ones it doesn't know.
+///
+/// `watched_prs`: the commands for repos and watching, and the
+/// `watched_prs` topic.
+pub const FEATURES: &[&str] = &["watched_prs"];
+
 /// The git SHA this binary was built from, plus a hash of the uncommitted
 /// changes when the tree was dirty.
 pub const BUILD_ID: &str = env!("SLOPWATCH_BUILD_ID");

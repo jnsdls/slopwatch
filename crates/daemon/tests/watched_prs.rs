@@ -239,7 +239,7 @@ async fn a_watched_pr_waits_until_its_base_branch_has_a_pipeline() {
     github.add_pipeline(&repo(), "main");
     client.ok(Command::Refresh).await;
 
-    assert_eq!(client.status(1), Some(PrStatus::Watched));
+    assert_eq!(client.status(1), Some(PrStatus::Ready));
 }
 
 #[tokio::test]

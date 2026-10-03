@@ -16,9 +16,10 @@ const API: &str = "https://api.github.com";
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to back off when GitHub rate-limits without saying how long.
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
-/// Open PRs read per repo, most recently updated first. Labelling a PR
-/// bumps its update time, so a watch change is always among them.
-const PRS_PER_REPO: usize = 100;
+/// GraphQL's largest page.
+const PAGE: usize = 100;
+/// Pages of repos to list in the add-repo picker.
+const MAX_REPO_PAGES: usize = 10;
 const LABEL_COLOR: &str = "6f42c1";
 const LABEL_DESCRIPTION: &str = "Watched by slopwatch";
 
@@ -101,8 +102,20 @@ impl Api {
 #[async_trait]
 impl GitHub for Api {
     async fn available_repos(&self) -> Result<Vec<RepoName>, GitHubError> {
-        let data = self.graphql(AVAILABLE_REPOS, json!({})).await?;
-        read_available_repos(data)
+        let mut repos = Vec::new();
+        let mut after = Value::Null;
+        for _ in 0..MAX_REPO_PAGES {
+            let data = self
+                .graphql(AVAILABLE_REPOS, json!({ "after": after }))
+                .await?;
+            let page = read_available_repos(data)?;
+            repos.extend(page.repos);
+            match page.next {
+                Some(cursor) => after = cursor.into(),
+                None => break,
+            }
+        }
+        Ok(repos)
     }
 
     async fn poll(&self, repos: &[RepoName]) -> Result<Poll, GitHubError> {
@@ -121,8 +134,8 @@ impl GitHub for Api {
             .rest(Method::POST, &format!("/repos/{repo}/labels"), Some(body))
             .await
         {
-            // 422 means a label by that name already exists.
-            Err(GitHubError::Other(message)) if message.starts_with("422") => Ok(()),
+            // A label by that name already exists.
+            Err(GitHubError::Unprocessable(_)) => Ok(()),
             other => other,
         }
     }
@@ -161,26 +174,21 @@ async fn check_status(response: Response) -> Result<Response, GitHubError> {
     let retry_after = header("retry-after").map(Duration::from_secs).or_else(|| {
         (header("x-ratelimit-remaining") == Some(0)).then(|| {
             let reset = header("x-ratelimit-reset").unwrap_or(0);
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            Duration::from_secs(reset.saturating_sub(now)).max(DEFAULT_RETRY_AFTER)
+            Duration::from_secs(reset.saturating_sub(unix_now())).max(DEFAULT_RETRY_AFTER)
         })
     });
     let url = response.url().path().to_owned();
     let body = response.text().await.unwrap_or_default();
-    match status {
-        StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS if retry_after.is_some() => {
-            Err(GitHubError::RateLimited {
-                retry_after: retry_after.unwrap_or(DEFAULT_RETRY_AFTER),
-            })
+    match (status, retry_after) {
+        (StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS, Some(retry_after)) => {
+            Err(GitHubError::RateLimited { retry_after })
         }
-        StatusCode::TOO_MANY_REQUESTS => Err(GitHubError::RateLimited {
+        (StatusCode::TOO_MANY_REQUESTS, None) => Err(GitHubError::RateLimited {
             retry_after: DEFAULT_RETRY_AFTER,
         }),
-        StatusCode::UNAUTHORIZED => Err(GitHubError::Auth(body)),
-        StatusCode::NOT_FOUND => Err(GitHubError::NotFound(url)),
+        (StatusCode::UNAUTHORIZED, _) => Err(GitHubError::Auth(body)),
+        (StatusCode::NOT_FOUND, _) => Err(GitHubError::NotFound(url)),
+        (StatusCode::UNPROCESSABLE_ENTITY, _) => Err(GitHubError::Unprocessable(body)),
         _ => Err(GitHubError::Other(format!(
             "{} from {url}: {body}",
             status.as_u16()
@@ -209,28 +217,48 @@ fn graphql_error(answer: &Value) -> GitHubError {
 }
 
 const AVAILABLE_REPOS: &str = "
-query {
+query($after: String) {
   viewer {
     repositories(
       first: 100
+      after: $after
       affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]
       ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]
       isArchived: false
       orderBy: { field: PUSHED_AT, direction: DESC }
     ) {
       nodes { nameWithOwner viewerPermission }
+      pageInfo { hasNextPage endCursor }
     }
   }
 }";
 
-fn read_available_repos(data: Value) -> Result<Vec<RepoName>, GitHubError> {
+struct RepoPage {
+    repos: Vec<RepoName>,
+    /// The cursor of the next page, if there is one.
+    next: Option<String>,
+}
+
+fn read_available_repos(data: Value) -> Result<RepoPage, GitHubError> {
     #[derive(Deserialize)]
     struct Data {
         viewer: Viewer,
     }
     #[derive(Deserialize)]
     struct Viewer {
-        repositories: Nodes<Repo>,
+        repositories: Repositories,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Repositories {
+        nodes: Vec<Repo>,
+        page_info: PageInfo,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PageInfo {
+        has_next_page: bool,
+        end_cursor: Option<String>,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -239,48 +267,56 @@ fn read_available_repos(data: Value) -> Result<Vec<RepoName>, GitHubError> {
         viewer_permission: Option<String>,
     }
 
-    let data: Data = parse(data)?;
-    Ok(data
-        .viewer
-        .repositories
-        .nodes
-        .into_iter()
-        .filter(|repo| {
-            matches!(
-                repo.viewer_permission.as_deref(),
-                Some("ADMIN" | "MAINTAIN" | "WRITE")
-            )
-        })
-        .filter_map(|repo| repo.name_with_owner.parse().ok())
-        .collect())
+    let Data { viewer } = parse(data)?;
+    let Repositories { nodes, page_info } = viewer.repositories;
+    Ok(RepoPage {
+        repos: nodes
+            .into_iter()
+            .filter(|repo| {
+                matches!(
+                    repo.viewer_permission.as_deref(),
+                    Some("ADMIN" | "MAINTAIN" | "WRITE")
+                )
+            })
+            .filter_map(|repo| repo.name_with_owner.parse().ok())
+            .collect(),
+        next: page_info
+            .has_next_page
+            .then_some(page_info.end_cursor)
+            .flatten(),
+    })
 }
 
-/// One query for every repo in `repos`, aliased `r0`, `r1` and so on, with
-/// the owners and names passed as variables.
+/// One query for every repo in `repos`. Each repo gets an alias, `r0`, `r1`
+/// and so on, that says whether it still exists, and one search finds the
+/// developer's open PRs across all of them.
 fn poll_query(repos: &[RepoName]) -> (String, Value) {
-    let mut parameters = Vec::new();
+    let mut parameters = vec!["$search: String!".to_owned()];
     let mut fields = String::new();
+    let mut search = "is:pr is:open author:@me".to_owned();
     let mut variables = serde_json::Map::new();
     for (index, repo) in repos.iter().enumerate() {
         parameters.push(format!("$o{index}: String!, $n{index}: String!"));
         variables.insert(format!("o{index}"), repo.owner.clone().into());
         variables.insert(format!("n{index}"), repo.name.clone().into());
         fields.push_str(&format!(
-            "  r{index}: repository(owner: $o{index}, name: $n{index}) {{ ...Prs }}\n"
+            "  r{index}: repository(owner: $o{index}, name: $n{index}) {{ nameWithOwner }}\n"
         ));
+        search.push_str(&format!(" repo:{repo}"));
     }
+    variables.insert("search".to_owned(), search.into());
     let query = format!(
         "query({parameters}) {{
   rateLimit {{ cost limit remaining resetAt }}
-  viewer {{ login }}
-{fields}}}
-fragment Prs on Repository {{
-  pullRequests(states: OPEN, first: {PRS_PER_REPO}, orderBy: {{ field: UPDATED_AT, direction: DESC }}) {{
+{fields}  prs: search(query: $search, type: ISSUE, first: {PAGE}) {{
+    issueCount
     nodes {{
-      number title url isDraft headRefOid baseRefName
-      author {{ login }}
-      labels(first: 20) {{ nodes {{ name }} }}
-      baseRef {{ target {{ ... on Commit {{ file(path: \"{PIPELINE_PATH}\") {{ oid }} }} }} }}
+      ... on PullRequest {{
+        number title url isDraft headRefOid baseRefName
+        repository {{ nameWithOwner }}
+        labels(first: {PAGE}) {{ nodes {{ name }} }}
+        baseRef {{ target {{ ... on Commit {{ file(path: \"{PIPELINE_PATH}\") {{ oid }} }} }} }}
+      }}
     }}
   }}
 }}",
@@ -299,13 +335,15 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
         reset_at: String,
     }
     #[derive(Deserialize)]
-    struct Viewer {
-        login: String,
+    #[serde(rename_all = "camelCase")]
+    struct Repo {
+        name_with_owner: String,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
-    struct Repo {
-        pull_requests: Nodes<Pr>,
+    struct Search {
+        issue_count: usize,
+        nodes: Vec<Pr>,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -316,13 +354,9 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
         is_draft: bool,
         head_ref_oid: String,
         base_ref_name: String,
-        author: Option<Login>,
+        repository: Repo,
         labels: Nodes<Label>,
         base_ref: Option<BaseRef>,
-    }
-    #[derive(Deserialize)]
-    struct Login {
-        login: String,
     }
     #[derive(Deserialize)]
     struct Label {
@@ -338,23 +372,36 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
     }
 
     let rate: Option<Rate> = parse(data["rateLimit"].take())?;
-    let viewer: Viewer = parse(data["viewer"].take())?;
+    let search: Search = parse(data["prs"].take())?;
+    // Missing PRs would read as closed, so a page that can't hold them all
+    // fails the poll instead.
+    if search.issue_count > search.nodes.len() {
+        return Err(GitHubError::Other(format!(
+            "{} open PRs across {} repos is more than one poll reads",
+            search.issue_count,
+            repos.len()
+        )));
+    }
+
     let mut polled = Vec::with_capacity(repos.len());
     for (index, repo) in repos.iter().enumerate() {
         let found: Option<Repo> = parse(data[format!("r{index}")].take())?;
         let prs = found.map(|found| {
-            found
-                .pull_requests
+            search
                 .nodes
-                .into_iter()
-                .filter(|pr| pr.author.as_ref().is_some_and(|a| a.login == viewer.login))
+                .iter()
+                .filter(|pr| {
+                    pr.repository
+                        .name_with_owner
+                        .eq_ignore_ascii_case(&found.name_with_owner)
+                })
                 .map(|pr| OpenPr {
                     number: pr.number,
-                    title: pr.title,
-                    url: pr.url,
+                    title: pr.title.clone(),
+                    url: pr.url.clone(),
                     draft: pr.is_draft,
-                    head_sha: pr.head_ref_oid,
-                    base: pr.base_ref_name,
+                    head_sha: pr.head_ref_oid.clone(),
+                    base: pr.base_ref_name.clone(),
                     labeled: pr
                         .labels
                         .nodes
@@ -362,8 +409,9 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
                         .any(|label| label.name == WATCH_LABEL),
                     base_has_pipeline: pr
                         .base_ref
-                        .and_then(|base| base.target)
-                        .and_then(|target| target.file)
+                        .as_ref()
+                        .and_then(|base| base.target.as_ref())
+                        .and_then(|target| target.file.as_ref())
                         .is_some_and(|file| !file.is_null()),
                 })
                 .collect()
@@ -379,7 +427,9 @@ fn read_poll(repos: &[RepoName], mut data: Value) -> Result<Poll, GitHubError> {
             cost: rate.cost,
             limit: rate.limit,
             remaining: rate.remaining,
-            resets_in: seconds_until(&rate.reset_at).unwrap_or(Duration::from_secs(3600)),
+            resets_in: parse_utc(&rate.reset_at)
+                .map(|at| Duration::from_secs(at.saturating_sub(unix_now())))
+                .unwrap_or(Duration::from_secs(3600)),
         }),
     })
 }
@@ -394,14 +444,11 @@ fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T, GitHubError> {
         .map_err(|error| GitHubError::Other(format!("unexpected GraphQL answer: {error}")))
 }
 
-/// Seconds from now until an ISO 8601 UTC time like `2026-10-03T03:19:55Z`.
-fn seconds_until(timestamp: &str) -> Option<Duration> {
-    let at = parse_utc(timestamp)?;
-    let now = SystemTime::now()
+fn unix_now() -> u64 {
+    SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(Duration::from_secs(at.saturating_sub(now)))
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Seconds since the Unix epoch for `YYYY-MM-DDTHH:MM:SSZ`.
@@ -428,7 +475,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_poll_query_asks_for_every_repo_under_its_own_alias() {
+    fn the_poll_query_checks_every_repo_and_searches_them_all_at_once() {
         let repos = [RepoName::new("o", "a"), RepoName::new("p", "b")];
 
         let (query, variables) = poll_query(&repos);
@@ -443,40 +490,43 @@ mod tests {
         );
         assert_eq!(
             variables,
-            json!({ "o0": "o", "n0": "a", "o1": "p", "n1": "b" })
+            json!({
+                "search": "is:pr is:open author:@me repo:o/a repo:p/b",
+                "o0": "o", "n0": "a", "o1": "p", "n1": "b",
+            })
         );
     }
 
+    fn pr(repo: &str, number: u64, labels: &[&str], base: Value) -> Value {
+        json!({
+            "number": number, "title": format!("PR {number}"),
+            "url": format!("https://github.com/{repo}/pull/{number}"),
+            "isDraft": number == 9, "headRefOid": "abc", "baseRefName": "main",
+            "repository": { "nameWithOwner": repo },
+            "labels": { "nodes": labels.iter().map(|name| json!({ "name": name })).collect::<Vec<_>>() },
+            "baseRef": base,
+        })
+    }
+
     #[test]
-    fn a_poll_keeps_the_viewers_prs_and_reads_label_and_pipeline() {
-        let repos = [RepoName::new("o", "a"), RepoName::new("o", "gone")];
+    fn a_poll_sorts_prs_into_their_repos_and_reads_label_and_pipeline() {
+        let repos = [
+            RepoName::new("o", "a"),
+            RepoName::new("o", "b"),
+            RepoName::new("o", "gone"),
+        ];
+        let with_pipeline = json!({ "target": { "file": { "oid": "def" } } });
+        let without = json!({ "target": { "file": null } });
         let data = json!({
             "rateLimit": { "cost": 1, "limit": 5000, "remaining": 4990, "resetAt": "2100-01-01T00:00:00Z" },
-            "viewer": { "login": "me" },
-            "r0": { "pullRequests": { "nodes": [
-                {
-                    "number": 7, "title": "Mine, watched", "url": "https://github.com/o/a/pull/7",
-                    "isDraft": false, "headRefOid": "abc", "baseRefName": "main",
-                    "author": { "login": "me" },
-                    "labels": { "nodes": [{ "name": "bug" }, { "name": "slopwatch" }] },
-                    "baseRef": { "target": { "file": { "oid": "def" } } },
-                },
-                {
-                    "number": 8, "title": "Someone else's", "url": "https://github.com/o/a/pull/8",
-                    "isDraft": false, "headRefOid": "abd", "baseRefName": "main",
-                    "author": { "login": "them" },
-                    "labels": { "nodes": [] },
-                    "baseRef": { "target": { "file": null } },
-                },
-                {
-                    "number": 9, "title": "Mine, draft, base deleted", "url": "https://github.com/o/a/pull/9",
-                    "isDraft": true, "headRefOid": "abe", "baseRefName": "old",
-                    "author": { "login": "me" },
-                    "labels": { "nodes": [] },
-                    "baseRef": null,
-                },
-            ] } },
-            "r1": null,
+            "r0": { "nameWithOwner": "o/a" },
+            "r1": { "nameWithOwner": "O/B" },
+            "r2": null,
+            "prs": { "issueCount": 3, "nodes": [
+                pr("o/a", 7, &["bug", "slopwatch"], with_pipeline),
+                pr("O/B", 8, &[], without),
+                pr("o/a", 9, &[], Value::Null),
+            ] },
         });
 
         let poll = read_poll(&repos, data).unwrap();
@@ -484,56 +534,54 @@ mod tests {
         let rate = poll.rate.unwrap();
         assert_eq!((rate.cost, rate.limit, rate.remaining), (1, 5000, 4990));
         assert!(rate.resets_in > Duration::from_secs(3600));
+        assert_eq!(poll.repos[2].prs, None);
+        let summary = |index: usize| -> Vec<(u64, bool, bool, bool)> {
+            poll.repos[index]
+                .prs
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|pr| (pr.number, pr.labeled, pr.base_has_pipeline, pr.draft))
+                .collect()
+        };
         assert_eq!(
-            poll.repos[1],
-            RepoPoll {
-                repo: repos[1].clone(),
-                prs: None
-            }
+            summary(0),
+            [(7, true, true, false), (9, false, false, true)]
         );
-        let prs = poll.repos[0].prs.as_ref().unwrap();
-        assert_eq!(
-            prs,
-            &[
-                OpenPr {
-                    number: 7,
-                    title: "Mine, watched".into(),
-                    url: "https://github.com/o/a/pull/7".into(),
-                    draft: false,
-                    head_sha: "abc".into(),
-                    base: "main".into(),
-                    labeled: true,
-                    base_has_pipeline: true,
-                },
-                OpenPr {
-                    number: 9,
-                    title: "Mine, draft, base deleted".into(),
-                    url: "https://github.com/o/a/pull/9".into(),
-                    draft: true,
-                    head_sha: "abe".into(),
-                    base: "old".into(),
-                    labeled: false,
-                    base_has_pipeline: false,
-                },
-            ]
-        );
+        assert_eq!(summary(1), [(8, false, false, false)]);
+    }
+
+    #[test]
+    fn a_poll_with_more_prs_than_one_page_fails_rather_than_dropping_some() {
+        let repos = [RepoName::new("o", "a")];
+        let data = json!({
+            "rateLimit": null,
+            "r0": { "nameWithOwner": "o/a" },
+            "prs": { "issueCount": 101, "nodes": [] },
+        });
+
+        assert!(read_poll(&repos, data).is_err());
     }
 
     #[test]
     fn available_repos_are_the_ones_the_developer_can_push_to() {
-        let data = json!({ "viewer": { "repositories": { "nodes": [
-            { "nameWithOwner": "o/admin", "viewerPermission": "ADMIN" },
-            { "nameWithOwner": "o/write", "viewerPermission": "WRITE" },
-            { "nameWithOwner": "o/read", "viewerPermission": "READ" },
-            { "nameWithOwner": "o/triage", "viewerPermission": "TRIAGE" },
-        ] } } });
+        let data = json!({ "viewer": { "repositories": {
+            "nodes": [
+                { "nameWithOwner": "o/admin", "viewerPermission": "ADMIN" },
+                { "nameWithOwner": "o/write", "viewerPermission": "WRITE" },
+                { "nameWithOwner": "o/read", "viewerPermission": "READ" },
+                { "nameWithOwner": "o/triage", "viewerPermission": "TRIAGE" },
+            ],
+            "pageInfo": { "hasNextPage": true, "endCursor": "abc" },
+        } } });
 
-        let repos = read_available_repos(data).unwrap();
+        let page = read_available_repos(data).unwrap();
 
         assert_eq!(
-            repos,
+            page.repos,
             [RepoName::new("o", "admin"), RepoName::new("o", "write")]
         );
+        assert_eq!(page.next.as_deref(), Some("abc"));
     }
 
     #[test]

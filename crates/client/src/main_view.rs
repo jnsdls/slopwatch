@@ -248,32 +248,23 @@ impl MainView {
         let tone = match pr.status {
             PrStatus::NotWatched => theme.muted_foreground,
             PrStatus::Waiting => theme.warning,
-            PrStatus::Watched => theme.success,
+            PrStatus::Ready => theme.success,
         };
         let (repo, number) = (pr.repo.clone(), pr.number);
-        let toggle = if pr.watched() {
-            Button::new(SharedString::from(format!("unwatch-{repo}-{number}")))
-                .label("Unwatch")
-                .small()
-                .ghost()
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
-                    this.send(Command::Unwatch {
-                        repo: repo.clone(),
-                        number,
-                    });
-                }))
-        } else {
-            Button::new(SharedString::from(format!("watch-{repo}-{number}")))
-                .label("Watch")
-                .small()
-                .primary()
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
-                    this.send(Command::Watch {
-                        repo: repo.clone(),
-                        number,
-                    });
-                }))
-        };
+        let watched = pr.watched();
+        let toggle = Button::new(SharedString::from(format!("toggle-{repo}-{number}")))
+            .label(if watched { "Unwatch" } else { "Watch" })
+            .small()
+            .when(watched, |button| button.ghost())
+            .when(!watched, |button| button.primary())
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+                let (repo, number) = (repo.clone(), number);
+                this.send(if watched {
+                    Command::Unwatch { repo, number }
+                } else {
+                    Command::Watch { repo, number }
+                });
+            }));
 
         div()
             .flex()

@@ -22,14 +22,25 @@ const RESERVE: f64 = 0.05;
 
 #[derive(Debug, Default)]
 pub struct Pace {
-    /// What each poll in the last hour cost, oldest first.
+    /// What each GraphQL call in the last hour cost, oldest first.
     spent: VecDeque<(Instant, u32)>,
+    /// What the last whole poll cost, across all its batches.
+    last_poll: u32,
     limit: Option<u32>,
     hold_until: Option<Instant>,
 }
 
 impl Pace {
-    /// Records a poll that went through.
+    /// Records a whole poll that went through, one rate per batch.
+    pub fn record_poll(&mut self, now: Instant, rates: &[RateLimit]) {
+        for &rate in rates {
+            self.record(now, rate);
+        }
+        self.last_poll = rates.iter().map(|rate| rate.cost).sum();
+    }
+
+    /// Records any other GraphQL call, such as the poll of a repo being
+    /// added, so its points count against the share too.
     pub fn record(&mut self, now: Instant, rate: RateLimit) {
         self.spent.push_back((now, rate.cost));
         self.limit = Some(rate.limit);
@@ -69,8 +80,7 @@ impl Pace {
         // Assume the next poll costs what the last one did, and wait until
         // enough of the last hour's polls age out to fit it in the share.
         let allowance = (f64::from(self.limit.unwrap_or(DEFAULT_LIMIT)) * SHARE) as u32;
-        let expected = self.spent.back().map_or(0, |&(_, cost)| cost);
-        let mut total: u32 = self.spent.iter().map(|&(_, cost)| cost).sum::<u32>() + expected;
+        let mut total: u32 = self.spent.iter().map(|&(_, cost)| cost).sum::<u32>() + self.last_poll;
         for &(at, cost) in &self.spent {
             if total <= allowance {
                 break;
@@ -95,17 +105,18 @@ mod tests {
         }
     }
 
-    /// Polls for an hour of simulated time, each poll costing `cost`, and
-    /// returns how many polls ran and the points they spent.
-    fn simulate_hour(cost: u32, live: bool) -> (u32, u32) {
+    /// Polls for an hour of simulated time, each poll sending `batches`
+    /// queries that cost `cost` each, and returns how many polls ran and the
+    /// points they spent.
+    fn simulate_hour(batches: usize, cost: u32, live: bool) -> (u32, u32) {
         let start = Instant::now();
         let mut pace = Pace::default();
         let mut now = start;
         let (mut polls, mut spent) = (0, 0);
         while now < start + HOUR {
             polls += 1;
-            spent += cost;
-            pace.record(now, rate(cost, 4000));
+            spent += cost * batches as u32;
+            pace.record_poll(now, &vec![rate(cost, 4000); batches]);
             now = pace.next_poll(now, live);
         }
         (polls, spent)
@@ -113,18 +124,36 @@ mod tests {
 
     #[test]
     fn a_cheap_poll_runs_every_30_s_while_live_and_every_2_min_when_settled() {
-        assert_eq!(simulate_hour(1, true), (120, 120));
-        assert_eq!(simulate_hour(1, false), (30, 30));
+        assert_eq!(simulate_hour(1, 1, true), (120, 120));
+        assert_eq!(simulate_hour(1, 1, false), (30, 30));
     }
 
     #[test]
     fn expensive_polls_slow_down_to_a_quarter_of_the_hourly_budget() {
-        for cost in [11, 25, 100, 400] {
-            let (polls, spent) = simulate_hour(cost, true);
+        for (batches, cost) in [(1, 11), (1, 100), (1, 400), (4, 5), (4, 25), (10, 30)] {
+            let per_poll = cost * batches as u32;
+            let (polls, spent) = simulate_hour(batches, cost, true);
 
-            assert!(spent <= 1250, "cost {cost}: spent {spent} in {polls} polls");
-            assert!(spent > 1250 - cost, "cost {cost}: only spent {spent}");
+            assert!(
+                spent <= 1250,
+                "{batches}x{cost}: spent {spent} in {polls} polls"
+            );
+            assert!(
+                spent > 1250 - per_poll,
+                "{batches}x{cost}: only spent {spent}"
+            );
         }
+    }
+
+    #[test]
+    fn other_calls_count_against_the_share() {
+        let now = Instant::now();
+        let mut pace = Pace::default();
+        pace.record_poll(now, &[rate(10, 4000)]);
+
+        pace.record(now, rate(1240, 4000));
+
+        assert_eq!(pace.next_poll(now, true), now + HOUR);
     }
 
     #[test]
@@ -132,7 +161,7 @@ mod tests {
         let now = Instant::now();
         let mut pace = Pace::default();
 
-        pace.record(now, rate(1, 100));
+        pace.record_poll(now, &[rate(1, 100)]);
 
         assert_eq!(pace.next_poll(now, true), now + Duration::from_secs(1800));
     }

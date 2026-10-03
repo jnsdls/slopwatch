@@ -3,7 +3,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use slopwatch_protocol::{
     ClientFrame, Command, ErrorBody, ErrorCode, Reply, Request, RequestId, Response, ResponseBody,
-    ServerFrame, Topic, TopicUpdate, WatchedPrsUpdate,
+    ServerFrame, Topic, TopicUpdate, WatchedPrsDelta, WatchedPrsUpdate,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
@@ -38,7 +38,7 @@ impl Daemon {
             }
         }
 
-        let mut deltas: Option<broadcast::Receiver<_>> = None;
+        let mut deltas: Option<Deltas> = None;
         loop {
             tokio::select! {
                 text = next_text(&mut ws) => {
@@ -49,26 +49,51 @@ impl Daemon {
                     let subscribe = matches!(command, Command::Subscribe { .. });
                     let result = self.execute(command).await;
                     if subscribe && matches!(result, ResponseBody::Ok(_)) {
-                        let subscription = self.watching.subscribe();
-                        deltas = Some(subscription.deltas);
-                        send(&mut ws, &snapshot(subscription.seq, subscription.snapshot)).await?;
+                        send(&mut ws, &self.subscribe(&mut deltas)).await?;
                     }
                     // A command's deltas reach the client before its
                     // response, so a client that waits for the response
                     // sees what the command changed.
-                    if let Some(receiver) = &mut deltas {
-                        while let Some(frame) = self.forward(receiver.try_recv()) {
-                            send(&mut ws, &frame).await?;
-                        }
+                    while let Some(next) = deltas.as_mut().map(|deltas| Next::from(deltas.try_recv())) {
+                        let Some(frame) = self.frame(next, &mut deltas) else { break };
+                        send(&mut ws, &frame).await?;
                     }
                     send(&mut ws, &ServerFrame::Response(Response { id, result })).await?;
                 }
-                delta = recv(&mut deltas) => {
-                    if let Some(frame) = self.forward(delta) {
+                next = recv(&mut deltas) => {
+                    if let Some(frame) = self.frame(next, &mut deltas) {
                         send(&mut ws, &frame).await?;
                     }
                 }
             }
+        }
+    }
+
+    /// Starts or restarts the connection's subscription and returns the
+    /// snapshot to send.
+    fn subscribe(&self, deltas: &mut Option<Deltas>) -> ServerFrame {
+        let Subscription {
+            seq,
+            snapshot,
+            deltas: receiver,
+        } = self.watching.subscribe();
+        *deltas = Some(receiver);
+        ServerFrame::Topic(TopicUpdate::WatchedPrs {
+            seq,
+            update: WatchedPrsUpdate::Snapshot(snapshot),
+        })
+    }
+
+    /// The frame for `next`. A subscriber that fell too far behind to catch
+    /// up starts over from a fresh snapshot.
+    fn frame(&self, next: Next, deltas: &mut Option<Deltas>) -> Option<ServerFrame> {
+        match next {
+            Next::Delta(seq, delta) => Some(ServerFrame::Topic(TopicUpdate::WatchedPrs {
+                seq,
+                update: WatchedPrsUpdate::Delta(delta),
+            })),
+            Next::Lagged => Some(self.subscribe(deltas)),
+            Next::Nothing => None,
         }
     }
 
@@ -130,69 +155,38 @@ impl Daemon {
             Err(error) => ResponseBody::Error(error_body(error)),
         }
     }
-
-    /// The frame for a delta, or a fresh snapshot for a subscriber that fell
-    /// too far behind to catch up.
-    fn forward(
-        &self,
-        delta: Result<(u64, slopwatch_protocol::WatchedPrsDelta), impl Into<Missed>>,
-    ) -> Option<ServerFrame> {
-        match delta.map_err(Into::into) {
-            Ok((seq, delta)) => Some(ServerFrame::Topic(TopicUpdate::WatchedPrs {
-                seq,
-                update: WatchedPrsUpdate::Delta(delta),
-            })),
-            Err(Missed::Nothing) => None,
-            Err(Missed::Lagged) => {
-                let Subscription { seq, snapshot, .. } = self.watching.subscribe();
-                Some(self::snapshot(seq, snapshot))
-            }
-        }
-    }
 }
 
-/// Why a subscriber got no delta.
-enum Missed {
-    Nothing,
-    /// It fell behind and lost deltas. It resyncs from a snapshot, and the
-    /// deltas still queued after that are older than the snapshot, so they
-    /// arrive with lower sequence numbers and the client drops them.
+type Deltas = broadcast::Receiver<(u64, WatchedPrsDelta)>;
+
+/// What a subscription has next.
+enum Next {
+    Delta(u64, WatchedPrsDelta),
+    /// The subscriber fell behind and lost deltas.
     Lagged,
+    Nothing,
 }
 
-impl From<broadcast::error::TryRecvError> for Missed {
-    fn from(error: broadcast::error::TryRecvError) -> Self {
-        match error {
-            broadcast::error::TryRecvError::Lagged(_) => Missed::Lagged,
-            _ => Missed::Nothing,
+impl From<Result<(u64, WatchedPrsDelta), broadcast::error::TryRecvError>> for Next {
+    fn from(received: Result<(u64, WatchedPrsDelta), broadcast::error::TryRecvError>) -> Self {
+        match received {
+            Ok((seq, delta)) => Next::Delta(seq, delta),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => Next::Lagged,
+            Err(_) => Next::Nothing,
         }
     }
-}
-
-impl From<broadcast::error::RecvError> for Missed {
-    fn from(error: broadcast::error::RecvError) -> Self {
-        match error {
-            broadcast::error::RecvError::Lagged(_) => Missed::Lagged,
-            broadcast::error::RecvError::Closed => Missed::Nothing,
-        }
-    }
-}
-
-fn snapshot(seq: u64, snapshot: slopwatch_protocol::WatchedPrs) -> ServerFrame {
-    ServerFrame::Topic(TopicUpdate::WatchedPrs {
-        seq,
-        update: WatchedPrsUpdate::Snapshot(snapshot),
-    })
 }
 
 /// The next delta for a subscribed connection. Never resolves for one that
 /// hasn't subscribed.
-async fn recv<T: Clone>(
-    receiver: &mut Option<broadcast::Receiver<T>>,
-) -> Result<T, broadcast::error::RecvError> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
+async fn recv(deltas: &mut Option<Deltas>) -> Next {
+    let Some(deltas) = deltas else {
+        return std::future::pending().await;
+    };
+    match deltas.recv().await {
+        Ok((seq, delta)) => Next::Delta(seq, delta),
+        Err(broadcast::error::RecvError::Lagged(_)) => Next::Lagged,
+        Err(broadcast::error::RecvError::Closed) => Next::Nothing,
     }
 }
 

@@ -84,6 +84,9 @@ pub enum GitHubError {
     RateLimited { retry_after: Duration },
     /// No usable credential.
     Auth(String),
+    /// GitHub refused the change as invalid, such as creating a label that
+    /// already exists.
+    Unprocessable(String),
     /// Anything else: the network, a 5xx, a response we couldn't read.
     Other(String),
 }
@@ -98,6 +101,7 @@ impl fmt::Display for GitHubError {
                 retry_after.as_secs()
             ),
             GitHubError::Auth(message) => write!(f, "GitHub auth failed: {message}"),
+            GitHubError::Unprocessable(message) => write!(f, "GitHub refused: {message}"),
             GitHubError::Other(message) => f.write_str(message),
         }
     }

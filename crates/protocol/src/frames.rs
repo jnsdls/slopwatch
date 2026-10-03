@@ -51,7 +51,10 @@ impl ClientHello {
     pub fn local() -> Self {
         Self {
             dialect: crate::DIALECT,
-            features: Vec::new(),
+            features: crate::FEATURES
+                .iter()
+                .map(|&feature| feature.to_owned())
+                .collect(),
             build_id: crate::BUILD_ID.to_owned(),
             auth: Auth::Local,
         }

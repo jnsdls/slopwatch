@@ -16,10 +16,15 @@ fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn only_the_auth_module_runs_gh() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+fn only_the_daemons_auth_module_reads_the_gh_token() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
-    sources(&src, &mut files);
+    for krate in fs::read_dir(&crates).unwrap() {
+        let src = krate.unwrap().path().join("src");
+        if src.is_dir() {
+            sources(&src, &mut files);
+        }
+    }
 
     let readers: Vec<_> = files
         .iter()
@@ -29,8 +34,8 @@ fn only_the_auth_module_runs_gh() {
                 || text.contains("GH_TOKEN")
                 || text.contains("hosts.yml")
         })
-        .map(|path| path.strip_prefix(&src).unwrap().to_owned())
+        .map(|path| path.strip_prefix(&crates).unwrap().to_owned())
         .collect();
 
-    assert_eq!(readers, [PathBuf::from("auth.rs")]);
+    assert_eq!(readers, [PathBuf::from("daemon/src/auth.rs")]);
 }
