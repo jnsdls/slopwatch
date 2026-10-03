@@ -6,6 +6,7 @@
 //! answer, for a [`RunState`], what the Gate says and what each pending Step
 //! does next.
 
+mod edit;
 mod error;
 mod expr;
 mod load;
@@ -15,6 +16,7 @@ mod run;
 mod validate;
 mod verdict;
 
+pub use edit::{Edit, EditError, apply_edits};
 pub use error::{LoadError, Referrer};
 pub use expr::{Expr, Fact, Glob, StepTerm};
 pub use load::{PluginInfo, Resolver, load};
