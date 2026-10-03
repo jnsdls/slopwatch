@@ -95,6 +95,9 @@ pub const DIALECT: u32 = 1;
 /// `pipeline_publish`: the `publish_pipeline`, `merge_pipeline` and
 /// `discard_pipeline_draft` commands, and `published` and `conflicts` on a
 /// draft.
+///
+/// `onboarding`: the `apply_starter` command, and `missing_secrets` and
+/// `missing_plugin` on a draft's Steps.
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -111,6 +114,7 @@ pub const FEATURES: &[&str] = &[
     "plugins",
     "stacks",
     "pipeline_publish",
+    "onboarding",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

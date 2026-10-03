@@ -9,6 +9,7 @@ pub mod link;
 pub mod link_view;
 pub mod main_view;
 pub mod notifications;
+pub mod onboarding;
 pub mod pipeline_editor;
 pub mod pipeline_editor_view;
 pub mod plugins;

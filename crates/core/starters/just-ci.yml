@@ -1,0 +1,6 @@
+# Starter "Just CI": CI in the Gate. Build up from the Library later.
+version: 1
+steps:
+  ci: { uses: ci }
+gate:
+  - ci

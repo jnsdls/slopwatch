@@ -74,6 +74,7 @@ use tokio::sync::mpsc;
 
 use crate::approvals::{self, Approval, Grant, Unapproved, unapproved_plugin};
 use crate::clones::{Clones, PipelineAt};
+use crate::drafts::StepNeeds;
 use crate::github::{GitHub, GitHubError, OpenPr};
 use crate::inbox::Inbox;
 use crate::notifications::Notifications;
@@ -901,6 +902,21 @@ struct PrEvidence {
     linked_issues: Vec<LinkedIssue>,
     /// The diff file, when a Step in the Pipeline asks for it.
     diff: Option<PathBuf>,
+}
+
+impl StepNeeds for Runs {
+    fn missing_secrets(&self, plugin: &str) -> Vec<String> {
+        let Some(manifest) = self.plugins.manifest(plugin) else {
+            return Vec::new();
+        };
+        manifest
+            .secrets
+            .into_iter()
+            .filter(|spec| !spec.optional)
+            .filter(|spec| !self.secrets.is_set(&spec.name).unwrap_or(false))
+            .map(|spec| spec.name)
+            .collect()
+    }
 }
 
 impl PrEvidence {

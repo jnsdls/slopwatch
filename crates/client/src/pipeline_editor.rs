@@ -216,6 +216,21 @@ impl PipelineEditor {
         self.edit_placing(edits, positions)
     }
 
+    /// Replaces the draft's Steps and Gate with the Starter `key`'s.
+    pub fn pick_starter(&mut self, key: &str) -> Vec<Command> {
+        self.notice = None;
+        self.selected = None;
+        self.moved.clear();
+        match (&self.repo, &self.draft) {
+            (Some(repo), Some(draft)) => vec![Command::ApplyStarter {
+                repo: repo.clone(),
+                edits_seen: draft.edits.len(),
+                starter: key.to_owned(),
+            }],
+            _ => Vec::new(),
+        }
+    }
+
     /// Wires the output port of `from` to `to`.
     pub fn connect(&mut self, from: &str, to: Target) -> Vec<Command> {
         let edits = self.with_outline(|outline| outline.connect(from, to));
@@ -474,6 +489,8 @@ mod tests {
             uses: uses.into(),
             with: Map::new(),
             merge: false,
+            missing_secrets: Vec::new(),
+            missing_plugin: None,
         };
         PipelineDraft {
             repo: repo(),
@@ -633,6 +650,25 @@ mod tests {
             .insert("ci".into(), NodePosition { x: 100, y: 100 });
         editor.apply(moved);
         assert!(editor.moved.is_empty());
+    }
+
+    #[test]
+    fn picking_a_starter_asks_the_daemon_for_it_on_the_draft_as_seen() {
+        let mut editor = opened();
+        editor.select(Some(Selection::Step("ci".into())));
+        editor.refused("an older refusal".into());
+
+        assert_eq!(
+            editor.pick_starter("hands-off"),
+            [Command::ApplyStarter {
+                repo: repo(),
+                edits_seen: 0,
+                starter: "hands-off".into(),
+            }]
+        );
+        assert_eq!(editor.selected(), None, "its Steps are gone");
+        assert_eq!(editor.notice(), None);
+        assert!(PipelineEditor::default().pick_starter("just-ci").is_empty());
     }
 
     #[test]

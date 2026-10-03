@@ -93,6 +93,12 @@ impl Prs {
         self.topic.pr(repo, number)
     }
 
+    /// Every open PR of `repo`, whichever source is showing.
+    pub fn in_repo(&self, repo: &RepoName) -> Vec<PullRequest> {
+        let prs = self.topic.prs.iter().filter(|pr| &pr.repo == repo);
+        prs.cloned().collect()
+    }
+
     pub fn loaded(&self) -> bool {
         self.seq.is_some()
     }

@@ -518,6 +518,17 @@ impl Daemon {
                         .map(|()| Reply::Done),
                 );
             }
+            Command::ApplyStarter {
+                repo,
+                edits_seen,
+                starter,
+            } => {
+                return respond(
+                    self.drafts_or_refuse()
+                        .and_then(|drafts| drafts.apply_starter(&repo, edits_seen, &starter))
+                        .map(|()| Reply::Done),
+                );
+            }
             Command::MovePipelineNode {
                 repo,
                 node,
@@ -580,16 +591,24 @@ impl Daemon {
                 });
             }
             Command::SetSecret { secret, value } => {
-                return respond(match self.runs_or_refuse() {
-                    Ok(runs) => runs.set_secret(secret, value).await.map(|()| Reply::Done),
+                let set = match self.runs_or_refuse() {
+                    Ok(runs) => runs.set_secret(secret, value).await,
                     Err(error) => Err(error.into()),
-                });
+                };
+                if set.is_ok() {
+                    self.secrets_changed();
+                }
+                return respond(set.map(|()| Reply::Done));
             }
             Command::DeleteSecret { secret } => {
-                return respond(match self.runs_or_refuse() {
-                    Ok(runs) => runs.delete_secret(secret).await.map(|()| Reply::Done),
+                let deleted = match self.runs_or_refuse() {
+                    Ok(runs) => runs.delete_secret(secret).await,
                     Err(error) => Err(error.into()),
-                });
+                };
+                if deleted.is_ok() {
+                    self.secrets_changed();
+                }
+                return respond(deleted.map(|()| Reply::Done));
             }
             Command::ListPlugins => {
                 return respond(match self.runs_or_refuse() {
@@ -674,6 +693,15 @@ impl Daemon {
         self.runs
             .as_deref()
             .ok_or_else(|| RunError::Invalid("This daemon doesn't run Pipelines".to_owned()))
+    }
+
+    /// Drafts show which Steps lack a Secret, so they go out again.
+    fn secrets_changed(&self) {
+        if let Some(drafts) = &self.drafts
+            && let Err(error) = drafts.refresh()
+        {
+            eprintln!("slopwatchd: can't send drafts after a Secret changed: {error:?}");
+        }
     }
 
     /// The daemon's drafts. Only some tests build a daemon without them.

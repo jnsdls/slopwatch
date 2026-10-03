@@ -340,6 +340,15 @@ pub enum Command {
     DiscardPipelineDraft {
         repo: RepoName,
     },
+    /// Replaces the draft's Steps and Gate with those of the Starter named
+    /// `starter`, as one change. Unlike `edit_pipeline`, a Plugin or Library
+    /// Step this machine lacks doesn't refuse it: the Step shows it as
+    /// missing. `edits_seen` works as for `edit_pipeline`.
+    ApplyStarter {
+        repo: RepoName,
+        edits_seen: usize,
+        starter: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

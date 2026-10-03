@@ -75,6 +75,13 @@ pub struct DraftStep {
     /// The Step is a Merge Step, so it belongs after the Gate.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub merge: bool,
+    /// Secrets its Plugin requires that aren't set. The Step would error
+    /// on them, and the editor shows a badge to paste each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_secrets: Vec<String>,
+    /// The Plugin it runs, when this machine doesn't have it installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_plugin: Option<String>,
 }
 
 /// A PR from the `slopwatch/pipeline` branch, which publishing opens and

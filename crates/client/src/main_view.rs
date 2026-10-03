@@ -29,6 +29,7 @@ use crate::link_view::LinkView;
 use crate::notifications::{
     NotificationCenter, Permission, Poster, SystemCenter, notice, settings_url,
 };
+use crate::onboarding::Landing;
 use crate::pipeline_editor_view::PipelineEditorView;
 use crate::plugins::unapproved_plugin;
 use crate::plugins_view::PluginsView;
@@ -80,6 +81,10 @@ pub struct MainView {
     run_pane: RunPane,
     /// Repos the developer can add, while the picker is open.
     picker: Option<Vec<RepoName>>,
+    /// A repo just added, until its draft says whether it has a Pipeline:
+    /// without one it gets the tour, with one the developer goes to its
+    /// PRs.
+    onboarding: Option<RepoName>,
     /// The last command that failed, until the next one succeeds.
     error: Option<String>,
     commands: Sender<Command>,
@@ -154,6 +159,7 @@ impl MainView {
             plugins: cx.new(|cx| PluginsView::new(commands.clone(), window, cx)),
             run_pane: RunPane::default(),
             picker: None,
+            onboarding: None,
             error: None,
             commands,
         }
@@ -200,6 +206,17 @@ impl MainView {
                 }
             }
             LinkEvent::Topic(TopicUpdate::Pipeline { draft }) => {
+                if self.onboarding.as_ref() == Some(&draft.repo) {
+                    self.onboarding = None;
+                    // The first repo is where macOS asks, not launch.
+                    self.ask_permission(cx);
+                    match Landing::for_draft(&draft) {
+                        Landing::Tour => {
+                            self.pipeline.update(cx, |editor, cx| editor.start_tour(cx));
+                        }
+                        Landing::Watching => self.show_prs(Source::Repo(draft.repo.clone())),
+                    }
+                }
                 self.pipeline
                     .update(cx, |editor, cx| editor.apply(*draft, cx));
             }
@@ -210,6 +227,11 @@ impl MainView {
             }
             LinkEvent::Topic(update) => {
                 self.prs.apply(update);
+                if let Some(repo) = self.pipeline.read(cx).repo().cloned() {
+                    let prs = self.prs.in_repo(&repo);
+                    self.pipeline
+                        .update(cx, |editor, cx| editor.set_prs(prs, cx));
+                }
                 if let Some(pr) = self.pending_reveal.take() {
                     self.reveal(pr);
                 }
@@ -249,6 +271,11 @@ impl MainView {
                 // While the editor is open, its gestures are what get
                 // refused, and it shows why next to the canvas.
                 ResponseBody::Error(error) if self.pane == Pane::Pipeline => {
+                    // A repo whose draft won't open gets no tour, but the
+                    // first repo still asks for notifications.
+                    if self.onboarding.take().is_some() {
+                        self.ask_permission(cx);
+                    }
                     self.pipeline
                         .update(cx, |editor, cx| editor.refused(error.message, cx));
                 }
@@ -276,13 +303,23 @@ impl MainView {
         }
     }
 
-    /// Asks for notification permission when the developer adds a repo,
-    /// if they haven't been asked, until onboarding asks instead.
+    /// Asks for notification permission at the first repo the developer
+    /// adds, if they haven't been asked.
     fn ask_permission(&self, cx: &App) {
         let center = SystemCenter::new(cx);
         if center.permission() == Permission::NotAsked {
             center.ask();
         }
+    }
+
+    /// Shows `repo`'s Pipeline editor.
+    fn open_pipeline(&mut self, repo: &RepoName, cx: &mut Context<Self>) {
+        self.pane = Pane::Pipeline;
+        let prs = self.prs.in_repo(repo);
+        self.pipeline.update(cx, |editor, cx| {
+            editor.open(repo, cx);
+            editor.set_prs(prs, cx);
+        });
     }
 
     /// Reads the permission again, and redraws once macOS has answered.
@@ -460,9 +497,7 @@ impl MainView {
                     )
                     .on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| {
-                            this.pane = Pane::Pipeline;
-                            this.pipeline
-                                .update(cx, |editor, cx| editor.open(&chosen, cx));
+                            this.open_pipeline(&chosen, cx);
                             cx.notify();
                         },
                     )),
@@ -526,8 +561,9 @@ impl MainView {
                                 this.send(Command::AddRepo {
                                     repo: chosen.clone(),
                                 });
-                                this.ask_permission(cx);
-                                this.show_prs(Source::Repo(chosen.clone()));
+                                this.open_pipeline(&chosen, cx);
+                                this.onboarding = Some(chosen.clone());
+                                this.prs.source = Source::Repo(chosen.clone());
                                 this.picker = None;
                                 cx.notify();
                             })),

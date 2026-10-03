@@ -1,0 +1,21 @@
+# Starter "Ask me, then merge": once everything else passes, one tap from
+# you, then slopwatch merges.
+version: 1
+steps:
+  ci: { uses: ci }
+  desc-matches-diff: { uses: lib/desc-matches-diff }
+  resolves-issue: { uses: lib/resolves-issue, when: { linked_issue: true } }
+  claude-review: { uses: lib/claude-review, needs: [ci] }
+  ship-it:
+    uses: human
+    needs: [ci, desc-matches-diff, resolves-issue, claude-review]
+    when: [ci, desc-matches-diff, { resolves-issue: [pass, skipped] }, claude-review]
+    with: { prompt: "Ship it?" }
+  merge: { uses: merge, needs: [gate] }
+  claude-fix: { uses: lib/claude-fix, needs: [gate] }
+gate:
+  - ci
+  - desc-matches-diff
+  - resolves-issue: [pass, skipped]
+  - claude-review
+  - ship-it
