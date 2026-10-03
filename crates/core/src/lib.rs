@@ -23,4 +23,4 @@ pub use pipeline::{
 };
 pub use reuse::ReuseKey;
 pub use run::{Decision, Plan, PrFacts, RunState, SkipReason};
-pub use verdict::{GateState, Status, Verdict};
+pub use verdict::{GateState, StepState, Verdict};

@@ -38,14 +38,14 @@ struct PipelineFile {
     version: u32,
     #[serde(default)]
     fix_rounds: Option<u32>,
-    steps: BTreeMap<String, StepNode>,
+    steps: BTreeMap<String, StepEntry>,
     #[serde(default)]
     gate: Vec<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StepNode {
+struct StepEntry {
     uses: String,
     #[serde(default)]
     with: Map<String, Value>,
@@ -72,7 +72,9 @@ struct LibraryFile {
     stall_after: Option<String>,
 }
 
-/// Loads and validates a Pipeline. On failure, returns every error found.
+/// Loads and validates a Pipeline. On failure, returns the errors found.
+/// Graph rules are checked only once every Step resolves, and a cycle stops
+/// the checks that need an acyclic graph.
 pub fn load(text: &str, resolver: &dyn Resolver) -> Result<Pipeline, Vec<LoadError>> {
     let file: PipelineFile =
         serde_saphyr::from_str(text).map_err(|e| vec![LoadError::Syntax(e.to_string())])?;
@@ -124,7 +126,11 @@ pub fn load(text: &str, resolver: &dyn Resolver) -> Result<Pipeline, Vec<LoadErr
     })
 }
 
-fn resolve_step(id: &str, node: StepNode, resolver: &dyn Resolver) -> Result<Step, Vec<LoadError>> {
+fn resolve_step(
+    id: &str,
+    node: StepEntry,
+    resolver: &dyn Resolver,
+) -> Result<Step, Vec<LoadError>> {
     if RESERVED_IDS.contains(&id) {
         return Err(vec![LoadError::ReservedId(id.to_owned())]);
     }

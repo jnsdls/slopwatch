@@ -1,24 +1,24 @@
 mod support;
 
-use slopwatch_core::{Decision, GateState, PrFacts, RunState, SkipReason, Status, Verdict};
+use slopwatch_core::{Decision, GateState, PrFacts, RunState, SkipReason, StepState, Verdict};
 use support::load_ok;
 
-fn state(statuses: &[(&str, Status)]) -> RunState {
+fn state(steps: &[(&str, StepState)]) -> RunState {
     RunState {
-        statuses: statuses
+        steps: steps
             .iter()
-            .map(|(id, status)| ((*id).to_owned(), *status))
+            .map(|(id, state)| ((*id).to_owned(), *state))
             .collect(),
         ..RunState::default()
     }
 }
 
-fn settled(v: Verdict) -> Status {
-    Status::Settled(v)
+fn settled(v: Verdict) -> StepState {
+    StepState::Settled(v)
 }
 
-const PASS: Status = Status::Settled(Verdict::Pass);
-const FAIL: Status = Status::Settled(Verdict::Fail);
+const PASS: StepState = StepState::Settled(Verdict::Pass);
+const FAIL: StepState = StepState::Settled(Verdict::Fail);
 
 #[test]
 fn or_passes_as_soon_as_one_side_passes_and_fails_only_once_both_fail() {
@@ -34,11 +34,11 @@ gate:
     );
     assert_eq!(pipeline.gate(&state(&[])), GateState::Pending);
     assert_eq!(
-        pipeline.gate(&state(&[("a", PASS), ("b", Status::Running)])),
+        pipeline.gate(&state(&[("a", PASS), ("b", StepState::Running)])),
         GateState::Pass
     );
     assert_eq!(
-        pipeline.gate(&state(&[("a", FAIL), ("b", Status::Running)])),
+        pipeline.gate(&state(&[("a", FAIL), ("b", StepState::Running)])),
         GateState::Pending
     );
     assert_eq!(
@@ -73,7 +73,7 @@ gate: [ci, desc, review]
     assert_eq!(plan.decision("desc"), Some(&Decision::Start));
     assert_eq!(plan.decision("review"), Some(&Decision::Wait));
 
-    let plan = pipeline.plan(&state(&[("ci", PASS), ("desc", Status::Running)]));
+    let plan = pipeline.plan(&state(&[("ci", PASS), ("desc", StepState::Running)]));
     assert_eq!(plan.decision("ci"), None, "settled Steps get no decision");
     assert_eq!(plan.decision("desc"), None, "running Steps get no decision");
     assert_eq!(plan.decision("review"), Some(&Decision::Start));
@@ -157,7 +157,7 @@ steps:
 gate: [ci]
 "#,
     );
-    let plan = pipeline.plan(&state(&[("ci", FAIL), ("lint", Status::Running)]));
+    let plan = pipeline.plan(&state(&[("ci", FAIL), ("lint", StepState::Running)]));
     assert_eq!(
         plan.decision("review"),
         Some(&Decision::Skip(SkipReason::Upstream {
@@ -199,7 +199,7 @@ gate: [ci, human]
 #[test]
 fn merge_and_fix_wait_for_the_gate() {
     let pipeline = load_ok(GATED);
-    let plan = pipeline.plan(&state(&[("ci", PASS), ("human", Status::Running)]));
+    let plan = pipeline.plan(&state(&[("ci", PASS), ("human", StepState::Running)]));
     assert_eq!(plan.gate, GateState::Pending);
     assert_eq!(plan.decision("merge"), Some(&Decision::Wait));
     assert_eq!(plan.decision("fix"), Some(&Decision::Wait));
@@ -252,6 +252,37 @@ gate: [ci]
         plan.decision("notify"),
         Some(&Decision::Skip(SkipReason::Gate(GateState::Fail)))
     );
+}
+
+#[test]
+fn the_round_cap_applies_only_once_a_write_step_would_run() {
+    let pipeline = load_ok(&GATED.replace("version: 1", "version: 1\nfix_rounds: 1"));
+    let mut run = state(&[("ci", PASS)]);
+    run.fix_round = 1;
+    assert_eq!(pipeline.plan(&run).decision("fix"), Some(&Decision::Wait));
+    run.steps.insert("human".into(), PASS);
+    assert_eq!(
+        pipeline.plan(&run).decision("fix"),
+        Some(&Decision::Skip(SkipReason::Gate(GateState::Pass))),
+        "a shippable Run doesn't report the round cap"
+    );
+}
+
+#[test]
+fn gate_counts_the_skips_the_state_implies() {
+    let pipeline = load_ok(
+        r#"
+version: 1
+steps:
+  a: { uses: ci }
+  b: { uses: jev, needs: [a] }
+gate:
+  - b: [pass, skipped]
+"#,
+    );
+    let run = state(&[("a", FAIL)]);
+    assert_eq!(pipeline.gate(&run), GateState::Pass);
+    assert_eq!(pipeline.plan(&run).gate, GateState::Pass);
 }
 
 #[test]

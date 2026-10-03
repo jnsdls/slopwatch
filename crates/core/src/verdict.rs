@@ -51,7 +51,7 @@ impl fmt::Display for Verdict {
 
 /// Where one Step stands within a Run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Status {
+pub enum StepState {
     /// Not started yet.
     #[default]
     Pending,
@@ -59,10 +59,10 @@ pub enum Status {
     Settled(Verdict),
 }
 
-impl Status {
+impl StepState {
     pub fn verdict(self) -> Option<Verdict> {
         match self {
-            Status::Settled(v) => Some(v),
+            StepState::Settled(v) => Some(v),
             _ => None,
         }
     }

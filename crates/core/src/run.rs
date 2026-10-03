@@ -6,7 +6,7 @@ use std::fmt;
 
 use crate::expr::{Env, Expr, StepTerm, Tri};
 use crate::pipeline::{GATE, Pipeline, Step};
-use crate::verdict::{GateState, Status, Verdict};
+use crate::verdict::{GateState, StepState, Verdict};
 
 /// Facts about the PR a Condition can read, from the head-SHA snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -22,8 +22,8 @@ pub struct PrFacts {
 /// What a Run knows right now.
 #[derive(Debug, Clone, Default)]
 pub struct RunState {
-    /// Each Step's status. A Step that isn't listed is pending.
-    pub statuses: HashMap<String, Status>,
+    /// Each Step's state. A Step that isn't listed is pending.
+    pub steps: HashMap<String, StepState>,
     /// Steps whose settled, non-pass Verdict a Waiver counts as pass.
     pub waived: HashSet<String>,
     pub pr: PrFacts,
@@ -88,11 +88,10 @@ impl fmt::Display for SkipReason {
 }
 
 impl Pipeline {
-    /// What the Gate says given the Run's state.
+    /// What the Gate says given the Run's state, counting the skips the
+    /// state already implies. The same as [`Plan::gate`].
     pub fn gate(&self, state: &RunState) -> GateState {
-        let mut env = Working::new(state);
-        env.evaluate_gate(&self.gate);
-        env.gate
+        self.plan(state).gate
     }
 
     /// Decides every pending Step. A skip counts as settled for the Steps
@@ -106,13 +105,13 @@ impl Pipeline {
                 continue;
             }
             let step = &self.steps[node];
-            if state.statuses.get(node).copied().unwrap_or_default() != Status::Pending {
+            if state.steps.get(node).copied().unwrap_or_default() != StepState::Pending {
                 continue;
             }
             let decision = self.decide(step, &env, state);
             if matches!(decision, Decision::Skip(_)) {
-                env.statuses
-                    .insert(node.as_str(), Status::Settled(Verdict::Skipped));
+                env.steps
+                    .insert(node.as_str(), StepState::Settled(Verdict::Skipped));
             }
             decisions.push((node.clone(), decision));
         }
@@ -123,11 +122,11 @@ impl Pipeline {
     }
 
     fn decide(&self, step: &Step, env: &Working<'_>, state: &RunState) -> Decision {
-        if step.is_write() && state.fix_round >= self.fix_rounds {
-            return Decision::Skip(SkipReason::RoundCap);
-        }
         match step.condition().eval(env) {
             Tri::False => Decision::Skip(skip_reason(step, env)),
+            Tri::True if step.is_write() && state.fix_round >= self.fix_rounds => {
+                Decision::Skip(SkipReason::RoundCap)
+            }
             Tri::True if upstream_settled(step, env) => Decision::Start,
             _ => Decision::Wait,
         }
@@ -139,38 +138,30 @@ fn upstream_settled(step: &Step, env: &Working<'_>) -> bool {
         if need == GATE {
             env.gate != GateState::Pending
         } else {
-            matches!(env.status(need), Status::Settled(_))
+            matches!(env.step_state(need), StepState::Settled(_))
         }
     })
 }
 
 /// Why a false Condition is false. Under the default Condition that names the
-/// upstream Step (or the Gate) that decided it.
+/// term that decided it: an upstream Step, or the Gate.
 fn skip_reason(step: &Step, env: &Working<'_>) -> SkipReason {
-    if let Some(when) = &step.when {
-        return SkipReason::Condition(when.to_string());
-    }
-    if step.is_write() && step.needs_gate() {
-        return SkipReason::Gate(env.gate);
-    }
-    for need in &step.needs {
-        if need == GATE {
-            if env.gate == GateState::Fail {
-                return SkipReason::Gate(GateState::Fail);
-            }
+    let default = match (&step.when, step.condition()) {
+        (None, Expr::All(terms)) => terms.as_slice(),
+        (None, not_gate @ Expr::Not(_)) => std::slice::from_ref(not_gate),
+        _ => return SkipReason::Condition(step.condition().to_string()),
+    };
+    for term in default {
+        if term.eval(env) != Tri::False {
             continue;
         }
-        let term = StepTerm {
-            id: need.clone(),
-            accepts_skipped: false,
+        return match term {
+            Expr::Step(StepTerm { id, .. }) => SkipReason::Upstream {
+                step: id.clone(),
+                verdict: env.step_state(id).verdict().unwrap_or(Verdict::Missing),
+            },
+            _ => SkipReason::Gate(env.gate),
         };
-        let status = env.status(need);
-        if let (Tri::False, Status::Settled(verdict)) = (term.eval(status), status) {
-            return SkipReason::Upstream {
-                step: need.clone(),
-                verdict,
-            };
-        }
     }
     SkipReason::Condition(step.condition().to_string())
 }
@@ -178,7 +169,7 @@ fn skip_reason(step: &Step, env: &Working<'_>) -> SkipReason {
 /// The Run's state as one evaluation pass sees it, with skips decided so far
 /// counted as settled.
 struct Working<'a> {
-    statuses: HashMap<&'a str, Status>,
+    steps: HashMap<&'a str, StepState>,
     waived: &'a HashSet<String>,
     pr: &'a PrFacts,
     gate: GateState,
@@ -187,10 +178,10 @@ struct Working<'a> {
 impl<'a> Working<'a> {
     fn new(state: &'a RunState) -> Working<'a> {
         Working {
-            statuses: state
-                .statuses
+            steps: state
+                .steps
                 .iter()
-                .map(|(id, status)| (id.as_str(), *status))
+                .map(|(id, state)| (id.as_str(), *state))
                 .collect(),
             waived: &state.waived,
             pr: &state.pr,
@@ -208,10 +199,10 @@ impl<'a> Working<'a> {
 }
 
 impl Env for Working<'_> {
-    fn status(&self, id: &str) -> Status {
-        match self.statuses.get(id).copied().unwrap_or_default() {
-            Status::Settled(_) if self.waived.contains(id) => Status::Settled(Verdict::Pass),
-            status => status,
+    fn step_state(&self, id: &str) -> StepState {
+        match self.steps.get(id).copied().unwrap_or_default() {
+            StepState::Settled(_) if self.waived.contains(id) => StepState::Settled(Verdict::Pass),
+            state => state,
         }
     }
 

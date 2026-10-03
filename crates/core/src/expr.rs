@@ -9,7 +9,7 @@ use globset::{GlobBuilder, GlobMatcher};
 use serde_json::Value;
 
 use crate::run::PrFacts;
-use crate::verdict::{GateState, Status, Verdict};
+use crate::verdict::{GateState, StepState, Verdict};
 
 /// Words a Step id can't take, because the expression language or the Gate
 /// node already uses them.
@@ -109,8 +109,8 @@ impl Tri {
 
 /// What an expression reads while it evaluates.
 pub(crate) trait Env {
-    /// The Step's status, with a Waiver already counted as pass.
-    fn status(&self, id: &str) -> Status;
+    /// The Step's state, with a Waiver already counted as pass.
+    fn step_state(&self, id: &str) -> StepState;
     fn gate(&self) -> GateState;
     fn pr(&self) -> &PrFacts;
 }
@@ -168,7 +168,7 @@ impl Expr {
         match self {
             Expr::Const(true) => Tri::True,
             Expr::Const(false) => Tri::False,
-            Expr::Step(term) => term.eval(env.status(&term.id)),
+            Expr::Step(term) => term.eval(env.step_state(&term.id)),
             Expr::Gate => match env.gate() {
                 GateState::Pass => Tri::True,
                 GateState::Fail => Tri::False,
@@ -221,12 +221,12 @@ pub(crate) fn all(items: &[Expr], env: &dyn Env) -> Tri {
 }
 
 impl StepTerm {
-    pub(crate) fn eval(&self, status: Status) -> Tri {
-        match status {
-            Status::Pending | Status::Running => Tri::Unknown,
-            Status::Settled(Verdict::Pass) => Tri::True,
-            Status::Settled(Verdict::Skipped) if self.accepts_skipped => Tri::True,
-            Status::Settled(_) => Tri::False,
+    pub(crate) fn eval(&self, state: StepState) -> Tri {
+        match state {
+            StepState::Pending | StepState::Running => Tri::Unknown,
+            StepState::Settled(Verdict::Pass) => Tri::True,
+            StepState::Settled(Verdict::Skipped) if self.accepts_skipped => Tri::True,
+            StepState::Settled(_) => Tri::False,
         }
     }
 }
@@ -413,13 +413,13 @@ mod tests {
     use super::*;
 
     struct TestEnv {
-        steps: HashMap<&'static str, Status>,
+        steps: HashMap<&'static str, StepState>,
         gate: GateState,
         pr: PrFacts,
     }
 
     impl TestEnv {
-        fn new(steps: &[(&'static str, Status)]) -> TestEnv {
+        fn new(steps: &[(&'static str, StepState)]) -> TestEnv {
             TestEnv {
                 steps: steps.iter().copied().collect(),
                 gate: GateState::Pending,
@@ -429,7 +429,7 @@ mod tests {
     }
 
     impl Env for TestEnv {
-        fn status(&self, id: &str) -> Status {
+        fn step_state(&self, id: &str) -> StepState {
             self.steps.get(id).copied().unwrap_or_default()
         }
         fn gate(&self) -> GateState {
@@ -448,14 +448,14 @@ mod tests {
         Expr::parse(&v, Context::Condition).unwrap()
     }
 
-    const PASS: Status = Status::Settled(Verdict::Pass);
-    const FAIL: Status = Status::Settled(Verdict::Fail);
-    const SKIPPED: Status = Status::Settled(Verdict::Skipped);
+    const PASS: StepState = StepState::Settled(Verdict::Pass);
+    const FAIL: StepState = StepState::Settled(Verdict::Fail);
+    const SKIPPED: StepState = StepState::Settled(Verdict::Skipped);
 
     #[test]
     fn or_passes_once_one_side_passes_while_the_other_is_pending() {
         let expr = gate(json!([{"or": ["a", "b"]}]));
-        let env = TestEnv::new(&[("a", PASS), ("b", Status::Running)]);
+        let env = TestEnv::new(&[("a", PASS), ("b", StepState::Running)]);
         assert_eq!(expr.eval(&env), Tri::True);
     }
 
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(strict.eval(&env), Tri::False);
         assert_eq!(lenient.eval(&env), Tri::True);
         for verdict in [Verdict::Inconclusive, Verdict::Error, Verdict::Missing] {
-            let env = TestEnv::new(&[("docs", Status::Settled(verdict))]);
+            let env = TestEnv::new(&[("docs", StepState::Settled(verdict))]);
             assert_eq!(lenient.eval(&env), Tri::False, "{verdict}");
         }
     }
