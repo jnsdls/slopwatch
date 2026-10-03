@@ -625,6 +625,7 @@ impl Reply {
             usage: Usage {
                 model: MODEL.into(),
                 input_tokens: tokens("inputTokens"),
+                cached_input_tokens: 0,
                 output_tokens: tokens("outputTokens"),
                 usd,
             },
@@ -1252,6 +1253,7 @@ mod tests {
             usage: Usage {
                 model: MODEL.into(),
                 input_tokens: 100,
+                cached_input_tokens: 0,
                 output_tokens: 0,
                 usd: Some(0.0001),
             },
@@ -1518,6 +1520,7 @@ mod tests {
             config: with.as_object().unwrap().clone(),
             snapshot: pr,
             upstream: BTreeMap::new(),
+            budget_usd: None,
         });
         let input = format!("{}\n", serde_json::to_string(&start).unwrap());
         let mut output = Vec::new();
@@ -1565,6 +1568,7 @@ mod tests {
             FromStep::Usage(Usage {
                 model: MODEL.into(),
                 input_tokens: 512,
+                cached_input_tokens: 0,
                 output_tokens: 10,
                 usd: Some(0.0000215),
             })

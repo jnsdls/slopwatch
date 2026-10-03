@@ -299,7 +299,10 @@ impl Client {
         match self.ok(Command::ListSecrets).await {
             Reply::Secrets { secrets } => secrets
                 .into_iter()
-                .filter(|secret| secret.name != "AI_GATEWAY_API_KEY")
+                .filter(|secret| {
+                    !["AI_GATEWAY_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+                        .contains(&secret.name.as_str())
+                })
                 .collect(),
             other => panic!("expected Secrets, got {other:?}"),
         }

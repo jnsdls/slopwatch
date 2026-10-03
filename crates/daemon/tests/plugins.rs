@@ -373,6 +373,7 @@ async fn settings_take_absolute_paths_and_a_cap_and_show_in_the_list() {
             settings: PluginSettings {
                 path: vec!["bin".into()],
                 cap: None,
+                config_dir: None,
             },
         })
         .await;
@@ -388,6 +389,7 @@ async fn settings_take_absolute_paths_and_a_cap_and_show_in_the_list() {
     let settings = PluginSettings {
         path: vec!["/opt/lint/bin".into()],
         cap: Some(1),
+        config_dir: None,
     };
     for plugin in ["lint", "ci"] {
         client

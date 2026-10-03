@@ -153,7 +153,7 @@ fn a_pipeline_applies_its_with_override_over_the_library_step() {
     let review = pipeline.step("review").unwrap();
     assert_eq!(review.config["model"], "sonnet");
     assert_eq!(review.config["auth"], "subscription");
-    assert_eq!(review.config["fail_on"], "high");
+    assert_eq!(review.config["fail_on"], "error");
 }
 
 #[test]
@@ -220,7 +220,7 @@ async fn editing_a_library_step_changes_every_pipeline_that_uses_it() {
         &mut client,
         Command::SaveLibraryStep {
             step: "claude-review".into(),
-            text: "# tighter\nuses: claude\nwith:\n  model: opus\n  auth: subscription\n  fail_on: medium\n".into(),
+            text: "# tighter\nuses: claude\nwith:\n  model: opus\n  auth: subscription\n  fail_on: warning\n".into(),
         },
     )
     .await;
@@ -228,10 +228,10 @@ async fn editing_a_library_step_changes_every_pipeline_that_uses_it() {
 
     let (first_after, first_hash_after) = before(review_and_fix);
     let (second_after, second_hash_after) = before(override_model);
-    assert_eq!(first_before["fail_on"], "high");
-    assert_eq!(first_after["fail_on"], "medium");
-    assert_eq!(second_before["fail_on"], "high");
-    assert_eq!(second_after["fail_on"], "medium");
+    assert_eq!(first_before["fail_on"], "error");
+    assert_eq!(first_after["fail_on"], "warning");
+    assert_eq!(second_before["fail_on"], "error");
+    assert_eq!(second_after["fail_on"], "warning");
     assert_eq!(second_after["model"], "sonnet", "the override still wins");
     assert_ne!(first_hash, first_hash_after);
     assert_ne!(second_hash, second_hash_after);

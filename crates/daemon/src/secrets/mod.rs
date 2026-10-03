@@ -129,6 +129,7 @@ impl Secrets {
                     name: name.clone(),
                     set_at: Some(set_at),
                     granted_to: Vec::new(),
+                    optional: false,
                 };
                 (name, info)
             })
@@ -139,6 +140,7 @@ impl Secrets {
                     name: name.clone(),
                     set_at: None,
                     granted_to: Vec::new(),
+                    optional: false,
                 });
                 if !info.granted_to.contains(&approval.plugin) {
                     info.granted_to.push(approval.plugin.clone());
@@ -368,16 +370,19 @@ mod tests {
                     name: "ANTHROPIC_API_KEY".into(),
                     set_at: None,
                     granted_to: vec!["claude".into()],
+                    optional: false,
                 },
                 SecretInfo {
                     name: "JEV_API_KEY".into(),
                     set_at: Some(100),
                     granted_to: vec!["jev".into(), "other".into()],
+                    optional: false,
                 },
                 SecretInfo {
                     name: "UNUSED".into(),
                     set_at: Some(50),
                     granted_to: vec![],
+                    optional: false,
                 },
             ]
         );

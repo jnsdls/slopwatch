@@ -12,13 +12,15 @@ use gpui_kit::*;
 use slopwatch_protocol::{Command, PluginListing};
 
 use crate::plugins::{
-    PluginsList, approve, asks_more, grant_lines, save_settings, settings_fields, state_line,
+    Fields, PluginsList, approve, asks_more, grant_lines, save_settings, settings_fields,
+    state_line,
 };
 
 pub struct PluginsView {
     list: PluginsList,
     path: Entity<InputState>,
     cap: Entity<InputState>,
+    config_dir: Entity<InputState>,
     /// Why the settings fields can't be saved, until they're fixed.
     problem: Option<String>,
     commands: Sender<Command>,
@@ -29,10 +31,14 @@ impl PluginsView {
         let path =
             cx.new(|cx| InputState::new(window, cx).placeholder("/opt/tool/bin:/usr/local/bin"));
         let cap = cx.new(|cx| InputState::new(window, cx).placeholder("manifest's"));
+        let config_dir = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Config directory for its CLI, if it takes one")
+        });
         Self {
             list: PluginsList::default(),
             path,
             cap,
+            config_dir,
             problem: None,
             commands,
         }
@@ -58,15 +64,18 @@ impl PluginsView {
     pub fn choose(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.list.choose(name);
         self.problem = None;
-        let (path, cap) = self
+        let fields = self
             .list
             .chosen()
             .map(|plugin| settings_fields(&plugin.settings))
             .unwrap_or_default();
         self.path
-            .update(cx, |input, cx| input.set_value(path, window, cx));
+            .update(cx, |input, cx| input.set_value(fields.path, window, cx));
         self.cap
-            .update(cx, |input, cx| input.set_value(cap, window, cx));
+            .update(cx, |input, cx| input.set_value(fields.cap, window, cx));
+        self.config_dir.update(cx, |input, cx| {
+            input.set_value(fields.config_dir, window, cx)
+        });
         cx.notify();
     }
 
@@ -81,9 +90,12 @@ impl PluginsView {
         let Some(plugin) = self.list.chosen().map(|plugin| plugin.name.clone()) else {
             return;
         };
-        let path = self.path.read(cx).value().to_string();
-        let cap = self.cap.read(cx).value().to_string();
-        match save_settings(&plugin, &path, &cap) {
+        let fields = Fields {
+            path: self.path.read(cx).value().to_string(),
+            cap: self.cap.read(cx).value().to_string(),
+            config_dir: self.config_dir.read(cx).value().to_string(),
+        };
+        match save_settings(&plugin, &fields) {
             Ok(command) => {
                 self.problem = None;
                 let _ = self.commands.send(command);
@@ -249,9 +261,11 @@ impl PluginsView {
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save(cx))),
                     ),
             )
+            .child(Input::new(&self.config_dir).small())
             .child(div().text_xs().text_color(theme.muted_foreground).child(
                 "PATH dirs go in front of the PATH its describe and Steps get. The cap \
-                 limits how many of its Steps run at once.",
+                 limits how many of its Steps run at once. The config directory goes to \
+                 the CLI it runs: claude logs in from it on a subscription.",
             ))
             .when_some(self.problem.clone(), |this, problem| {
                 this.child(div().text_xs().text_color(theme.danger).child(problem))
