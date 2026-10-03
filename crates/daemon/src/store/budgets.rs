@@ -70,30 +70,44 @@ impl Store {
             .optional()
     }
 
-    /// Lets the PR's next Run past `kind`, once.
+    /// Lets the PR's next Run past `kind`, once. `at` is when, in
+    /// seconds.
     pub fn add_lift(
         &self,
         repo: &RepoName,
         number: u64,
         kind: BudgetKind,
+        at: i64,
     ) -> Result<(), StoreError> {
         self.db().execute(
-            "INSERT OR IGNORE INTO budget_lifts (repo, number, kind) VALUES (?1, ?2, ?3)",
-            params![repo.to_string(), number as i64, json_str(&kind)],
+            "INSERT OR REPLACE INTO budget_lifts (repo, number, kind, at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![repo.to_string(), number as i64, json_str(&kind), at],
         )?;
         Ok(())
     }
 
-    /// The lifts waiting for the PR's next Run.
-    pub fn lifts(&self, repo: &RepoName, number: u64) -> Result<Vec<BudgetKind>, StoreError> {
+    /// The lifts waiting for the PR's next Run. A lift of the daily
+    /// Budget counts only on the day it was given, from `today` on.
+    pub fn lifts(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        today: i64,
+    ) -> Result<Vec<BudgetKind>, StoreError> {
         let db = self.db();
-        let mut query =
-            db.prepare("SELECT kind FROM budget_lifts WHERE repo = ?1 AND number = ?2")?;
+        let mut query = db.prepare(
+            "SELECT kind, at FROM budget_lifts WHERE repo = ?1 AND number = ?2 ORDER BY kind",
+        )?;
         let kinds = query.query_map(params![repo.to_string(), number as i64], |row| {
-            row.get::<_, String>(0)
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
         Ok(kinds
-            .filter_map(|kind| serde_json::from_value(kind.ok()?.into()).ok())
+            .filter_map(|row| {
+                let (kind, at) = row.ok()?;
+                let kind: BudgetKind = serde_json::from_value(kind.into()).ok()?;
+                (kind != BudgetKind::Daily || at >= today).then_some(kind)
+            })
             .collect())
     }
 
@@ -122,6 +136,7 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// Keeps the daemon's own settings.
     pub fn put_daemon_settings(&self, settings: &DaemonSettings) -> Result<(), StoreError> {
         let json = serde_json::to_string(settings).expect("settings always serialize");
         self.db().execute(
@@ -189,11 +204,20 @@ mod tests {
         assert_eq!(store.raised_pr_budget(&repo, 7, first).unwrap(), Some(20.0));
         assert_eq!(store.raised_pr_budget(&repo, 7, RunId(99)).unwrap(), None);
 
-        store.add_lift(&repo, 7, BudgetKind::Pr).unwrap();
-        store.add_lift(&repo, 7, BudgetKind::Pr).unwrap();
-        assert_eq!(store.lifts(&repo, 7).unwrap(), [BudgetKind::Pr]);
+        store.add_lift(&repo, 7, BudgetKind::Pr, 10).unwrap();
+        store.add_lift(&repo, 7, BudgetKind::Pr, 10).unwrap();
+        store.add_lift(&repo, 7, BudgetKind::Daily, 10).unwrap();
+        assert_eq!(
+            store.lifts(&repo, 7, 0).unwrap(),
+            [BudgetKind::Daily, BudgetKind::Pr]
+        );
+        assert_eq!(
+            store.lifts(&repo, 7, 100).unwrap(),
+            [BudgetKind::Pr],
+            "a daily lift from an earlier day is gone"
+        );
         store.clear_lifts(&repo, 7).unwrap();
-        assert!(store.lifts(&repo, 7).unwrap().is_empty());
+        assert!(store.lifts(&repo, 7, 0).unwrap().is_empty());
     }
 
     #[test]

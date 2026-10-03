@@ -26,6 +26,7 @@ impl Cents {
         Cents(((usd * 100.0 * 1e6).round() / 1e6).ceil() as u64)
     }
 
+    /// The amount in US dollars.
     pub fn usd(self) -> f64 {
         self.0 as f64 / 100.0
     }

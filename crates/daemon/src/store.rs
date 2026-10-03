@@ -307,6 +307,7 @@ const MIGRATIONS: &[&str] = &[
         repo TEXT NOT NULL,
         number INTEGER NOT NULL,
         kind TEXT NOT NULL,
+        at INTEGER NOT NULL,
         PRIMARY KEY (repo, number, kind)
     );
     CREATE TABLE settings (

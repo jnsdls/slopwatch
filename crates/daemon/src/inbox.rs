@@ -341,7 +341,13 @@ impl Inbox {
         };
         let open = state.open.get_mut(&id).expect("found above");
         open.entry.title = title.to_owned();
-        open.entry.reasons = reasons;
+        // A PR entry that was about something else, such as a Run that
+        // ended not shippable, keeps saying so after the Budget's lines.
+        if open.entry.budget.is_none() {
+            open.entry.reasons.splice(0..0, reasons);
+        } else {
+            open.entry.reasons = reasons;
+        }
         open.entry.budget = Some(hit);
         if let Err(index) = open.entry.prs.binary_search(&pr) {
             open.entry.prs.insert(index, pr);

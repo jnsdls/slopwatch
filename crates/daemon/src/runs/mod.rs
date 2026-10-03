@@ -1722,7 +1722,7 @@ impl Engine {
             return Ok(());
         }
         self.budget_held.remove(&key);
-        let lifted = self.store.lifts(repo, pr.number)?;
+        let lifted = self.lifts(repo, pr.number)?;
 
         let steps: Vec<_> = pipeline.ordered_steps().collect();
         let id = self.store.insert_run(
@@ -1974,9 +1974,10 @@ impl Engine {
             .pipeline
             .steps()
             .all(|step| matches!(run.state.steps.get(&step.id), Some(StepState::Settled(_))));
+        // Steps a restart interrupted won't start again, and the end
+        // cancels them.
         let stopped = over_budget
             && run.preparing.is_empty()
-            && run.interrupted.is_empty()
             && run.running.values().all(|running| running.reported);
         if settled || stopped {
             let reason = end_reason(run);
@@ -2510,7 +2511,15 @@ impl Engine {
         }
     }
 
-    fn try_on_report(&mut self, report: StepReport) -> Result<(), StoreError> {
+    fn try_on_report(&mut self, mut report: StepReport) -> Result<(), StoreError> {
+        // A priced call counts toward the PR's and the day's spend even
+        // when its Step was reset or its Run ended meanwhile.
+        if let Report::Message(FromStep::Usage(usage)) = &mut report.report {
+            usage.usd = prices::usd(usage);
+            if let Some(usd) = usage.usd.filter(|&usd| usd > 0.0) {
+                self.store.add_usage(report.run, &report.step, usd, now())?;
+            }
+        }
         if let Report::Message(FromStep::Effect { id, effect }) = report.report {
             return self.on_effect(report.run, &report.step, report.attempt, id, effect);
         }
@@ -2611,8 +2620,7 @@ impl Engine {
                 self.on_ask(&key, &step, &prompt)?;
             }
             // Usage counts even after a cancel: the call was made.
-            Report::Message(FromStep::Usage(mut usage)) => {
-                usage.usd = prices::usd(&usage);
+            Report::Message(FromStep::Usage(usage)) => {
                 let usd = usage.usd;
                 self.journal.append(
                     report.run,

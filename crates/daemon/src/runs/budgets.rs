@@ -19,11 +19,11 @@
 //! letting one more Run past it with "run anyway once". Either starts the
 //! held PRs again.
 
-use slopwatch_core::{EndReason, Pipeline, Verdict};
+use slopwatch_core::{EndReason, Pipeline, Step, Verdict};
 use slopwatch_protocol::step::{Manifest, Outputs};
 use slopwatch_protocol::{
-    Actor, BudgetHit, BudgetKind, Cause, Cents, DaemonSettings, EntryId, PrRef, RepoName, RunId,
-    Scope,
+    Actor, BudgetHit, BudgetKind, Cause, Cents, DaemonSettings, EntryId, InboxEntry, PrRef,
+    RepoName, RunId, Scope,
 };
 
 use super::{Engine, PrKey, RunError, now, pr_ref};
@@ -39,7 +39,7 @@ pub(super) struct BudgetHold {
 }
 
 /// How a Step that a spent PR or daily Budget stopped settles.
-fn stopped(kind: BudgetKind) -> String {
+fn stop_reason(kind: BudgetKind) -> String {
     match kind {
         BudgetKind::Pr => "error(budget): the PR's Budget is spent".to_owned(),
         BudgetKind::Daily => "error(budget): the day's Budget is spent".to_owned(),
@@ -48,7 +48,7 @@ fn stopped(kind: BudgetKind) -> String {
 
 /// What a Step can spend in one attempt: what the Pipeline sets, or else
 /// its Plugin's manifest. `None` leaves it without a Budget of its own.
-pub(super) fn step_budget(step: &slopwatch_core::Step, manifest: Option<&Manifest>) -> Option<f64> {
+pub(super) fn step_budget(step: &Step, manifest: Option<&Manifest>) -> Option<f64> {
     step.budget_usd
         .or_else(|| manifest.and_then(|manifest| manifest.budget_usd))
 }
@@ -67,6 +67,15 @@ impl Engine {
             .store
             .raised_pr_budget(repo, number, window)?
             .unwrap_or(pipeline.budget_usd()))
+    }
+
+    /// The lifts waiting for the PR's next Run.
+    pub(super) fn lifts(
+        &self,
+        repo: &RepoName,
+        number: u64,
+    ) -> Result<Vec<BudgetKind>, StoreError> {
+        self.store.lifts(repo, number, local_midnight(now()))
     }
 
     /// What Steps spent since local midnight.
@@ -134,7 +143,7 @@ impl Engine {
         pipeline: &Pipeline,
     ) -> Result<bool, StoreError> {
         let (repo, number) = key;
-        let lifted = self.store.lifts(repo, *number)?;
+        let lifted = self.lifts(repo, *number)?;
         let Some(hit) = self.spent_budget(repo, *number, window, pipeline, &lifted)? else {
             return Ok(false);
         };
@@ -188,13 +197,11 @@ impl Engine {
         Ok(caps.into_iter().reduce(f64::min).map(|cap| cap.max(0.0)))
     }
 
-    /// Records `usd`, what one model call of `step` cost, and stops what
-    /// it pushed past a Budget: the Step itself past its own, and every
+    /// Counts `usd`, what one model call of `step` cost and the store
+    /// already has, and stops what it pushed past a Budget: the Step itself past its own, and every
     /// Run whose PR's or the day's Budget it spent.
     pub(super) fn on_usage(&mut self, key: &PrKey, step: &str, usd: f64) -> Result<(), StoreError> {
         let run = self.active.get_mut(key).expect("only active Runs report");
-        let id = run.id;
-        self.store.add_usage(id, step, usd, now())?;
         let running = run.running.get_mut(step).expect("the report matched it");
         running.spent += usd;
         running.costed = true;
@@ -260,7 +267,7 @@ impl Engine {
                 key,
                 &step,
                 Verdict::Error,
-                Some(stopped(hit.kind)),
+                Some(stop_reason(hit.kind)),
                 Outputs::default(),
             )?;
             if let Some(running) = self.active[key].running.get(&step) {
@@ -313,7 +320,7 @@ impl Engine {
     pub(super) fn run_anyway_once(&mut self, id: EntryId, actor: &Actor) -> Result<(), RunError> {
         let (entry, hit) = self.over_budget_entry(id)?;
         for pr in &entry.prs {
-            self.store.add_lift(&pr.repo, pr.number, hit.kind)?;
+            self.store.add_lift(&pr.repo, pr.number, hit.kind, now())?;
         }
         self.inbox.answer_entry(id, "run anyway once", actor)?;
         self.start_held(&entry.prs)
@@ -355,10 +362,7 @@ impl Engine {
     }
 
     /// The open entry `id`, if a spent Budget raised it, with the Budget.
-    fn over_budget_entry(
-        &self,
-        id: EntryId,
-    ) -> Result<(slopwatch_protocol::InboxEntry, BudgetHit), RunError> {
+    fn over_budget_entry(&self, id: EntryId) -> Result<(InboxEntry, BudgetHit), RunError> {
         if self.stopped {
             return Err(RunError::Invalid("The daemon is restarting".to_owned()));
         }
@@ -389,10 +393,9 @@ impl Engine {
             let Some(latest) = self.store.latest_run_id(&pr.repo, pr.number)? else {
                 continue;
             };
-            let stored = self
-                .store
-                .run(latest)?
-                .ok_or_else(|| RunError::NotFound(format!("No Run {latest}")))?;
+            let Some(stored) = self.store.run(latest)? else {
+                continue;
+            };
             match self.same_sha_pr(&stored) {
                 Ok(open) => self.start_same_sha(stored, &open)?,
                 Err(RunError::Store(error)) => return Err(RunError::Store(error)),
