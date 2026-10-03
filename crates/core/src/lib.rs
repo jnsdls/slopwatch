@@ -10,6 +10,7 @@ mod draft;
 mod edit;
 mod error;
 mod expr;
+mod guarded;
 mod library;
 mod load;
 mod pipeline;
@@ -26,6 +27,7 @@ pub use draft::{
 pub use edit::{Edit, EditError, apply_edits, flow_style};
 pub use error::{LoadError, Referrer};
 pub use expr::{Expr, Fact, Glob, StepTerm};
+pub use guarded::{Guard, guarded};
 pub use library::{PRESETS, Preset, check_library_step, is_library_step_name, library_step_plugin};
 pub use load::{PluginInfo, Resolver, check, load, parse_duration, resolve_uses};
 pub use pipeline::{

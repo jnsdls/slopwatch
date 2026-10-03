@@ -3,8 +3,8 @@
 //! Built-in Plugins run from the daemon's own executable, as
 //! `slopwatchd plugin <name> describe` and `slopwatchd plugin <name> run`,
 //! so they ship and update with the app and speak the Step contract like
-//! any third-party Plugin. `ci`, `claude`, `codex`, `human`, `jev` and
-//! `merge` are built so far.
+//! any third-party Plugin: `ci`, `claude`, `codex`, `fix`, `human`, `jev`
+//! and `merge`.
 //!
 //! A third-party Plugin is an executable, or a symlink to one, in the
 //! Plugins folder: `plugins/<name>` under the config dir (ADR 0012). The
@@ -18,6 +18,7 @@ pub mod ci;
 pub mod claude;
 pub mod codex;
 pub mod describe;
+pub mod fix;
 pub mod human;
 pub mod jev;
 pub mod merge;
@@ -514,6 +515,7 @@ fn builtins() -> Vec<Manifest> {
         ci::manifest(),
         claude::manifest(),
         codex::manifest(),
+        fix::manifest(),
         jev::manifest(),
         merge::manifest(),
         human::manifest(),
@@ -561,6 +563,7 @@ pub fn main(args: &[String]) -> ExitCode {
             "human" => human::run(std::io::stdin().lock(), std::io::stdout().lock()),
             "claude" => claude::run(),
             "codex" => codex::run(),
+            "fix" => fix::run(),
             "jev" => jev::run(
                 std::io::BufReader::new(std::io::stdin()),
                 std::io::stdout().lock(),

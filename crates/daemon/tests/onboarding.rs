@@ -226,23 +226,27 @@ async fn a_repo_with_a_pipeline_opens_a_draft_of_it() {
 
 #[tokio::test]
 async fn each_starter_fills_the_draft_with_a_pipeline_that_loads_here() {
+    // The shipped presets, with every built-in Plugin they use, `fix`
+    // included, so no Starter has a missing Plugin.
     let harness = harness();
-    // Every Plugin the Starters use, whether or not this build has it yet.
-    harness.library.save("claude-review", "uses: ci\n").unwrap();
-    harness.library.save("codex-review", "uses: ci\n").unwrap();
-    harness.library.save("claude-fix", "uses: fix\n").unwrap();
     let mut client = Client::connect(&harness.daemon).await;
 
     for starter in STARTERS {
         client.pick(starter.key).await;
 
         let draft = client.draft();
-        let problems: Vec<&String> = draft
-            .problems
+        assert!(
+            draft.problems.is_empty(),
+            "{}: {:#?}",
+            starter.key,
+            draft.problems
+        );
+        let missing: Vec<_> = draft
+            .steps
             .iter()
-            .filter(|problem| !problem.contains("`fix`, which isn't installed"))
+            .filter_map(|step| step.missing_plugin.as_deref())
             .collect();
-        assert!(problems.is_empty(), "{}: {problems:#?}", starter.key);
+        assert!(missing.is_empty(), "{}: {missing:?}", starter.key);
         let ids: Vec<&str> = draft.steps.iter().map(|s| s.info.id.as_str()).collect();
         let expected = slopwatch_core::Outline::parse(starter.text).unwrap();
         let expected: Vec<&str> = expected.steps().iter().map(|s| s.id.as_str()).collect();

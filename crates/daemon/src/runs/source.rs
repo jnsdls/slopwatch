@@ -229,7 +229,8 @@ impl Runs {
                     expected_head: head,
                     headline: publication.headline,
                     body: publication.body,
-                    files: &[(PIPELINE_PATH, publication.text)],
+                    files: &[(PIPELINE_PATH, publication.text.as_bytes())],
+                    deletions: &[],
                 },
             )
             .await

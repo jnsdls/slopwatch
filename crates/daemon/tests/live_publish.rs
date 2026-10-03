@@ -78,7 +78,8 @@ async fn publishing_calls_work_against_github() {
                     expected_head: &expected,
                     headline: "Check publishing from slopwatch",
                     body: "Made by crates/daemon/tests/live_publish.rs.",
-                    files: &[(&path, text)],
+                    files: &[(&path, text.as_bytes())],
+                    deletions: &[],
                 },
             )
             .await

@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 
 use super::now_ms;
 
-use crate::store::{EffectRow, Store, StoreError};
+use crate::store::{CommitIntent, EffectRow, Store, StoreError};
 
 /// Live events a slow subscriber may fall behind by. One that falls
 /// further replays the rest from the stored journal.
@@ -75,6 +75,33 @@ impl Journal {
         Ok(seq)
     }
 
+    /// Settles a commit intent. With `made`, the commit GitHub made, its
+    /// SHA goes in the push journal and [`RunEvent::Committed`] in its
+    /// Run's journal, in one store transaction (ADR 0002).
+    pub fn close_commit(
+        &self,
+        intent: &CommitIntent,
+        made: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let Some(sha) = made else {
+            return self.store.finish_commit(intent, None).map(drop);
+        };
+        let live = self.live.lock().expect("no panics while appending");
+        let event = RunEvent::Committed {
+            step: intent.step.clone(),
+            sha: sha.to_owned(),
+            files: intent.files.clone(),
+        };
+        let text = serde_json::to_string(&event).expect("Run events always serialize");
+        let ts = now_ms();
+        let seq = self
+            .store
+            .finish_commit(intent, Some((sha, ts, &text)))?
+            .expect("a made commit appends its event");
+        let _ = live.send((intent.run, Journalled { seq, ts, event }));
+        Ok(())
+    }
+
     /// Prunes an ended Run's journal down to the events that rebuild its
     /// record: the start, each Step's last settle, the Waivers, the last
     /// Gate, the Effects, the usage, the end and each Inbox entry's last
@@ -97,6 +124,7 @@ impl Journal {
                 | RunEvent::StepWaived { .. }
                 | RunEvent::Ended { .. }
                 | RunEvent::Effect { .. }
+                | RunEvent::Committed { .. }
                 | RunEvent::StepUsage { .. } => keep.push(seq),
                 RunEvent::StepSettled { step, .. } => {
                     settled.insert(step, seq);

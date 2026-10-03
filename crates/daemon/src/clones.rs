@@ -341,6 +341,142 @@ impl Clones {
         .map(drop)
     }
 
+    /// What the files in `dir`, a worktree of PR `number` checked out at
+    /// `head`, change against `head`, as a tree in the clone and the paths
+    /// that differ. Files `.gitignore` names are left out. The tree and the
+    /// changed files' blobs go into the clone, so a commit can be made
+    /// from them once the worktree is gone. `index` is a scratch file
+    /// outside the worktree, removed afterwards, so whatever the Step did
+    /// to the worktree's own index or `HEAD` doesn't count.
+    pub async fn worktree_changes(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        dir: &Path,
+        head: &str,
+        index: &Path,
+    ) -> Result<WorktreeChanges, GitError> {
+        let _turn = self.turn(repo).await;
+        let index_path = index
+            .to_str()
+            .ok_or_else(|| GitError(format!("{} isn't UTF-8", index.display())))?;
+        let env = [("GIT_INDEX_FILE", index_path)];
+        let _ = tokio::fs::remove_file(index).await;
+        let result = async {
+            git_env(dir, remote, &env, &["read-tree", head]).await?;
+            git_env(dir, remote, &env, &["add", "--all", "--", "."]).await?;
+            let tree = git_env(dir, remote, &env, &["write-tree"]).await?;
+            let raw = git_output_env(
+                dir,
+                remote,
+                &[],
+                &[
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--raw",
+                    "--no-renames",
+                    head,
+                    &tree,
+                ],
+            )
+            .await?;
+            Ok(WorktreeChanges {
+                tree,
+                changes: parse_raw_diff(&raw)?,
+            })
+        }
+        .await;
+        let _ = tokio::fs::remove_file(index).await;
+        result
+    }
+
+    /// The trees of each of `commits` the clone has, in order. A commit it
+    /// doesn't have is left out.
+    pub async fn trees(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        commits: &[String],
+    ) -> Vec<String> {
+        let _turn = self.turn(repo).await;
+        let Ok(path) = self.cloned(repo, remote).await else {
+            return Vec::new();
+        };
+        let mut trees = Vec::new();
+        for commit in commits {
+            if let Ok(tree) = git(
+                &path,
+                remote,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{commit}^{{tree}}"),
+                ],
+            )
+            .await
+            {
+                trees.push(tree);
+            }
+        }
+        trees
+    }
+
+    /// The contents of blob `oid`, which the clone has or fetches.
+    pub async fn blob(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        oid: &str,
+    ) -> Result<Vec<u8>, GitError> {
+        let _turn = self.turn(repo).await;
+        let path = self.cloned(repo, remote).await?;
+        git_output_env(&path, remote, &[], &["cat-file", "blob", oid]).await
+    }
+
+    /// The parents and tree of `sha`, PR `number`'s head on GitHub,
+    /// fetching the PR's head first if the clone doesn't have it.
+    pub async fn commit_of(
+        &self,
+        repo: &RepoName,
+        remote: &GitRemote,
+        number: u64,
+        sha: &str,
+    ) -> Result<(Vec<String>, String), GitError> {
+        let _turn = self.turn(repo).await;
+        let path = self.cloned(repo, remote).await?;
+        let commit = format!("{sha}^{{commit}}");
+        if git(&path, remote, &["cat-file", "-e", &commit])
+            .await
+            .is_err()
+        {
+            git(
+                &path,
+                remote,
+                &[
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--filter=blob:none",
+                    &remote.url,
+                    &format!("+refs/pull/{number}/head:refs/slopwatch/pull/{number}"),
+                ],
+            )
+            .await?;
+        }
+        let listed = git(&path, remote, &["log", "-1", "--format=%P%n%T", sha]).await?;
+        let mut lines = listed.lines();
+        let parents = lines
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let tree = lines.next().unwrap_or_default().to_owned();
+        Ok((parents, tree))
+    }
+
     /// Waits for the repo's turn: one git operation per repo at a time.
     async fn turn(&self, repo: &RepoName) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = self
@@ -388,6 +524,54 @@ impl Clones {
     }
 }
 
+/// What a worktree changes against the commit it was checked out at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeChanges {
+    /// The whole tree the worktree holds.
+    pub tree: String,
+    pub changes: Vec<Change>,
+}
+
+/// One path that differs, as `git diff-tree --raw` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub path: String,
+    /// `A`dded, `D`eleted, `M`odified or `T`ype changed.
+    pub status: char,
+    /// The file modes before and after, such as `100644`. `000000` where
+    /// the path doesn't exist.
+    pub old_mode: String,
+    pub new_mode: String,
+    /// The blob after, all zeroes for a deletion.
+    pub blob: String,
+}
+
+/// Reads `git diff-tree -r -z --raw` output: `:old new oldsha newsha
+/// status` then the path, each ending in NUL.
+fn parse_raw_diff(raw: &[u8]) -> Result<Vec<Change>, GitError> {
+    let text = String::from_utf8(raw.to_vec())
+        .map_err(|_| GitError("a changed path isn't UTF-8".to_owned()))?;
+    let mut fields = text.split('\0').filter(|field| !field.is_empty());
+    let mut changes = Vec::new();
+    while let Some(meta) = fields.next() {
+        let path = fields
+            .next()
+            .ok_or_else(|| GitError(format!("git diff-tree listed `{meta}` without a path")))?;
+        let parts: Vec<&str> = meta.trim_start_matches(':').split_whitespace().collect();
+        let [old_mode, new_mode, _, blob, status] = parts[..] else {
+            return Err(GitError(format!("can't read git diff-tree's `{meta}`")));
+        };
+        changes.push(Change {
+            path: path.to_owned(),
+            status: status.chars().next().unwrap_or('?'),
+            old_mode: old_mode.to_owned(),
+            new_mode: new_mode.to_owned(),
+            blob: blob.to_owned(),
+        });
+    }
+    Ok(changes)
+}
+
 /// Fetches `branch` into the clone at `path` and returns its tip.
 async fn fetch_branch(path: &Path, remote: &GitRemote, branch: &str) -> Result<String, GitError> {
     if branch.starts_with('-') || branch.contains("..") || branch.contains(':') {
@@ -413,7 +597,17 @@ async fn fetch_branch(path: &Path, remote: &GitRemote, branch: &str) -> Result<S
 /// Runs git in `dir` and returns its stdout, trimmed of the final newline
 /// for one-line answers. Text output keeps everything else as is.
 async fn git(dir: &Path, remote: &GitRemote, args: &[&str]) -> Result<String, GitError> {
-    let output = git_output(dir, remote, args).await?;
+    git_env(dir, remote, &[], args).await
+}
+
+/// [`git`] with `env` set besides the remote's.
+async fn git_env(
+    dir: &Path,
+    remote: &GitRemote,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> Result<String, GitError> {
+    let output = git_output_env(dir, remote, env, args).await?;
     let mut text = String::from_utf8(output)
         .map_err(|_| GitError(format!("git {} wrote non-UTF-8", args[0])))?;
     if args[0] != "cat-file" {
@@ -424,10 +618,21 @@ async fn git(dir: &Path, remote: &GitRemote, args: &[&str]) -> Result<String, Gi
 
 /// Runs git in `dir` and returns its stdout as it wrote it.
 async fn git_output(dir: &Path, remote: &GitRemote, args: &[&str]) -> Result<Vec<u8>, GitError> {
+    git_output_env(dir, remote, &[], args).await
+}
+
+/// [`git_output`] with `env` set besides the remote's.
+async fn git_output_env(
+    dir: &Path,
+    remote: &GitRemote,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> Result<Vec<u8>, GitError> {
     let output = Command::new("git")
         .current_dir(dir)
         .args(args)
         .envs(remote.env.iter().map(|(k, v)| (k, v)))
+        .envs(env.iter().copied())
         .env("GIT_TERMINAL_PROMPT", "0")
         // A checkout fetches the blobs it needs from the remote, but not
         // Git LFS objects, which a review doesn't need and which would
@@ -615,6 +820,83 @@ mod tests {
             .await
             .unwrap();
         assert!(tree.join("docs/guide.md").exists());
+    }
+
+    #[tokio::test]
+    async fn a_worktrees_changes_are_a_tree_in_the_clone_and_the_paths_that_differ() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let github = FakeGitHub::new("me");
+        github.add_repo(&repo());
+        github.open_pr(&repo(), 3, "me", "Docs");
+        github.push_file(&repo(), 3, "docs/guide.md", "Read me.\n");
+        github.push_file(&repo(), 3, "old.txt", "Going.\n");
+        github.push_file(&repo(), 3, ".gitignore", "target/\n");
+        let head = github.head_sha(&repo(), 3);
+        let remote = github.git_remote(&repo()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let clones = Clones::new(dir.path().join("repos"));
+        let tree = dir.path().join("worktrees/1/fix.1");
+        clones
+            .add_worktree(&repo(), &remote, 3, &head, &tree)
+            .await
+            .unwrap();
+        let index = dir.path().join("worktrees/1/fix.1.index");
+
+        let unchanged = clones
+            .worktree_changes(&repo(), &remote, &tree, &head, &index)
+            .await
+            .unwrap();
+        assert!(unchanged.changes.is_empty());
+        assert_eq!(
+            clones
+                .trees(&repo(), &remote, std::slice::from_ref(&head))
+                .await,
+            std::slice::from_ref(&unchanged.tree)
+        );
+
+        std::fs::write(tree.join("docs/guide.md"), "Read me twice.\n").unwrap();
+        std::fs::remove_file(tree.join("old.txt")).unwrap();
+        std::fs::write(tree.join("new.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(tree.join("new.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::create_dir(tree.join("target")).unwrap();
+        std::fs::write(tree.join("target/out"), "built").unwrap();
+        std::os::unix::fs::symlink("docs/guide.md", tree.join("link")).unwrap();
+
+        let changed = clones
+            .worktree_changes(&repo(), &remote, &tree, &head, &index)
+            .await
+            .unwrap();
+        let summary: Vec<(char, &str, &str, &str)> = changed
+            .changes
+            .iter()
+            .map(|c| {
+                (
+                    c.status,
+                    c.path.as_str(),
+                    c.old_mode.as_str(),
+                    c.new_mode.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ('M', "docs/guide.md", "100644", "100644"),
+                ('A', "link", "000000", "120000"),
+                ('A', "new.sh", "000000", "100755"),
+                ('D', "old.txt", "100644", "000000"),
+            ]
+        );
+        assert!(!index.exists(), "the scratch index goes");
+        let guide = &changed.changes[0];
+        assert_eq!(
+            clones.blob(&repo(), &remote, &guide.blob).await.unwrap(),
+            b"Read me twice.\n"
+        );
+        let (parents, head_tree) = clones.commit_of(&repo(), &remote, 3, &head).await.unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(head_tree, unchanged.tree);
     }
 
     #[tokio::test]

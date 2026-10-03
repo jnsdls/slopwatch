@@ -38,8 +38,8 @@ pub use notifications::{
 };
 pub use plugins::{Grant, PluginListing, PluginSettings, workspace_name};
 pub use runs::{
-    Cost, EffectView, GateTerm, RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus,
-    StepView, Waiver,
+    CommitView, Cost, EffectView, GateTerm, RunEvent, RunId, RunSummary, RunView, StepInfo,
+    StepStatus, StepView, Waiver,
 };
 pub use secrets::{SecretInfo, SecretValue, is_secret_name};
 pub use topics::{

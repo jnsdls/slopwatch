@@ -1,7 +1,8 @@
 //! What the `claude` and `codex` Plugins share: they run an agent CLI
 //! headless as a reviewer in a worktree of the PR's head, with tools that
 //! only read. They ask it for Findings in a fixed JSON shape, and fail when
-//! a Finding reaches the Step's `fail_on` severity.
+//! a Finding reaches the Step's `fail_on` severity. The `fix` Plugin runs
+//! the same CLIs the same way, as a fixer that may edit ([`Job::Fix`]).
 //!
 //! A Step's `with:` keys:
 //!
@@ -49,9 +50,20 @@ pub enum Auth {
     ApiKey,
 }
 
-/// A review Step's `with:`.
+/// What a session asks the agent to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Job {
+    /// Read the PR and report Findings. Tools only read.
+    Review,
+    /// Fix the problems behind the Gate's failing terms by editing the
+    /// worktree, which the daemon commits ([`super::fix`]).
+    Fix,
+}
+
+/// A review or fix Step's `with:`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    pub job: Job,
     /// What to look for.
     pub prompt: String,
     /// The CLI's model, or its default.
@@ -131,6 +143,7 @@ impl Config {
             ));
         }
         Ok(Config {
+            job: Job::Review,
             prompt,
             model: text("model")?,
             effort: text("effort")?,
@@ -397,48 +410,72 @@ pub struct Finished {
 /// Runs one review session over the process's stdio: reads `start`, runs
 /// the CLI, and reports its usage and the Outcome. A `cancel`, or the
 /// daemon hanging up, stops the CLI.
-pub fn run<A: Agent>(mut agent: A) -> std::io::Result<()> {
+pub fn run<A: Agent>(agent: A) -> std::io::Result<()> {
     let mut input = BufReader::new(std::io::stdin());
     let mut output = std::io::stdout().lock();
-    let mut line = String::new();
-    if input.read_line(&mut line)? == 0 {
+    let Some(start) = read_start(&mut input, A::NAME)? else {
         return Ok(());
-    }
-    let start = match serde_json::from_str::<ToStep>(&line) {
-        Ok(ToStep::Start(start)) => start,
-        Ok(_) | Err(_) => {
-            eprintln!("{}: the daemon didn't start with `start`", A::NAME);
-            return Ok(());
-        }
     };
     let config = match Config::parse(&start.config, A::NAME) {
         Ok(config) => config,
         Err(reason) => return send(&mut output, &FromStep::Error { reason }),
     };
+    session(agent, &config, &start, input, &mut output)
+}
+
+/// Reads the daemon's `start`, the first line of a session. `None` when
+/// the daemon hung up or sent something else first.
+pub fn read_start(input: &mut impl BufRead, name: &str) -> std::io::Result<Option<Start>> {
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    match serde_json::from_str::<ToStep>(&line) {
+        Ok(ToStep::Start(start)) => Ok(Some(start)),
+        Ok(_) | Err(_) => {
+            eprintln!("{name}: the daemon didn't start with `start`");
+            Ok(None)
+        }
+    }
+}
+
+/// Runs the CLI for `config`'s job once `start` is in, and reports its
+/// usage and the Outcome on `output`. `input` is the rest of the daemon's
+/// side, watched for `cancel`.
+pub fn session<A: Agent>(
+    mut agent: A,
+    config: &Config,
+    start: &Start,
+    input: impl BufRead + Send + 'static,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
     if config.auth == Auth::ApiKey && std::env::var_os(A::API_KEY).is_none() {
         let reason = format!(
             "`auth: api_key` runs on the Secret {}, which isn't set. Set it under Secrets, or \
              use `auth: subscription`.",
             A::API_KEY
         );
-        return send(&mut output, &FromStep::Error { reason });
+        return send(output, &FromStep::Error { reason });
     }
 
     let mut schema_file = tempfile::Builder::new()
-        .prefix("slopwatch-review-schema")
+        .prefix("slopwatch-schema")
         .suffix(".json")
         .tempfile()?;
-    serde_json::to_writer(&mut schema_file, &schema())?;
+    serde_json::to_writer(&mut schema_file, &schema_for(config.job))?;
     schema_file.flush()?;
-    let mut command = agent.command(&config, &start, schema_file.path());
+    let mut command = agent.command(config, start, schema_file.path());
     if config.auth == Auth::Subscription {
         command.env_remove(A::API_KEY);
     }
-    let prompt = prompt(
-        &config,
-        &start.snapshot,
-        Diff::read(&start.snapshot).as_ref(),
-    );
+    let prompt = match config.job {
+        Job::Review => prompt(
+            config,
+            &start.snapshot,
+            Diff::read(&start.snapshot).as_ref(),
+        ),
+        Job::Fix => super::fix::prompt(config, start),
+    };
     // The arguments only: the env can hold an API key.
     let args: Vec<_> = command
         .get_args()
@@ -454,7 +491,7 @@ pub fn run<A: Agent>(mut agent: A) -> std::io::Result<()> {
         Ok(child) => child,
         Err(error) => {
             let reason = format!("can't run `{}`: {error}", config.cli);
-            return send(&mut output, &FromStep::Error { reason });
+            return send(output, &FromStep::Error { reason });
         }
     };
     // The prompt goes in on a thread of its own, so a CLI that writes
@@ -474,7 +511,7 @@ pub fn run<A: Agent>(mut agent: A) -> std::io::Result<()> {
                 Event::Progress(message) => {
                     eprintln!("{}: {message}", A::NAME);
                     send(
-                        &mut output,
+                        output,
                         &FromStep::Progress {
                             message: Some(message),
                         },
@@ -490,13 +527,17 @@ pub fn run<A: Agent>(mut agent: A) -> std::io::Result<()> {
     let status = child.wait()?;
     let finished = agent.finish(status);
     for usage in finished.usage {
-        send(&mut output, &FromStep::Usage(usage))?;
+        send(output, &FromStep::Usage(usage))?;
     }
     if cancelled.load(Ordering::Acquire) {
         return Ok(());
     }
+    let judged = |answer: &Value| match config.job {
+        Job::Review => outcome(answer, config.fail_on),
+        Job::Fix => super::fix::outcome(answer),
+    };
     let message = match finished.answer {
-        Some(Ok(answer)) => match outcome(&answer, config.fail_on) {
+        Some(Ok(answer)) => match judged(&answer) {
             Ok(outcome) => FromStep::Outcome(outcome),
             Err(reason) => FromStep::Error {
                 reason: format!("{} answered in the wrong shape: {reason}", A::NAME),
@@ -504,10 +545,18 @@ pub fn run<A: Agent>(mut agent: A) -> std::io::Result<()> {
         },
         Some(Err(reason)) => FromStep::Error { reason },
         None => FromStep::Error {
-            reason: format!("{} exited ({status}) without a review", A::NAME),
+            reason: format!("{} exited ({status}) without an answer", A::NAME),
         },
     };
-    send(&mut output, &message)
+    send(output, &message)
+}
+
+/// The JSON Schema the agent's answer to `job` holds to.
+pub fn schema_for(job: Job) -> Value {
+    match job {
+        Job::Review => schema(),
+        Job::Fix => super::fix::schema(),
+    }
 }
 
 /// Stops the CLI when the daemon sends `cancel` or hangs up, unless
@@ -546,7 +595,7 @@ fn watch_for_cancel(
 }
 
 /// Writes one protocol message to the daemon.
-fn send(output: &mut impl Write, message: &FromStep) -> std::io::Result<()> {
+pub fn send(output: &mut impl Write, message: &FromStep) -> std::io::Result<()> {
     let line = serde_json::to_string(message)?;
     writeln!(output, "{line}")?;
     output.flush()

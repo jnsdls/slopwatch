@@ -42,6 +42,7 @@ struct PipelineFile {
     fix_rounds: Option<u32>,
     #[serde(default)]
     budget_usd: Option<f64>,
+    guard_lockfiles: Option<bool>,
     steps: BTreeMap<String, StepEntry>,
     #[serde(default)]
     gate: Vec<Value>,
@@ -79,6 +80,7 @@ pub fn load(text: &str, resolver: &dyn Resolver) -> Result<Pipeline, Vec<LoadErr
         gate: read.gate,
         fix_rounds: read.fix_rounds,
         budget_usd: read.budget_usd,
+        guard: read.guard,
         order,
     })
 }
@@ -110,6 +112,7 @@ struct Read {
     gate: Vec<Expr>,
     fix_rounds: u32,
     budget_usd: f64,
+    guard: crate::Guard,
     errors: Vec<LoadError>,
 }
 
@@ -171,6 +174,9 @@ fn read(text: &str, resolver: &dyn Resolver) -> Result<Read, Vec<LoadError>> {
         gate,
         fix_rounds,
         budget_usd,
+        guard: crate::Guard {
+            lockfiles: file.guard_lockfiles.unwrap_or(true),
+        },
         errors,
     })
 }

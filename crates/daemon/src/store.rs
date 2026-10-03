@@ -315,11 +315,35 @@ const MIGRATIONS: &[&str] = &[
         value TEXT NOT NULL
     );
 ",
+    // Commits of write Steps' changes (ADR 0002, ADR 0008): a row before
+    // the call, with the head it expects and the tree it should make, and
+    // the SHA GitHub made after. `finished` without a SHA is a commit that
+    // didn't happen. `repo` is the PR's, `head_repo` where its branch is.
+    "
+    CREATE TABLE commits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL REFERENCES runs(id),
+        step TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        head_repo TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        expected_head TEXT NOT NULL,
+        tree TEXT NOT NULL,
+        files TEXT NOT NULL DEFAULT '[]',
+        sha TEXT,
+        finished INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX commits_open ON commits (finished, id);
+    CREATE INDEX commits_by_run ON commits (run_id, sha);
+",
 ];
 
 mod budgets;
+mod commits;
 mod drafts;
 
+pub use commits::{CommitIntent, NewCommitIntent, Streak};
 pub use drafts::{OpenPipelineCommit, StoredDraft};
 
 #[derive(Clone)]

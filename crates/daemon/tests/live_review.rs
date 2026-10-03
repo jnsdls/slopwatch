@@ -89,6 +89,8 @@ async fn a_real_cli_reviews_a_real_pr() {
             stacked_on: None,
         },
         upstream: BTreeMap::new(),
+        gate_failing: vec![],
+        ci_logs: vec![],
         budget_usd: Some(0.5),
     });
 

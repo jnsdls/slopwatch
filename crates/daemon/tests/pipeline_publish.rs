@@ -504,7 +504,8 @@ async fn a_commit_a_crash_left_open_is_settled_by_the_next_publish() {
                 expected_head: &tip,
                 headline: "Update the slopwatch Pipeline",
                 body: "",
-                files: &[(PIPELINE_PATH, &text)],
+                files: &[(PIPELINE_PATH, text.as_bytes())],
+                deletions: &[],
             },
         )
         .await

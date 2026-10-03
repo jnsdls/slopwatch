@@ -225,7 +225,7 @@ Each ticket left these for the build. None of them changes a decision on the map
 
 - The Merge Step's timeout, which bounds its wait on a `BLOCKED` PR ([Task: consistency sweep before the PRD](https://github.com/jnsdls/slopwatch/issues/45)). The Step contract sets `timeout` and `stall_after` defaults only for agent, CI, Jev and Human Steps. [#75](https://github.com/jnsdls/slopwatch/issues/75) set it to 1 hour, with no stall watchdog.
 - The `jev` Plugin's per-Plugin cap. Parallax runs 4 in flight with 1 to 30 s backoff ([Research: Jev evaluate API for PR judging](https://github.com/jnsdls/slopwatch/issues/3)). [#71](https://github.com/jnsdls/slopwatch/issues/71) set the cap to 4 Steps, each sending one request, so at most 4 requests are in flight. A 429, 408 or 5xx is retried after 1, 2, 4, 8, 16 and 30 s, each with up to a quarter added at random, and then the Step errors. The timeout is 5 minutes rather than the Step contract's 2, because one request with every retry and its 30 s request timeout can run past 2.
-- The co-author email in the `Co-authored-by: slopwatch` trailer, open until a slopwatch domain or App bot exists ([GitHub identity and push ownership](https://github.com/jnsdls/slopwatch/issues/15)).
+- The co-author email in the `Co-authored-by: slopwatch` trailer, open until a slopwatch domain or App bot exists ([GitHub identity and push ownership](https://github.com/jnsdls/slopwatch/issues/15)). [#74](https://github.com/jnsdls/slopwatch/issues/74) set it to `noreply@slopwatch.invalid` (ADR 0008's "What the build settled").
 
 ### Mechanics to work out in code
 

@@ -477,6 +477,17 @@ pub fn waiver_line(step: &StepView) -> Option<String> {
     Some(format!("Waived, {}: {}", waiver.category, waiver.reason))
 }
 
+/// The commit a write Step's changes became, as its row says it.
+pub fn commit_line(view: &RunView, step: &StepView) -> Option<String> {
+    let commit = view.commit.as_ref().filter(|c| c.step == step.info.id)?;
+    let sha = commit.sha.get(..7).unwrap_or(&commit.sha);
+    Some(match commit.files.len() {
+        0 => format!("Committed {sha}"),
+        1 => format!("Committed {sha}: {}", commit.files[0]),
+        n => format!("Committed {sha}: {n} files"),
+    })
+}
+
 /// Whether a Run reads as good, bad or neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
@@ -871,6 +882,18 @@ mod tests {
         );
         assert_eq!(step_tone(&step), Tone::Neutral);
         assert_eq!(step_state(&step), "fail (waived)");
+
+        let mut view = RunView::default();
+        assert_eq!(commit_line(&view, &step), None);
+        view.commit = Some(slopwatch_protocol::CommitView {
+            step: step.info.id.clone(),
+            sha: "0123456789abcdef".into(),
+            files: vec!["a.rs".into(), "b.rs".into()],
+        });
+        assert_eq!(
+            commit_line(&view, &step).as_deref(),
+            Some("Committed 0123456: 2 files")
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use slopwatch_protocol::step::{
     CONFIG_DIR_ENV, Manifest, PR_DIFF, STEP_DIALECT, SecretSpec, Start, Usage,
 };
 
-use super::review::{self, Agent, Auth, Config, Event, Finished};
+use super::review::{self, Agent, Auth, Config, Event, Finished, Job};
 
 /// The Secret an `auth: api_key` Step runs on.
 pub const API_KEY: &str = "ANTHROPIC_API_KEY";
@@ -56,6 +56,9 @@ pub fn manifest() -> Manifest {
 /// The tools a reviewer gets: reading, nothing that runs or writes.
 const TOOLS: &str = "Read,Grep,Glob";
 
+/// The tools a fixer gets: reading and editing files, nothing that runs.
+const FIX_TOOLS: &str = "Read,Grep,Glob,Edit,Write";
+
 #[derive(Debug, Default)]
 pub struct Claude {
     result: Option<Value>,
@@ -67,6 +70,11 @@ impl Agent for Claude {
 
     fn command(&mut self, config: &Config, start: &Start, _schema: &Path) -> Command {
         let mut command = Command::new(&config.cli);
+        // A fixer's edits are accepted without asking, in the worktree.
+        let (mode, tools) = match config.job {
+            Job::Review => ("dontAsk", TOOLS),
+            Job::Fix => ("acceptEdits", FIX_TOOLS),
+        };
         command.args([
             "-p",
             "--output-format",
@@ -74,11 +82,11 @@ impl Agent for Claude {
             "--verbose",
             "--no-session-persistence",
             "--permission-mode",
-            "dontAsk",
+            mode,
             "--tools",
-            TOOLS,
+            tools,
             "--json-schema",
-            &review::schema().to_string(),
+            &review::schema_for(config.job).to_string(),
         ]);
         if !config.repo_config {
             command.arg(match config.auth {
@@ -105,7 +113,9 @@ impl Agent for Claude {
         // The diff sits in a directory of the PR's own, outside the
         // worktree the tools may read, so a diff too long for the prompt
         // needs it named.
-        if let Some(dir) = start.snapshot.diff.as_deref().and_then(Path::parent) {
+        if config.job == Job::Review
+            && let Some(dir) = start.snapshot.diff.as_deref().and_then(Path::parent)
+        {
             command.arg("--add-dir").arg(dir);
         }
         command
@@ -211,7 +221,7 @@ fn answer(result: &Value) -> Result<Value, String> {
     }
     match result.get("structured_output") {
         Some(answer) if answer.is_object() => Ok(answer.clone()),
-        _ => Err("claude finished without the structured review it was asked for".to_owned()),
+        _ => Err("claude finished without the structured answer it was asked for".to_owned()),
     }
 }
 
@@ -274,6 +284,8 @@ mod tests {
             config: with.as_object().unwrap().clone(),
             snapshot: review::tests::snapshot(),
             upstream: BTreeMap::new(),
+            gate_failing: vec![],
+            ci_logs: vec![],
             budget_usd: Some(2.0),
         };
         (config, start)

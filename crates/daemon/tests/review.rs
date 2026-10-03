@@ -494,8 +494,9 @@ async fn the_review_api_keys_list_as_optional_so_an_unset_one_isnt_missing() {
     let listed = runs.list_secrets().unwrap();
 
     for (name, plugin) in [("ANTHROPIC_API_KEY", "claude"), ("OPENAI_API_KEY", "codex")] {
+        // `fix` runs either agent, so it gets both keys.
         let info = listed.iter().find(|info| info.name == name).unwrap();
-        assert_eq!(info.granted_to, [plugin]);
+        assert_eq!(info.granted_to, [plugin, "fix"]);
         assert!(info.optional, "{name}");
     }
 }

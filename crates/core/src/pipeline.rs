@@ -27,6 +27,8 @@ pub struct Pipeline {
     /// What Steps may spend on one Watched PR since its last outside push,
     /// in list-price US dollars.
     pub(crate) budget_usd: f64,
+    /// What the Pipeline guards besides what's always guarded.
+    pub(crate) guard: crate::Guard,
     /// Every Step id plus [`GATE`], each after everything it reads.
     pub(crate) order: Vec<String>,
 }
@@ -70,6 +72,12 @@ impl Pipeline {
     /// The Watched PR's Budget, in list-price US dollars.
     pub fn budget_usd(&self) -> f64 {
         self.budget_usd
+    }
+
+    /// The Guarded paths beyond the ones always guarded, which only
+    /// lockfiles are: `guard_lockfiles: false` unguards them (ADR 0008).
+    pub fn guard(&self) -> crate::Guard {
+        self.guard
     }
 }
 
