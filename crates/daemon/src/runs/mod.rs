@@ -58,7 +58,10 @@ use slopwatch_core::{
     Decision, EndReason, GATE, GateState, Pipeline, PrFacts, RunState, Step, StepState, Verdict,
     load, parse_duration,
 };
-use slopwatch_protocol::step::{FromStep, Manifest, Outcome, Outputs, PrSnapshot, Start, ToStep};
+use slopwatch_protocol::step::{
+    EffectKind, FromStep, MERGE_STATE, Manifest, MergeState, Outcome, Outputs, PrSnapshot, Start,
+    ToStep,
+};
 use slopwatch_protocol::{
     Actor, Cause, Closing, GateTerm, LogFilter, LogKey, LogPage, LogRecord, PrRef, RepoName,
     RunEvent, RunId, StepInfo, StepLogPage, Waiver,
@@ -66,7 +69,7 @@ use slopwatch_protocol::{
 use tokio::sync::mpsc;
 
 use crate::clones::{Clones, PipelineAt};
-use crate::github::{GitHub, OpenPr};
+use crate::github::{GitHub, GitHubError, OpenPr};
 use crate::inbox::Inbox;
 use crate::plugins::Plugins;
 use crate::shell_env;
@@ -92,6 +95,19 @@ pub const LOG_TAIL: u32 = 200;
 const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 type PrKey = (RepoName, u64);
+
+/// What GitHub said about merging each PR, and which read it answered.
+/// `None` means GitHub has no such PR anymore.
+type MergeStates = HashMap<PrKey, (MergeRead, Option<MergeState>)>;
+
+/// A read of a PR's merge state, as the sync asks for it. A Run takes the
+/// answer only if it still judges `head_sha`, and if no merge it asked for
+/// finished while the read was out, which bumps its `merge_epoch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeRead {
+    head_sha: String,
+    epoch: u64,
+}
 
 pub struct Runs {
     engine: tokio::sync::Mutex<Engine>,
@@ -244,13 +260,22 @@ impl Runs {
     /// GitHub has answered for every repo since the daemon started, the
     /// PRs are only what the store kept, so nothing moves (ADR 0009).
     pub async fn sync(&self) {
-        let starts = {
-            let mut engine = self.engine.lock().await;
+        let wanted = {
+            let engine = self.engine.lock().await;
             if !engine.watching.fresh() {
                 return;
             }
+            // The same PRs go to the sync below, so a poll in between
+            // can't show a PR gone that the merge states saw open.
             let prs = engine.watching.prs();
-            let starts = engine.sync(prs);
+            let wanted = engine.merge_states_wanted(&prs);
+            (prs, wanted)
+        };
+        let (prs, wanted) = wanted;
+        let merge_states = self.read_merge_states(wanted).await;
+        let starts = {
+            let mut engine = self.engine.lock().await;
+            let starts = engine.sync(prs, merge_states);
             engine.schedule();
             starts
         };
@@ -263,6 +288,27 @@ impl Runs {
         let engine = self.engine.lock().await;
         self.live
             .store(!engine.active.is_empty(), Ordering::Relaxed);
+    }
+
+    /// Asks GitHub where each PR stands for merging, at the head its Run
+    /// judges. A PR GitHub can't find reads as `None`. One that can't be
+    /// read for another reason is left out, and the next sync asks again.
+    async fn read_merge_states(&self, wanted: Vec<(PrKey, MergeRead)>) -> MergeStates {
+        let mut states = HashMap::new();
+        for ((repo, number), read) in wanted {
+            match self.github.merge_state(&repo, number, &read.head_sha).await {
+                Ok(state) => {
+                    states.insert((repo, number), (read, Some(state)));
+                }
+                Err(GitHubError::NotFound(_)) => {
+                    states.insert((repo, number), (read, None));
+                }
+                Err(error) => {
+                    eprintln!("slopwatchd: can't read {repo}#{number}'s merge state: {error}");
+                }
+            }
+        }
+        states
     }
 
     /// What a Run on the PR's head starts from: the Pipeline at the tip of
@@ -601,6 +647,22 @@ struct Active {
     /// in a row did. Each starts again or settles once the first poll has
     /// run (ADR 0009).
     interrupted: BTreeMap<String, u32>,
+    /// GitHub merged the PR after the Run asked it to, and the PR has left
+    /// the poll. The Run ends merged once its Steps settle.
+    merged: bool,
+    /// How many merges the Run asked for have finished. A merge state
+    /// read before the latest one doesn't count (see [`MergeRead`]).
+    merge_epoch: u64,
+}
+
+impl Active {
+    /// The merge state read this Run would take now.
+    fn merge_read(&self) -> MergeRead {
+        MergeRead {
+            head_sha: self.head_sha.clone(),
+            epoch: self.merge_epoch,
+        }
+    }
 }
 
 /// What a developer's Waiver covers.
@@ -756,6 +818,8 @@ impl Engine {
                 running: HashMap::new(),
                 interrupted: BTreeMap::new(),
                 rerun: HashSet::new(),
+                merged: false,
+                merge_epoch: 0,
             };
             active.state.waived =
                 self.store
@@ -852,19 +916,62 @@ impl Engine {
 
     /// Ends the Runs the poll says are over, passes PR updates to running
     /// Steps, and returns the PRs that may need a new Run.
-    fn sync(&mut self, prs: Vec<(RepoName, OpenPr)>) -> Vec<(RepoName, OpenPr, StartWhen)> {
+    fn sync(
+        &mut self,
+        prs: Vec<(RepoName, OpenPr)>,
+        merge_states: MergeStates,
+    ) -> Vec<(RepoName, OpenPr, StartWhen)> {
         if self.stopped {
             return Vec::new();
         }
-        self.try_sync(prs).unwrap_or_else(|error| {
+        self.try_sync(prs, merge_states).unwrap_or_else(|error| {
             eprintln!("slopwatchd: can't update Runs: {error}");
             Vec::new()
         })
     }
 
+    /// The PRs whose merge state the next sync needs, with the head SHA
+    /// their Run judges: those with a running Step that reads it, and those
+    /// that left the poll after their Run asked to merge them, which may
+    /// mean GitHub merged them.
+    fn merge_states_wanted(&self, prs: &[(RepoName, OpenPr)]) -> Vec<(PrKey, MergeRead)> {
+        let open: HashSet<PrKey> = prs
+            .iter()
+            .map(|(repo, pr)| (repo.clone(), pr.number))
+            .collect();
+        self.active
+            .iter()
+            .filter(|(key, run)| {
+                if run.merged {
+                    return false;
+                }
+                if open.contains(*key) {
+                    return run.running.iter().any(|(step, running)| {
+                        !running.reported && self.reads_merge_state(run, step)
+                    });
+                }
+                self.store
+                    .asked_for(run.id, EffectKind::Merge)
+                    .unwrap_or_else(|error| {
+                        eprintln!("slopwatchd: can't read Run {}'s Effects: {error}", run.id);
+                        false
+                    })
+            })
+            .map(|(key, run)| (key.clone(), run.merge_read()))
+            .collect()
+    }
+
+    fn reads_merge_state(&self, run: &Active, step: &str) -> bool {
+        run.pipeline
+            .step(step)
+            .and_then(|step| self.plugins.manifest(&step.plugin))
+            .is_some_and(|manifest| manifest.features.iter().any(|f| f == MERGE_STATE))
+    }
+
     fn try_sync(
         &mut self,
         prs: Vec<(RepoName, OpenPr)>,
+        merge_states: MergeStates,
     ) -> Result<Vec<(RepoName, OpenPr, StartWhen)>, StoreError> {
         let open: BTreeMap<PrKey, (RepoName, OpenPr)> = prs
             .into_iter()
@@ -873,11 +980,31 @@ impl Engine {
 
         let keys: Vec<PrKey> = self.active.keys().cloned().collect();
         for key in keys {
+            let run = &self.active[&key];
             let ending = match open.get(&key) {
-                None => Some(EndReason::Closed),
+                // GitHub merged it, and the Run ends once its Steps settle.
+                None if run.merged => continue,
+                None => match merge_states.get(&key) {
+                    Some((_, Some(state))) if state.merged => {
+                        self.merged_on_github(&key, state)?;
+                        continue;
+                    }
+                    // A merge finished while the read was out, so its
+                    // "not merged" may predate the merge.
+                    Some((read, _)) if read.epoch != run.merge_epoch => continue,
+                    Some(_) => Some(EndReason::Closed),
+                    // The Run asked to merge it, but GitHub couldn't say
+                    // whether it did. The next sync asks again.
+                    None if self.store.asked_for(run.id, EffectKind::Merge)? => continue,
+                    None => Some(EndReason::Closed),
+                },
                 Some((_, pr)) if !pr.labeled => Some(EndReason::Cancelled),
-                Some((repo, pr)) if pr.head_sha != self.active[&key].head_sha => {
-                    Some(if self.store.pushed_by_slopwatch(repo, &pr.head_sha)? {
+                Some((repo, pr)) if pr.head_sha != run.head_sha => {
+                    // A rebase doesn't say what head it made, so whatever
+                    // head follows one is its push (ADR 0004).
+                    let ours = self.store.pushed_by_slopwatch(repo, &pr.head_sha)?
+                        || self.store.asked_for(run.id, EffectKind::Rebase)?;
+                    Some(if ours {
                         EndReason::Pushed
                     } else {
                         EndReason::Superseded
@@ -891,8 +1018,14 @@ impl Engine {
                 continue;
             }
             let (repo, pr) = &open[&key];
-            let snapshot = snapshot(repo, pr);
+            let mut snapshot = snapshot(repo, pr);
             let run = self.active.get_mut(&key).expect("listed above");
+            // A merge state read this time replaces the last one, which
+            // stays until then.
+            snapshot.merge = match merge_states.get(&key) {
+                Some((read, Some(state))) if *read == run.merge_read() => Some(state.clone()),
+                _ => run.snapshot.as_ref().and_then(|last| last.merge.clone()),
+            };
             if run.snapshot.as_ref() == Some(&snapshot) {
                 continue;
             }
@@ -980,6 +1113,28 @@ impl Engine {
             .collect();
         self.inbox.keep_watched(&watched)?;
         Ok(starts)
+    }
+
+    /// GitHub merged a PR whose Run asked it to, as a merge queue does
+    /// some time after the merge Effect. The PR has left the poll, so its
+    /// Steps hear it through the merge state, and the Run ends merged once
+    /// they settle.
+    fn merged_on_github(&mut self, key: &PrKey, state: &MergeState) -> Result<(), StoreError> {
+        let run = self.active.get_mut(key).expect("only active Runs merge");
+        run.merged = true;
+        let Some(snapshot) = run.snapshot.as_mut() else {
+            // The daemon restarted, and with the PR gone no poll will
+            // bring the snapshot its Steps need to go on.
+            let run = self.active.remove(key).expect("found above");
+            return self.end_run(run, EndReason::Merged);
+        };
+        snapshot.merge = Some(state.clone());
+        for running in run.running.values() {
+            running.handle.send(ToStep::PrUpdated {
+                snapshot: snapshot.clone(),
+            });
+        }
+        self.advance(key)
     }
 
     /// Starts a Run on the PR's head, with the Pipeline from its root
@@ -1128,6 +1283,8 @@ impl Engine {
                 running: HashMap::new(),
                 interrupted: BTreeMap::new(),
                 rerun: HashSet::new(),
+                merged: false,
+                merge_epoch: 0,
             },
         );
         for (step, waiver) in self.store.waivers(repo, pr.number, &pr.head_sha)? {
@@ -1293,10 +1450,7 @@ impl Engine {
             .steps()
             .all(|step| matches!(run.state.steps.get(&step.id), Some(StepState::Settled(_))));
         if settled {
-            let reason = match run.gate {
-                GateState::Pass => EndReason::Shippable,
-                GateState::Fail | GateState::Pending => EndReason::NotShippable,
-            };
+            let reason = end_reason(run);
             let run = self.active.remove(key).expect("checked above");
             return self.end_run(run, reason);
         }
@@ -1774,12 +1928,12 @@ impl Engine {
         // A Run the developer cancelled, or one a push or close ended,
         // needs nothing from them.
         if reason == EndReason::NotShippable {
-            self.inbox.raise_pr(
-                pr_ref(&run.repo, run.number),
-                run.id,
-                NOT_SHIPPABLE,
-                not_shippable(&run),
-            )?;
+            let (title, reasons) = match couldnt_merge(&run) {
+                Some(reasons) => (COULDNT_MERGE, reasons),
+                None => (NOT_SHIPPABLE, not_shippable(&run)),
+            };
+            self.inbox
+                .raise_pr(pr_ref(&run.repo, run.number), run.id, title, reasons)?;
         }
         self.publish(&run.repo, run.number)
     }
@@ -1968,6 +2122,40 @@ impl Engine {
     }
 }
 
+/// Why a Run whose Steps have all settled ends. It's merged once a Merge
+/// Step passes, which it does only once GitHub merged the PR. A Merge Step
+/// that ran and couldn't land the PR leaves it not shippable, so the
+/// developer hears about it. Shippable needs the Gate to pass with no
+/// Merge Step, or with one that skipped or ended inconclusive, as on a
+/// draft.
+fn end_reason(run: &Active) -> EndReason {
+    let merge_verdicts = || {
+        run.pipeline
+            .steps()
+            .filter(|step| step.is_merge())
+            .filter_map(|step| match run.state.steps.get(&step.id) {
+                Some(StepState::Settled(verdict)) => Some(*verdict),
+                _ => None,
+            })
+    };
+    if run.merged || merge_verdicts().any(|verdict| verdict == Verdict::Pass) {
+        return EndReason::Merged;
+    }
+    match run.gate {
+        GateState::Pass if !merge_verdicts().any(failed_to_land) => EndReason::Shippable,
+        _ => EndReason::NotShippable,
+    }
+}
+
+/// Whether a Merge Step that settled `verdict` tried to land the PR and
+/// couldn't. A skip, or an inconclusive draft, didn't try.
+fn failed_to_land(verdict: Verdict) -> bool {
+    matches!(
+        verdict,
+        Verdict::Fail | Verdict::Error | Verdict::Cancelled | Verdict::Missing
+    )
+}
+
 /// Where a Run's Step logs live.
 fn run_logs(data_dir: &std::path::Path, run: RunId) -> PathBuf {
     data_dir.join("logs").join(run.to_string())
@@ -2038,6 +2226,42 @@ fn not_shippable(run: &Active) -> Vec<String> {
         reasons.push("The Gate didn't pass".to_owned());
     }
     reasons
+}
+
+const COULDNT_MERGE: &str = "Couldn't merge";
+
+/// Why the Merge Steps of a Run whose Gate passed didn't land the PR, such
+/// as a conflict with the base, a merge queue that dropped it, or GitHub
+/// blocking it past Merge's timeout. `None` when the Gate didn't pass or
+/// no Merge Step failed, which [`not_shippable`] explains instead.
+fn couldnt_merge(run: &Active) -> Option<Vec<String>> {
+    if run.gate != GateState::Pass {
+        return None;
+    }
+    let reasons: Vec<String> = run
+        .pipeline
+        .ordered_steps()
+        .filter(|step| step.is_merge())
+        .filter_map(|step| {
+            let id = &step.id;
+            let Some(StepState::Settled(verdict)) = run.state.steps.get(id) else {
+                return None;
+            };
+            if !failed_to_land(*verdict) {
+                return None;
+            }
+            let finding = run
+                .outcomes
+                .get(id)
+                .and_then(|outcome| outcome.outputs.findings.first())
+                .map(|finding| finding.message.clone());
+            Some(match finding.or_else(|| run.reasons.get(id).cloned()) {
+                Some(why) => format!("`{id}`: {why}"),
+                None => format!("`{id}`: {verdict}"),
+            })
+        })
+        .collect();
+    (!reasons.is_empty()).then_some(reasons)
 }
 
 fn pr_ref(repo: &RepoName, number: u64) -> PrRef {
@@ -2149,6 +2373,7 @@ fn snapshot(repo: &RepoName, pr: &OpenPr) -> PrSnapshot {
         draft: pr.draft,
         labels: pr.detail.labels.clone(),
         checks: pr.detail.checks.clone(),
+        merge: None,
     }
 }
 

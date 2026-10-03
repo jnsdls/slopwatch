@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use slopwatch_core::{EndReason, GateState, ReuseKey, Verdict};
-use slopwatch_protocol::step::{Effect, EffectResult, Outputs};
+use slopwatch_protocol::step::{Effect, EffectKind, EffectResult, Outputs};
 use slopwatch_protocol::{EntryId, InboxEntry, RepoName, RunId, RunSummary, Waiver};
 
 use crate::github::OpenPr;
@@ -1224,6 +1224,61 @@ impl Store {
             .optional()
             .map(|found| found.is_some())
     }
+
+    /// Whether a Step in `run` asked for a `kind` Effect, and GitHub took
+    /// it or hasn't answered yet.
+    pub fn asked_for(&self, run: RunId, kind: EffectKind) -> Result<bool, StoreError> {
+        asked_for(&self.db(), run, kind)
+    }
+
+    /// How many of the PR's Runs before `run`, newest first and in a row,
+    /// ended with a rebase slopwatch made (ADR 0004). The Run after each
+    /// one was rebase-started.
+    pub fn rebase_streak(
+        &self,
+        repo: &RepoName,
+        number: u64,
+        run: RunId,
+    ) -> Result<u32, StoreError> {
+        let db = self.db();
+        let mut earlier = db.prepare(
+            "SELECT id, end_reason FROM runs
+             WHERE repo = ?1 AND number = ?2 AND id < ?3 ORDER BY id DESC",
+        )?;
+        let rows = earlier.query_map(
+            params![repo.to_string(), number as i64, run.0 as i64],
+            |row| {
+                Ok((
+                    RunId(row.get::<_, i64>(0)? as u64),
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )?;
+        let mut streak = 0;
+        for row in rows {
+            let (id, reason) = row?;
+            let pushed = reason.as_deref() == Some(&json_str(&EndReason::Pushed));
+            if !pushed || !asked_for(&db, id, EffectKind::Rebase)? {
+                break;
+            }
+            streak += 1;
+        }
+        Ok(streak)
+    }
+}
+
+fn asked_for(db: &Connection, run: RunId, kind: EffectKind) -> rusqlite::Result<bool> {
+    db.query_row(
+        "SELECT 1 FROM effects
+         WHERE run_id = ?1 AND json_extract(effect, '$.kind') = ?2
+           AND (result IS NULL
+                OR json_extract(result, '$.status') IN ('done', 'enqueued'))
+         LIMIT 1",
+        params![run.0 as i64, kind.to_string()],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
 }
 
 const SELECT_EFFECT: &str =
@@ -1793,5 +1848,44 @@ mod tests {
             "GitHub refused it"
         );
         assert!(!store.reran(&repo, "aaa", "build").unwrap(), "never asked");
+    }
+
+    #[test]
+    fn the_rebase_streak_counts_runs_in_a_row_that_ended_with_a_rebase() {
+        let store = Store::in_memory();
+        let repo = RepoName::new("o", "r");
+        let rebase = Effect::Rebase {
+            method: slopwatch_protocol::step::UpdateMethod::Rebase,
+        };
+        let run = |head: &str, at: i64, rebased: Option<EffectResult>, ended: EndReason| {
+            let run = store.insert_run(&new_run(&repo, head), at).unwrap();
+            if let Some(result) = rebased {
+                let row = store
+                    .insert_effect(&intent(run, &repo, "rebase", &rebase))
+                    .unwrap();
+                finish(&store, &row, result);
+            }
+            store.end_run(run, ended, at).unwrap();
+            run
+        };
+        let failed = EffectResult::Failed {
+            reason: "conflict".into(),
+        };
+
+        run("a", 1, Some(EffectResult::Done), EndReason::Pushed);
+        run("b", 2, None, EndReason::Superseded);
+        run("c", 3, Some(EffectResult::Done), EndReason::Pushed);
+        let refused = run("d", 4, Some(failed), EndReason::NotShippable);
+        run("e", 5, Some(EffectResult::Done), EndReason::Pushed);
+        run("f", 6, Some(EffectResult::Done), EndReason::Pushed);
+        let current = store.insert_run(&new_run(&repo, "g"), 7).unwrap();
+
+        assert_eq!(store.rebase_streak(&repo, 7, current).unwrap(), 2);
+        assert_eq!(store.rebase_streak(&repo, 7, refused).unwrap(), 1);
+        assert!(
+            store
+                .asked_for(current, EffectKind::Rebase)
+                .is_ok_and(|asked| !asked)
+        );
     }
 }

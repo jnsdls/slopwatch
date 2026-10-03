@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 
-use slopwatch_protocol::step::{Effect, EffectResult};
+use slopwatch_protocol::step::{Effect, EffectResult, UpdateMethod};
 use slopwatch_protocol::{
     Command, LogFilter, LogKey, LogLevel, LogPage, LogRecord, LogSource, RunEvent, StepLogPage,
     Truncation,
@@ -417,9 +417,17 @@ fn event_text(event: &RunEvent, key: &LogKey) -> Option<String> {
                 } => format!("label `{name}`"),
                 Effect::Label { name, remove: true } => format!("removing label `{name}`"),
                 Effect::Rerun { check, .. } => format!("rerun of `{check}`"),
+                Effect::Rebase {
+                    method: UpdateMethod::Rebase,
+                } => "rebase onto the base".to_owned(),
+                Effect::Rebase {
+                    method: UpdateMethod::Merge,
+                } => "merge of the base into the branch".to_owned(),
+                Effect::Merge { .. } => "merge".to_owned(),
             };
             Some(match result {
                 EffectResult::Done => format!("{effect}: done"),
+                EffectResult::Enqueued => format!("{effect}: in the merge queue"),
                 EffectResult::Dropped { reason } => format!("{effect}: dropped, {reason}"),
                 EffectResult::Refused { reason } => format!("{effect}: refused, {reason}"),
                 EffectResult::Failed { reason } => format!("{effect}: failed, {reason}"),

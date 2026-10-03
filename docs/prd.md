@@ -217,13 +217,13 @@ Each ticket left these for the build. None of them changes a decision on the map
 - What ad-hoc signing costs. No Apple source says whether `SMAppService.register()` accepts an ad-hoc build, and DTS says ad-hoc builds lose approval across rebuilds ([Research: shipping and updating a Rust/GPUI macOS app](https://github.com/jnsdls/slopwatch/issues/32)). An ad-hoc designated requirement is the cdhash, so every rebuild is a new code identity. The first build checks whether the agent registers, and what a rebuild does to Login Items approval, notification permission and the daemon's access to its own Keychain items. If those break on every rebuild, v1 moves to a self-signed certificate, which keeps the designated requirement stable without an Apple account. Answered, except for notification permission, by [#56](https://github.com/jnsdls/slopwatch/issues/56) in ADR 0009's "What the first build showed".
 - Whether `claude -p` spawned by the launchd agent reads Claude's Keychain login without a prompt ([Secrets for Steps](https://github.com/jnsdls/slopwatch/issues/30)).
 - Whether `claude -p` stream-json emits `rate_limit_event` and fills `total_cost_usd` under a subscription login ([Research: subscription login for headless agent CLIs](https://github.com/jnsdls/slopwatch/issues/29)).
-- Whether `updatePullRequestBranch` with `MERGE` produces signed merge commits ([ADR 0004](adr/0004-merge-rebases-through-update-pull-request-branch.md)).
+- Whether `updatePullRequestBranch` with `MERGE` produces signed merge commits ([ADR 0004](adr/0004-merge-rebases-through-update-pull-request-branch.md)). Answered by [#75](https://github.com/jnsdls/slopwatch/issues/75): it does, signed by `web-flow`.
 - Whether `MERGE` comes out clean on a child after its parent was squash-merged ([ADR 0011](adr/0011-a-stack-lands-one-pr-at-a-time-from-the-bottom.md)).
 - Whether `yaml-edit` passes the round-trip suite. It is 0.x, so pin it.
 
 ### Values with no default yet
 
-- The Merge Step's timeout, which bounds its wait on a `BLOCKED` PR ([Task: consistency sweep before the PRD](https://github.com/jnsdls/slopwatch/issues/45)). The Step contract sets `timeout` and `stall_after` defaults only for agent, CI, Jev and Human Steps.
+- The Merge Step's timeout, which bounds its wait on a `BLOCKED` PR ([Task: consistency sweep before the PRD](https://github.com/jnsdls/slopwatch/issues/45)). The Step contract sets `timeout` and `stall_after` defaults only for agent, CI, Jev and Human Steps. [#75](https://github.com/jnsdls/slopwatch/issues/75) set it to 1 hour, with no stall watchdog.
 - The `jev` Plugin's per-Plugin cap. Parallax runs 4 in flight with 1 to 30 s backoff ([Research: Jev evaluate API for PR judging](https://github.com/jnsdls/slopwatch/issues/3)).
 - The co-author email in the `Co-authored-by: slopwatch` trailer, open until a slopwatch domain or App bot exists ([GitHub identity and push ownership](https://github.com/jnsdls/slopwatch/issues/15)).
 

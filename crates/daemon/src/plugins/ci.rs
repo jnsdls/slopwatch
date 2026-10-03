@@ -83,7 +83,7 @@ impl Ci {
             return;
         };
         rerun.failed = match result {
-            EffectResult::Done => None,
+            EffectResult::Done | EffectResult::Enqueued => None,
             EffectResult::Dropped { reason }
             | EffectResult::Refused { reason }
             | EffectResult::Failed { reason } => Some(reason.clone()),
