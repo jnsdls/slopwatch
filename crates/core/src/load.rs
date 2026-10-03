@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 
 use crate::error::LoadError;
 use crate::expr::{Context, Expr, RESERVED_IDS};
+use crate::library::{self, LibraryFile, is_library_step_name};
 use crate::pipeline::{
     BUILTIN_PLUGINS, FIX_ROUNDS_CEILING, FIX_ROUNDS_DEFAULT, Pipeline, Step, Uses, Workspace,
 };
@@ -53,19 +54,6 @@ struct StepEntry {
     needs: Vec<String>,
     #[serde(default)]
     when: Option<Value>,
-    #[serde(default)]
-    timeout: Option<String>,
-    #[serde(default)]
-    stall_after: Option<String>,
-}
-
-/// A Library Step file. `needs` and `when` belong only in the Pipeline.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LibraryFile {
-    uses: String,
-    #[serde(default)]
-    with: Map<String, Value>,
     #[serde(default)]
     timeout: Option<String>,
     #[serde(default)]
@@ -203,27 +191,22 @@ fn load_library_step(
     name: &str,
     resolver: &dyn Resolver,
 ) -> Result<LibraryFile, Vec<LoadError>> {
-    let invalid = |message: String| {
-        vec![LoadError::InvalidLibraryStep {
-            step: step.to_owned(),
-            name: name.to_owned(),
-            message,
-        }]
-    };
-    let Some(text) = resolver.library_step(name) else {
+    let text = is_library_step_name(name)
+        .then(|| resolver.library_step(name))
+        .flatten();
+    let Some(text) = text else {
         return Err(vec![LoadError::UnknownLibraryStep {
             step: step.to_owned(),
             name: name.to_owned(),
         }]);
     };
-    let library: LibraryFile = serde_saphyr::from_str(&text).map_err(|e| invalid(e.to_string()))?;
-    if library.uses.starts_with("lib/") {
-        return Err(invalid(format!(
-            "it uses `{}`, but a Library Step must use a Plugin",
-            library.uses
-        )));
-    }
-    Ok(library)
+    library::parse(&text).map_err(|message| {
+        vec![LoadError::InvalidLibraryStep {
+            step: step.to_owned(),
+            name: name.to_owned(),
+            message,
+        }]
+    })
 }
 
 fn duration(
@@ -233,19 +216,7 @@ fn duration(
     errors: &mut Vec<LoadError>,
 ) -> Option<Duration> {
     let value = value?;
-    let parsed = value
-        .find(|c: char| !c.is_ascii_digit())
-        .filter(|&split| split > 0)
-        .and_then(|split| {
-            let n: u64 = value[..split].parse().ok()?;
-            let unit = match &value[split..] {
-                "s" => 1,
-                "m" => 60,
-                "h" => 3600,
-                _ => return None,
-            };
-            Some(Duration::from_secs(n.checked_mul(unit)?))
-        });
+    let parsed = parse_duration(&value);
     if parsed.is_none() {
         errors.push(LoadError::InvalidDuration {
             step: step.to_owned(),
@@ -254,4 +225,19 @@ fn duration(
         });
     }
     parsed
+}
+
+/// A duration written as `90s`, `30m` or `2h`.
+pub(crate) fn parse_duration(value: &str) -> Option<Duration> {
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .filter(|&split| split > 0)?;
+    let n: u64 = value[..split].parse().ok()?;
+    let unit = match &value[split..] {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => return None,
+    };
+    Some(Duration::from_secs(n.checked_mul(unit)?))
 }

@@ -1,0 +1,12 @@
+# Shipped preset. Runs `claude -p` in a read-only worktree as a reviewer.
+# It reports Findings by severity and fails on any high one. Uses your own
+# Claude login unless `auth` names an API key Secret.
+uses: claude
+with:
+  model: opus
+  auth: subscription
+  fail_on: high
+  prompt: >-
+    Review this pull request. Report each problem you find as a Finding with
+    a severity (high, medium or low), and a file and line where one applies.
+    High means the change is wrong or unsafe to merge.

@@ -9,6 +9,7 @@
 mod edit;
 mod error;
 mod expr;
+mod library;
 mod load;
 mod pipeline;
 mod reuse;
@@ -19,6 +20,7 @@ mod verdict;
 pub use edit::{Edit, EditError, apply_edits};
 pub use error::{LoadError, Referrer};
 pub use expr::{Expr, Fact, Glob, StepTerm};
+pub use library::{PRESETS, Preset, check_library_step, is_library_step_name};
 pub use load::{PluginInfo, Resolver, load};
 pub use pipeline::{
     BUILTIN_PLUGINS, FIX_ROUNDS_CEILING, FIX_ROUNDS_DEFAULT, GATE, Pipeline, Step, Uses, Workspace,

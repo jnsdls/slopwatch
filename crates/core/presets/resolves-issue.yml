@@ -1,0 +1,10 @@
+# Shipped preset. Asks Jev whether the PR does what its linked issue asks.
+# The Step is skipped when the PR links no issue, so put it in the Gate as
+# `[pass, skipped]`. Needs the AI_GATEWAY_API_KEY Secret.
+uses: jev
+with:
+  requires: linked_issue
+  questions:
+    - id: resolves-issue
+      question: Does the diff do what the linked issue asks for?
+      pass_when: true
