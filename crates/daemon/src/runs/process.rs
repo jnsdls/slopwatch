@@ -585,30 +585,32 @@ mod tests {
     #[tokio::test]
     async fn stderr_and_log_messages_go_to_the_step_log() {
         let dir = tempfile::tempdir().unwrap();
-        let script = r#"echo to stderr >&2; sleep 0.2; echo '{"type":"log","message":"logged","level":"warn"}'; printf 'no newline' >&2"#;
+        let script = r#"echo to stderr >&2; echo '{"type":"log","message":"logged","level":"warn"}'; printf 'no newline' >&2"#;
         let (_handle, mut reports) = reports(sh(script, &dir)).await;
 
         assert!(matches!(
             reports.recv().await,
             Some(Report::Exited(Some(0)))
         ));
+        // Stdout and stderr are separate pipes, so only each one's own
+        // order holds.
         let records = step_log(&dir).records;
-        let lines: Vec<_> = records
-            .iter()
-            .map(|record| (record.source, record.level, record.text.as_str()))
-            .collect();
+        let from = |source| {
+            records
+                .iter()
+                .filter(|record| record.source == source)
+                .map(|record| (record.level, record.text.as_str()))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            lines,
-            [
-                (LogSource::Stderr, None, "to stderr"),
-                (
-                    LogSource::Log,
-                    Some(slopwatch_protocol::LogLevel::Warn),
-                    "logged"
-                ),
-                (LogSource::Stderr, None, "no newline"),
-            ]
+            from(LogSource::Stderr),
+            [(None, "to stderr"), (None, "no newline")]
         );
+        assert_eq!(
+            from(LogSource::Log),
+            [(Some(slopwatch_protocol::LogLevel::Warn), "logged")]
+        );
+        assert_eq!(records.len(), 3, "{records:?}");
     }
 
     #[tokio::test]
