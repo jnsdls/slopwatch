@@ -26,7 +26,7 @@ use serde_json::Value;
 use slopwatch_core::Workspace;
 use slopwatch_protocol::step::{Manifest, PR_DIFF, STEP_DIALECT, SecretSpec, Start, Usage};
 
-use super::review::{self, Agent, Auth, Config, Event, Finished};
+use super::review::{self, Agent, Auth, Config, Event, Finished, Job};
 
 /// The Secret an `auth: api_key` Step runs on. Codex reads it as
 /// `CODEX_API_KEY`.
@@ -72,7 +72,11 @@ impl Agent for Codex {
             "--ephemeral",
             "--skip-git-repo-check",
             "--sandbox",
-            "read-only",
+            match config.job {
+                Job::Review => "read-only",
+                // A fixer edits the worktree, and nothing outside it.
+                Job::Fix => "workspace-write",
+            },
             "--color",
             "never",
         ]);
@@ -214,6 +218,8 @@ mod tests {
             config: with.as_object().unwrap().clone(),
             snapshot: review::tests::snapshot(),
             upstream: BTreeMap::new(),
+            gate_failing: vec![],
+            ci_logs: vec![],
             budget_usd: None,
         };
         (config, start)

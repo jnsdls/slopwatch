@@ -43,6 +43,7 @@
 //! processes take turns. Reading a Pipeline from git happens outside it.
 
 mod budgets;
+mod commit;
 mod effects;
 pub(crate) mod journal;
 pub mod log;
@@ -54,17 +55,17 @@ mod stacks;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use slopwatch_core::{
-    Decision, EndReason, GATE, GateState, Pipeline, PrFacts, RunState, Step, StepState, Verdict,
-    Workspace, load, parse_duration,
+    Decision, EndReason, GATE, GateState, Pipeline, PrFacts, RunState, SkipReason, Step, StepState,
+    Verdict, Workspace, load, parse_duration,
 };
 use slopwatch_protocol::step::{
-    CONFIG_DIR_ENV, EffectKind, FromStep, LinkedIssue, MERGE_STATE, Manifest, MergeState, Outcome,
-    Outputs, PR_DIFF, PrSnapshot, Start, ToStep,
+    CI_LOGS, CONFIG_DIR_ENV, CheckState, CiLog, EffectKind, FromStep, LinkedIssue, MERGE_STATE,
+    Manifest, MergeState, Outcome, Outputs, PR_DIFF, PrSnapshot, Start, ToStep,
 };
 use slopwatch_protocol::{
     Actor, Answer, BudgetHit, BudgetKind, Cause, Cents, Closing, DaemonSettings, EntryId, GateTerm,
@@ -83,7 +84,7 @@ use crate::plugins::{NotApprovable, Plugins, human};
 use crate::secrets::{Keychain, Mask, SecretError, Secrets, held_by_secret, missing_secret};
 use crate::shell_env;
 use crate::store::{
-    ActiveRun, NewRun, NewStep, StackLinkRow, StepRow, StepRowState, Store, StoreError,
+    ActiveRun, NewRun, NewStep, StackLinkRow, StepRow, StepRowState, Store, StoreError, Streak,
 };
 use crate::watching::{RunInfo, Watching};
 
@@ -137,6 +138,9 @@ pub struct Runs {
     plugins: Arc<Plugins>,
     /// The Secrets each built-in Plugin runs without, by Plugin.
     optional_secrets: HashMap<String, HashSet<String>>,
+    /// Runs with a commit call out in this daemon, which settles its own
+    /// intent ([`commit`]).
+    committing: Arc<Mutex<HashSet<RunId>>>,
 }
 
 /// Where Runs keep their files, and for how long.
@@ -249,9 +253,11 @@ impl Runs {
             tokio::task::spawn_blocking(move || secrets.warm());
         }
         let settings = store.daemon_settings()?;
+        let committing = Arc::new(Mutex::new(HashSet::new()));
         let mut engine = Engine {
             settings,
             budget_held: HashMap::new(),
+            committing: Arc::clone(&committing),
             clones: Arc::clone(&clones),
             secrets: Arc::clone(&secrets),
             inbox: Arc::clone(&inbox),
@@ -299,6 +305,7 @@ impl Runs {
             secrets,
             plugins,
             optional_secrets,
+            committing,
         });
         let driver = Arc::clone(&runs);
         tokio::spawn(async move {
@@ -309,6 +316,8 @@ impl Runs {
                     Input::Effect(finished) => engine.on_effect_finished(finished),
                     Input::Stack(finished) => engine.on_stack_update(finished),
                     Input::Prepared(prepared) => engine.on_prepared(prepared),
+                    Input::Collected(collected) => engine.on_collected(collected),
+                    Input::Committed(done) => engine.on_committed(done),
                 }
                 engine.schedule();
                 driver
@@ -326,6 +335,8 @@ impl Runs {
         // A Plugin dropped in or rebuilt since the last sync, before any
         // Pipeline loads.
         self.plugins.scan().await;
+        // A commit a crash left open decides whether a moved head is ours.
+        self.settle_open_commits().await;
         let wanted = {
             let engine = self.engine.lock().await;
             if !engine.watching.fresh() {
@@ -874,6 +885,8 @@ impl Runs {
 
 struct Engine {
     store: Store,
+    /// Runs with a commit call out, shared with [`Runs`].
+    committing: Arc<Mutex<HashSet<RunId>>>,
     /// Makes Steps' worktrees.
     clones: Arc<Clones>,
     secrets: Arc<Secrets>,
@@ -1035,9 +1048,23 @@ struct Active {
     /// The Budget the Run ran out of. Nothing more starts, and it ends
     /// over budget once its running Steps settle.
     over_budget: Option<BudgetHit>,
+    /// The Fix round streak the Run continues. Its round count is in
+    /// `state.fix_round`.
+    streak: Streak,
+    /// Write Steps that reported `pass`, on their way to a commit.
+    writes: HashMap<String, commit::Write>,
+    /// The CI log tails fetched for a Step's next attempt, by Step.
+    ci_logs: HashMap<String, Vec<CiLog>>,
 }
 
 impl Active {
+    /// Whether a commit call for one of the Run's write Steps is out.
+    fn commit_out(&self) -> bool {
+        self.writes
+            .values()
+            .any(|write| matches!(write.stage, commit::Stage::Committing))
+    }
+
     /// The merge state read this Run would take now.
     fn merge_read(&self) -> MergeRead {
         MergeRead {
@@ -1158,6 +1185,8 @@ enum Input {
     Effect(effects::Finished),
     Stack(stacks::Finished),
     Prepared(Prepared),
+    Collected(commit::Collected),
+    Committed(commit::Done),
 }
 
 /// A Step attempt's worktree, made or not.
@@ -1165,8 +1194,9 @@ struct Prepared {
     run: RunId,
     step: String,
     attempt: u32,
-    /// Why the worktree couldn't be made.
-    result: Result<(), String>,
+    /// The CI log tails the Step gets, or why the worktree couldn't be
+    /// made.
+    result: Result<Vec<CiLog>, String>,
 }
 
 /// The git work that gives a Step whose manifest declares a `read` or
@@ -1178,10 +1208,13 @@ struct Preparation {
     head_sha: String,
     /// The Step attempt's working directory, which becomes the worktree.
     dir: PathBuf,
+    /// The failed GitHub Actions jobs whose log tails the Step asks for
+    /// ([`CI_LOGS`]), as `(check, job)`.
+    ci_jobs: Vec<(String, u64)>,
 }
 
 impl Preparation {
-    async fn run(self, clones: &Clones, github: &dyn GitHub) -> Result<(), String> {
+    async fn run(self, clones: &Clones, github: &dyn GitHub) -> Result<Vec<CiLog>, String> {
         let remote = github
             .git_remote(&self.repo)
             .await
@@ -1189,8 +1222,41 @@ impl Preparation {
         clones
             .add_worktree(&self.repo, &remote, self.number, &self.head_sha, &self.dir)
             .await
-            .map_err(|error| format!("can't check out the PR's head: {error}"))
+            .map_err(|error| format!("can't check out the PR's head: {error}"))?;
+        let mut logs = Vec::new();
+        for (check, job) in self.ci_jobs {
+            // A log that can't be read says so in its place, and the Step
+            // goes on with the rest.
+            let tail = match github.job_log(&self.repo, job).await {
+                Ok(log) => log_tail(&log),
+                Err(error) => format!("(slopwatch couldn't read this job's log: {error})"),
+            };
+            logs.push(CiLog { check, job, tail });
+        }
+        Ok(logs)
     }
+}
+
+/// The most lines of a CI log's end a Step gets.
+const CI_LOG_LINES: usize = 200;
+/// The most bytes of a CI log's end a Step gets.
+const CI_LOG_BYTES: usize = 32 * 1024;
+
+/// The last [`CI_LOG_LINES`] lines of `log`, at most [`CI_LOG_BYTES`] of
+/// them, cut at a line.
+fn log_tail(log: &str) -> String {
+    let lines: Vec<&str> = log.lines().collect();
+    let mut tail = Vec::new();
+    let mut bytes = 0;
+    for line in lines.iter().rev().take(CI_LOG_LINES) {
+        bytes += line.len() + 1;
+        if bytes > CI_LOG_BYTES {
+            break;
+        }
+        tail.push(*line);
+    }
+    tail.reverse();
+    tail.join("\n")
 }
 
 struct StepReport {
@@ -1272,7 +1338,17 @@ impl Engine {
                 budget_window: stored.budget_window,
                 lifted: stored.lifted,
                 over_budget: None,
+                streak: Streak::default(),
+                writes: HashMap::new(),
+                ci_logs: HashMap::new(),
             };
+            active.streak = self.store.fix_streak(
+                &active.repo,
+                active.number,
+                &active.head_sha,
+                Some(active.id),
+            )?;
+            active.state.fix_round = active.streak.rounds;
             active.state.waived =
                 self.store
                     .waived_steps(&active.repo, active.number, &active.head_sha)?;
@@ -1468,6 +1544,14 @@ impl Engine {
                     None => Some(EndReason::Closed),
                 },
                 Some((_, pr)) if !pr.labeled => Some(EndReason::Cancelled),
+                // A commit of the Run's own may be what moved the head. It
+                // ends the Run once settled.
+                Some((_, pr))
+                    if pr.head_sha != run.head_sha
+                        && (run.commit_out() || self.store.committing(run.id)?) =>
+                {
+                    continue;
+                }
                 Some((repo, pr)) if pr.head_sha != run.head_sha => {
                     // A rebase doesn't say what head it made, so whatever
                     // head follows one is its push (ADR 0004).
@@ -1724,6 +1808,7 @@ impl Engine {
         self.budget_held.remove(&key);
         let lifted = self.lifts(repo, pr.number)?;
 
+        let streak = self.store.fix_streak(repo, pr.number, &pr.head_sha, None)?;
         let steps: Vec<_> = pipeline.ordered_steps().collect();
         let id = self.store.insert_run(
             &NewRun {
@@ -1783,6 +1868,7 @@ impl Engine {
                 pr_base: Some(pr.base.clone()),
                 state: RunState {
                     pr: facts(&snapshot, &files),
+                    fix_round: streak.rounds,
                     ..RunState::default()
                 },
                 pipeline,
@@ -1802,6 +1888,9 @@ impl Engine {
                 budget_window: window.unwrap_or(id),
                 lifted,
                 over_budget: None,
+                streak,
+                writes: HashMap::new(),
+                ci_logs: HashMap::new(),
             },
         );
         for (step, waiver) in self.store.waivers(repo, pr.number, &pr.head_sha)? {
@@ -2103,12 +2192,27 @@ impl Engine {
         let attempt = run.attempts.get(step_id).copied().unwrap_or(0) + 1;
         run.preparing.insert(step_id.to_owned(), attempt);
         self.processes
-            .insert((run.id, step_id.to_owned(), attempt), plugin);
+            .insert((run.id, step_id.to_owned(), attempt), plugin.clone());
+        let wants_logs = self
+            .plugins
+            .manifest(&plugin)
+            .is_some_and(|manifest| manifest.features.iter().any(|feature| feature == CI_LOGS));
+        let ci_jobs = match (&run.snapshot, wants_logs) {
+            (Some(snapshot), true) => snapshot
+                .checks
+                .runs
+                .iter()
+                .filter(|check| check.state == CheckState::Failure)
+                .filter_map(|check| Some((check.name.clone(), check.actions_job?)))
+                .collect(),
+            _ => Vec::new(),
+        };
         let preparation = Preparation {
             repo: run.repo.clone(),
             number: run.number,
             head_sha: run.head_sha.clone(),
             dir: step_dir(&self.data_dir, run.id, step_id, attempt),
+            ci_jobs,
         };
         let (clones, github) = (Arc::clone(&self.clones), Arc::clone(&self.github));
         let reports = self.reports.clone();
@@ -2174,7 +2278,11 @@ impl Engine {
             return Ok(());
         };
         match result {
-            Ok(()) => self.start_step(&key, &step, Some(attempt))?,
+            Ok(logs) => {
+                let active = self.active.get_mut(&key).expect("found above");
+                active.ci_logs.insert(step.clone(), logs);
+                self.start_step(&key, &step, Some(attempt))?;
+            }
             Err(error) => self.settle(
                 &key,
                 &step,
@@ -2290,6 +2398,12 @@ impl Engine {
                 .into_iter()
                 .filter_map(|id| Some((id.clone(), run.outcomes.get(&id)?.clone())))
                 .collect(),
+            gate_failing: if step.needs_gate() {
+                run.pipeline.failing_waivable_steps(&run.state)
+            } else {
+                Vec::new()
+            },
+            ci_logs: run.ci_logs.remove(step_id).unwrap_or_default(),
             budget_usd,
         });
         let path = self.plugins.path(&step.plugin, &self.step_path);
@@ -2400,6 +2514,11 @@ impl Engine {
             .pipeline
             .step(step_id)
             .expect("the plan names Pipeline Steps");
+        // A write Step's work is the changes it leaves, which its Outcome
+        // doesn't hold.
+        if step.is_write() {
+            return Ok(false);
+        }
         let Some(version) = self.plugins.version(&step.plugin) else {
             return Ok(false);
         };
@@ -2480,6 +2599,7 @@ impl Engine {
             Some(reason) => run.reasons.insert(step.to_owned(), reason.clone()),
             None => run.reasons.remove(step),
         };
+        run.writes.remove(step);
         let mut closing = Closing::StepSettled;
         if let Some(running) = run.running.get_mut(step) {
             running.reported = true;
@@ -2526,8 +2646,11 @@ impl Engine {
         if matches!(report.report, Report::Exited(_)) {
             self.processes
                 .remove(&(report.run, report.step.clone(), report.attempt));
-            let dir = step_dir(&self.data_dir, report.run, &report.step, report.attempt);
-            let _ = std::fs::remove_dir_all(dir);
+            // A write Step's worktree stays until its changes are read.
+            if !self.collect_on_exit(report.run, &report.step, report.attempt) {
+                let dir = step_dir(&self.data_dir, report.run, &report.step, report.attempt);
+                let _ = std::fs::remove_dir_all(dir);
+            }
         }
         let Some(key) = self.key_of(report.run) else {
             // The Run already ended.
@@ -2543,6 +2666,17 @@ impl Engine {
         let reported = running.reported;
         let step = report.step;
         match report.report {
+            Report::Message(FromStep::Outcome(outcome))
+                if !reported
+                    && outcome.verdict == Verdict::Pass
+                    && self.active[&key]
+                        .pipeline
+                        .step(&step)
+                        .is_some_and(Step::is_write) =>
+            {
+                self.hold_write(&key, &step, outcome);
+                return Ok(());
+            }
             Report::Message(FromStep::Outcome(outcome)) if !reported => {
                 if matches!(
                     outcome.verdict,
@@ -2738,13 +2872,20 @@ impl Engine {
     /// afterwards.
     fn end_run(&mut self, mut run: Active, reason: EndReason) -> Result<(), StoreError> {
         self.ready.retain(|(id, _)| *id != run.id);
-        let still_running: Vec<String> = run
+        let mut still_running: Vec<String> = run
             .running
             .iter()
             .filter(|(_, running)| !running.reported)
             .map(|(step, _)| step.clone())
             .chain(run.interrupted.keys().cloned())
             .collect();
+        // A write Step whose changes weren't committed, as when another's
+        // commit ended the Run, has them thrown away.
+        for step in run.writes.keys() {
+            if !still_running.contains(step) {
+                still_running.push(step.clone());
+            }
+        }
         for running in run.running.values() {
             running.handle.cancel();
         }
@@ -2796,9 +2937,10 @@ impl Engine {
         // Nor does one whose every failure a shared cause's entry explains,
         // or one their rejection ended.
         if reason == EndReason::NotShippable {
-            let raised = match couldnt_merge(&run) {
-                Some(reasons) => Some((COULDNT_MERGE, reasons)),
-                None => not_shippable(&run).map(|reasons| (NOT_SHIPPABLE, reasons)),
+            let raised = match (couldnt_merge(&run), fix_stopped(&run)) {
+                (Some(reasons), _) => Some((COULDNT_MERGE, reasons)),
+                (None, Some(reasons)) => Some((FIX_STOPPED, reasons)),
+                (None, None) => not_shippable(&run).map(|reasons| (NOT_SHIPPABLE, reasons)),
             };
             if let Some((title, reasons)) = raised {
                 self.inbox
@@ -3398,6 +3540,45 @@ fn couldnt_merge(run: &Active) -> Option<Vec<String>> {
     (!reasons.is_empty()).then_some(reasons)
 }
 
+/// The title of the PR entry a Run raises when the Fix loop stopped.
+const FIX_STOPPED: &str = "Fix stopped";
+
+/// Why the Fix loop stopped in a Run whose Gate failed: a write Step
+/// skipped on the round cap, or one whose changes were empty or would
+/// repeat a tree (ADR 0008). One line per write Step that stopped, then
+/// what [`not_shippable`] lists. `None` when no write Step stopped it.
+fn fix_stopped(run: &Active) -> Option<Vec<String>> {
+    let mut reasons: Vec<String> = run
+        .pipeline
+        .ordered_steps()
+        .filter(|step| step.is_write())
+        .filter_map(|step| {
+            let reason = run.reasons.get(&step.id)?;
+            let line = if reason == &SkipReason::RoundCap.to_string() {
+                format!(
+                    "`{}`: round cap: {} Fix rounds in a row didn't get the Gate to pass \
+                     (`fix_rounds` is {})",
+                    step.id,
+                    run.state.fix_round,
+                    run.pipeline.fix_rounds()
+                )
+            } else if reason.starts_with(commit::NOTHING_ACTIONABLE)
+                || reason.starts_with(commit::LOOP_DETECTED)
+            {
+                format!("`{}`: {reason}", step.id)
+            } else {
+                return None;
+            };
+            Some(line)
+        })
+        .collect();
+    if reasons.is_empty() {
+        return None;
+    }
+    reasons.extend(not_shippable(run).unwrap_or_default());
+    Some(reasons)
+}
+
 fn pr_ref(repo: &RepoName, number: u64) -> PrRef {
     PrRef {
         repo: repo.clone(),
@@ -3476,7 +3657,8 @@ fn duration(span: Duration) -> String {
     }
 }
 
-/// Every Step upstream of `step`, nearest first.
+/// Every Step upstream of `step`, nearest first. A Step that needs the
+/// Gate reads every Step the Gate reads, and what those need.
 fn upstream(pipeline: &Pipeline, step: &str) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     let mut next = vec![step.to_owned()];
@@ -3484,10 +3666,21 @@ fn upstream(pipeline: &Pipeline, step: &str) -> Vec<String> {
         let Some(step) = pipeline.step(&id) else {
             continue;
         };
-        for need in &step.needs {
-            if pipeline.step(need).is_some() && !found.contains(need) {
+        let reads = step.needs.iter().flat_map(|need| {
+            if need == GATE {
+                pipeline
+                    .ordered_steps()
+                    .filter(|step| pipeline.gate_reads(&step.id))
+                    .map(|step| step.id.clone())
+                    .collect()
+            } else {
+                vec![need.clone()]
+            }
+        });
+        for need in reads.collect::<Vec<_>>() {
+            if pipeline.step(&need).is_some() && !found.contains(&need) {
                 found.push(need.clone());
-                next.push(need.clone());
+                next.push(need);
             }
         }
     }

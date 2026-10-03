@@ -36,8 +36,8 @@ use crate::plugins_view::PluginsView;
 use crate::prs::{Prs, Row as PrRow, Source, poll_line, status_line, storage_line};
 use crate::run_graph_view::{run_graph, tone_color};
 use crate::run_pane::{
-    GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, end_label, finding_line,
-    gate_tone, run_label, run_tone, step_line, step_tone, waiver_line,
+    GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, commit_line, end_label,
+    finding_line, gate_tone, run_label, run_tone, step_line, step_tone, waiver_line,
 };
 use crate::secrets::missing_secret;
 use crate::secrets_view::SecretsView;
@@ -1410,6 +1410,12 @@ impl MainView {
                     }),
             )
             .children(waiver_line(step).map(|line| {
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(line)
+            }))
+            .children(commit_line(view, step).map(|line| {
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)

@@ -148,8 +148,17 @@ pub struct Start {
     /// The Step's resolved `with:`.
     pub config: Map<String, Value>,
     pub snapshot: PrSnapshot,
-    /// The Outcomes of every Step upstream of this one, by Step id.
+    /// The Outcomes of every Step upstream of this one, by Step id. For a
+    /// Step that needs the Gate, that includes every Step the Gate reads.
     pub upstream: BTreeMap<String, Outcome>,
+    /// For a Step that needs the Gate: the Steps behind the Gate's failing
+    /// terms that no Waiver covers, which a fixer acts on. Empty otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_failing: Vec<String>,
+    /// The log tails of the head commit's failed GitHub Actions jobs, for a
+    /// Step whose manifest lists [`CI_LOGS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ci_logs: Vec<CiLog>,
     /// The most the Step may spend, in list-price USD: the tightest of its
     /// own Budget and what's left of the PR's and the day's. A Step that
     /// can cap its own spend, as `claude --max-budget-usd` does, should.
@@ -443,6 +452,20 @@ pub const MERGE_STATE: &str = "merge_state";
 /// The manifest feature that asks for [`PrSnapshot::diff`].
 pub const PR_DIFF: &str = "pr_diff";
 
+/// The manifest feature that asks for [`Start::ci_logs`].
+pub const CI_LOGS: &str = "ci_logs";
+
+/// The end of a failed GitHub Actions job's log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiLog {
+    /// The check's name, as [`Check::name`] has it.
+    pub check: String,
+    /// The Actions job.
+    pub job: u64,
+    /// The log's last lines.
+    pub tail: String,
+}
+
 /// The env var a Step gets the config directory the developer set for its
 /// Plugin in, when they set one. The Plugin hands it to the CLI it runs.
 pub const CONFIG_DIR_ENV: &str = "SLOPWATCH_CONFIG_DIR";
@@ -583,6 +606,8 @@ mod tests {
                 stacked_on: None,
             },
             upstream: BTreeMap::new(),
+            gate_failing: vec![],
+            ci_logs: vec![],
             budget_usd: None,
         });
 
@@ -590,6 +615,7 @@ mod tests {
 
         assert_eq!(wire["type"], "start");
         assert!(wire.get("budget_usd").is_none(), "no budget, no key");
+        assert!(wire.get("gate_failing").is_none() && wire.get("ci_logs").is_none());
         assert_eq!(wire["run"], 4);
         assert_eq!(wire["snapshot"]["head_sha"], "abc");
         assert_eq!(wire["snapshot"]["checks"]["state"], "none");

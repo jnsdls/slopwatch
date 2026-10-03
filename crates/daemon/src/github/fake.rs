@@ -20,7 +20,7 @@ use slopwatch_protocol::step::{
 
 use super::{
     Branch, GitHub, GitHubError, GitRemote, Merged, NewCommit, NewPr, OpenPr, PIPELINE_PATH,
-    ParentPr, Poll, PrDetail, PrFate, PrLink, RateLimit, RepoPoll, StackLink, WATCH_LABEL,
+    ParentPr, Poll, PrDetail, PrFate, PrHead, PrLink, RateLimit, RepoPoll, StackLink, WATCH_LABEL,
 };
 
 /// The Pipeline [`FakeGitHub::add_pipeline`] commits: one CI Step and a
@@ -58,6 +58,15 @@ struct State {
     hold_updates: bool,
     /// Every commit made through the API, as `(branch, sha)`, in order.
     api_commits: Vec<(String, String)>,
+    /// The message of every commit made through the API, in order.
+    api_messages: Vec<String>,
+    /// What each Actions job's log says, by job id.
+    job_logs: BTreeMap<u64, String>,
+    /// Where commit calls stop and never return, while set.
+    hold_commits: Option<Hold>,
+    /// A push from outside that lands on the branch just before the next
+    /// commit call, as `(repo, PR)`.
+    push_before_commit: Option<(RepoName, u64)>,
 }
 
 /// Where a comment call stops and never returns, the way a daemon killed
@@ -128,6 +137,10 @@ impl FakeGitHub {
                 retargets: Vec::new(),
                 hold_updates: false,
                 api_commits: Vec::new(),
+                api_messages: Vec::new(),
+                job_logs: BTreeMap::new(),
+                hold_commits: None,
+                push_before_commit: None,
             }),
             origins: tempfile::tempdir().expect("create a directory for the fake's git repos"),
         }
@@ -166,7 +179,12 @@ impl FakeGitHub {
             // GitHub serves partial clones, and a local repo only does when
             // asked to.
             run_git(&git, &["config", "uploadpack.allowFilter", "true"]);
-            state.commit(&git, "main", None, &[("README.md", Some("A repo.\n"))]);
+            state.commit(
+                &git,
+                "main",
+                None,
+                &[("README.md", Some(b"A repo.\n".as_slice()))],
+            );
             state.repos.insert(
                 name.clone(),
                 Repo {
@@ -231,7 +249,7 @@ impl FakeGitHub {
                 &git,
                 &head_branch(number),
                 Some(base),
-                &[(&file, Some("A change.\n"))],
+                &[(&file, Some(b"A change.\n".as_slice()))],
             );
             pull_ref(&git, number, &head_sha);
             state.repo(repo).prs.insert(
@@ -312,7 +330,12 @@ impl FakeGitHub {
     pub fn push_file(&self, repo: &RepoName, number: u64, path: &str, text: &str) -> String {
         self.with(|state| {
             let git = state.repo(repo).git.clone();
-            let sha = state.commit(&git, &head_branch(number), None, &[(path, Some(text))]);
+            let sha = state.commit(
+                &git,
+                &head_branch(number),
+                None,
+                &[(path, Some(text.as_bytes()))],
+            );
             pull_ref(&git, number, &sha);
             let pr = state.pr(repo, number);
             pr.head_sha = sha.clone();
@@ -374,7 +397,12 @@ impl FakeGitHub {
     pub fn set_pipeline(&self, repo: &RepoName, branch: &str, text: &str) -> String {
         self.with(|state| {
             let git = state.repo(repo).git.clone();
-            state.commit(&git, branch, None, &[(PIPELINE_PATH, Some(text))])
+            state.commit(
+                &git,
+                branch,
+                None,
+                &[(PIPELINE_PATH, Some(text.as_bytes()))],
+            )
         })
     }
 
@@ -452,7 +480,7 @@ impl FakeGitHub {
     pub fn commit_to(&self, repo: &RepoName, branch: &str, path: &str, text: &str) -> String {
         self.with(|state| {
             let git = state.repo(repo).git.clone();
-            state.commit(&git, branch, None, &[(path, Some(text))])
+            state.commit(&git, branch, None, &[(path, Some(text.as_bytes()))])
         })
     }
 
@@ -491,6 +519,51 @@ impl FakeGitHub {
     /// Every commit made through the API so far, as `(branch, sha)`.
     pub fn api_commits(&self) -> Vec<(String, String)> {
         self.with(|state| state.api_commits.clone())
+    }
+
+    /// The message of every commit made through the API so far.
+    pub fn api_messages(&self) -> Vec<String> {
+        self.with(|state| state.api_messages.clone())
+    }
+
+    /// Sets what Actions job `job`'s log says.
+    pub fn set_job_log(&self, job: u64, log: &str) {
+        self.with(|state| state.job_logs.insert(job, log.to_owned()));
+    }
+
+    /// Makes commit calls stop at `hold` and never return, or lets them
+    /// through again with `None`.
+    pub fn hold_commits(&self, hold: Option<Hold>) {
+        self.with(|state| state.hold_commits = hold);
+    }
+
+    /// Has someone else push to PR `number` just before the next commit
+    /// call reaches the branch.
+    pub fn push_before_next_commit(&self, repo: &RepoName, number: u64) {
+        self.with(|state| state.push_before_commit = Some((repo.clone(), number)));
+    }
+
+    /// The files at the tip of PR `number`'s head, as `(mode, path,
+    /// contents)`.
+    pub fn head_files(&self, repo: &RepoName, number: u64) -> Vec<(String, String, String)> {
+        self.with(|state| {
+            let git = state.repo(repo).git.clone();
+            let head = state.pr(repo, number).head_sha.clone();
+            run_git(&git, &["ls-tree", "-r", &head])
+                .lines()
+                .map(|line| {
+                    let (meta, path) = line.split_once('\t').expect("ls-tree lines have a tab");
+                    let mut meta = meta.split_whitespace();
+                    let mode = meta.next().unwrap_or_default().to_owned();
+                    let blob = meta.nth(1).unwrap_or_default();
+                    (
+                        mode,
+                        path.to_owned(),
+                        git_raw(&git, &["cat-file", "blob", blob]),
+                    )
+                })
+                .collect()
+        })
     }
 
     /// Every PR from `branch`, open or not, by number.
@@ -678,7 +751,7 @@ impl State {
         git: &Path,
         branch: &str,
         from: Option<&str>,
-        files: &[(&str, Option<&str>)],
+        files: &[(&str, Option<&[u8]>)],
     ) -> String {
         self.commits += 1;
         let index = git.join(format!("fake-index-{}", self.commits));
@@ -690,7 +763,7 @@ impl State {
         for (path, text) in files {
             match text {
                 Some(text) => {
-                    let blob = git_with(git, &["hash-object", "-w", "--stdin"], &[], Some(text));
+                    let blob = git_bytes(git, &["hash-object", "-w", "--stdin"], text);
                     let entry = format!("100644,{blob},{path}");
                     git_with(
                         git,
@@ -699,12 +772,15 @@ impl State {
                         None,
                     );
                 }
+                // Mode 0 drops the entry, which a bare repo allows where
+                // `--force-remove` wants a work tree.
                 None => {
+                    let entry = format!("0 {}\t{path}\n", "0".repeat(40));
                     git_with(
                         git,
-                        &["update-index", "--force-remove", path],
+                        &["update-index", "--index-info"],
                         &index_env,
-                        None,
+                        Some(&entry),
                     );
                 }
             }
@@ -780,6 +856,23 @@ fn git_with(git: &Path, args: &[&str], env: &[(&str, &str)], stdin: Option<&str>
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// Runs git in `git` with `stdin` as its input and returns its trimmed
+/// stdout, panicking on failure.
+fn git_bytes(git: &Path, args: &[&str], stdin: &[u8]) -> String {
+    use std::io::Write as _;
+    let mut child = git_command(git, &[])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "git {args:?} failed");
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
@@ -1213,26 +1306,76 @@ impl GitHub for FakeGitHub {
         repo: &RepoName,
         commit: &NewCommit<'_>,
     ) -> Result<String, GitHubError> {
-        self.with(|state| {
+        let hold = self.with(|state| {
+            if let Some((repo, number)) = state.push_before_commit.take() {
+                let git = state.repo(&repo).git.clone();
+                let path = format!("outside-{number}.txt");
+                let text = format!("Pushed from outside at {}.\n", state.commits);
+                let sha = state.commit(
+                    &git,
+                    &head_branch(number),
+                    None,
+                    &[(&path, Some(text.as_bytes()))],
+                );
+                pull_ref(&git, number, &sha);
+                let pr = state.pr(&repo, number);
+                pr.head_sha = sha;
+                pr.checks = Checks::default();
+            }
+            state.hold_commits
+        });
+        if hold == Some(Hold::BeforePosting) {
+            std::future::pending::<()>().await;
+        }
+        let made = self.with(|state| {
             let git = state.repo(repo).git.clone();
             let head = tip(&git, commit.branch);
             if head.as_deref() != Some(commit.expected_head) {
-                return Err(GitHubError::Other(format!(
+                return Err(GitHubError::Stale(format!(
                     "Expected branch to point to \"{}\" but it did not",
                     commit.expected_head
                 )));
             }
-            let files: Vec<(&str, Option<&str>)> = commit
+            let mut files: Vec<(&str, Option<&[u8]>)> = commit
                 .files
                 .iter()
-                .map(|(path, text)| (*path, Some(*text)))
+                .map(|(path, contents)| (*path, Some(*contents)))
                 .collect();
+            files.extend(commit.deletions.iter().map(|path| (*path, None)));
             let sha = state.commit(&git, commit.branch, None, &files);
             state.follow_branch(repo, commit.branch, &sha);
             state
                 .api_commits
                 .push((commit.branch.to_owned(), sha.clone()));
+            state
+                .api_messages
+                .push(format!("{}\n\n{}", commit.headline, commit.body));
             Ok(sha)
+        });
+        if made.is_ok() && hold == Some(Hold::AfterPosting) {
+            std::future::pending::<()>().await;
+        }
+        made
+    }
+
+    async fn pr_head(&self, repo: &RepoName, number: u64) -> Result<PrHead, GitHubError> {
+        self.with(|state| {
+            let pr = state.pr(repo, number);
+            Ok(PrHead {
+                repo: repo.clone(),
+                branch: pr.head.clone(),
+                sha: pr.head_sha.clone(),
+            })
+        })
+    }
+
+    async fn job_log(&self, _repo: &RepoName, job: u64) -> Result<String, GitHubError> {
+        self.with(|state| {
+            state
+                .job_logs
+                .get(&job)
+                .cloned()
+                .ok_or_else(|| GitHubError::NotFound(format!("job {job}")))
         })
     }
 }

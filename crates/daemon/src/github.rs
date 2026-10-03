@@ -134,6 +134,22 @@ pub trait GitHub: Send + Sync {
         repo: &RepoName,
         commit: &NewCommit<'_>,
     ) -> Result<String, GitHubError>;
+
+    /// Where PR `number`'s head lives: the repo and branch a commit to the
+    /// PR goes to, and the commit at its tip.
+    async fn pr_head(&self, repo: &RepoName, number: u64) -> Result<PrHead, GitHubError>;
+
+    /// The log of GitHub Actions job `job`, whole.
+    async fn job_log(&self, repo: &RepoName, job: u64) -> Result<String, GitHubError>;
+}
+
+/// A PR's head branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrHead {
+    /// The repo the branch is in: the PR's own, or a fork's.
+    pub repo: RepoName,
+    pub branch: String,
+    pub sha: String,
 }
 
 /// An open PR, as publishing finds or opens it.
@@ -160,8 +176,10 @@ pub struct NewCommit<'a> {
     pub expected_head: &'a str,
     pub headline: &'a str,
     pub body: &'a str,
-    /// Each file's path and whole new text.
-    pub files: &'a [(&'a str, &'a str)],
+    /// Each added or changed file's path and whole new contents.
+    pub files: &'a [(&'a str, &'a [u8])],
+    /// The paths the commit deletes.
+    pub deletions: &'a [&'a str],
 }
 
 /// What became of a merge GitHub accepted.
@@ -330,6 +348,9 @@ pub enum GitHubError {
     /// GitHub refused the change as invalid, such as creating a label that
     /// already exists.
     Unprocessable(String),
+    /// A compare-and-swap lost: the branch wasn't at the head the change
+    /// expected, as `createCommitOnBranch` answers with `STALE_DATA`.
+    Stale(String),
     /// Anything else: the network, a 5xx, a response we couldn't read.
     Other(String),
 }
@@ -345,6 +366,7 @@ impl fmt::Display for GitHubError {
             ),
             GitHubError::Auth(message) => write!(f, "GitHub auth failed: {message}"),
             GitHubError::Unprocessable(message) => write!(f, "GitHub refused: {message}"),
+            GitHubError::Stale(message) => write!(f, "the branch moved: {message}"),
             GitHubError::Other(message) => f.write_str(message),
         }
     }

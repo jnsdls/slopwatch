@@ -16,7 +16,7 @@ use slopwatch_protocol::step::{
 
 use super::{
     Branch, GitHub, GitHubError, GitRemote, Merged, NewCommit, NewPr, OpenPr, PIPELINE_PATH,
-    ParentPr, Poll, PrDetail, PrFate, PrLink, RateLimit, RepoPoll, StackLink, WATCH_LABEL,
+    ParentPr, Poll, PrDetail, PrFate, PrHead, PrLink, RateLimit, RepoPoll, StackLink, WATCH_LABEL,
 };
 use crate::auth::Credentials;
 
@@ -436,18 +436,23 @@ impl GitHub for Api {
         let additions: Vec<Value> = commit
             .files
             .iter()
-            .map(|(path, text)| {
+            .map(|(path, contents)| {
                 json!({
                     "path": path,
-                    "contents": base64::engine::general_purpose::STANDARD.encode(text),
+                    "contents": base64::engine::general_purpose::STANDARD.encode(contents),
                 })
             })
+            .collect();
+        let deletions: Vec<Value> = commit
+            .deletions
+            .iter()
+            .map(|path| json!({ "path": path }))
             .collect();
         let input = json!({
             "branch": { "repositoryNameWithOwner": repo.to_string(), "branchName": commit.branch },
             "expectedHeadOid": commit.expected_head,
             "message": { "headline": commit.headline, "body": commit.body },
-            "fileChanges": { "additions": additions },
+            "fileChanges": { "additions": additions, "deletions": deletions },
         });
         // A refused commit, such as one on a branch that moved, still
         // answers with data, holding a null payload next to the error.
@@ -459,9 +464,30 @@ impl GitHub for Api {
             .map(str::to_owned)
             .ok_or_else(|| graphql_error(&answer))
     }
+
+    async fn pr_head(&self, repo: &RepoName, number: u64) -> Result<PrHead, GitHubError> {
+        let variables = json!({ "owner": repo.owner, "name": repo.name, "number": number });
+        let data = self.graphql(PR_HEAD, variables).await?;
+        read_pr_head(repo, number, &data)
+    }
+
+    async fn job_log(&self, repo: &RepoName, job: u64) -> Result<String, GitHubError> {
+        // GitHub redirects to a short-lived download URL.
+        self.rest_text(&format!("/repos/{repo}/actions/jobs/{job}/logs"))
+            .await
+    }
 }
 
 impl Api {
+    /// A REST call whose answer is text, following redirects.
+    async fn rest_text(&self, path: &str) -> Result<String, GitHubError> {
+        self.send(|http| http.get(format!("{API}{path}")))
+            .await?
+            .text()
+            .await
+            .map_err(|error| GitHubError::Other(format!("unreadable answer from {path}: {error}")))
+    }
+
     /// A REST call whose answer is JSON.
     async fn rest_json<T: for<'de> Deserialize<'de>>(
         &self,
@@ -504,6 +530,36 @@ impl From<PullAnswer> for PrLink {
             head_sha: pr.head.sha,
         }
     }
+}
+
+const PR_HEAD: &str = "
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefName headRefOid
+      headRepository { nameWithOwner }
+    }
+  }
+}";
+
+/// The PR's head branch from a [`PR_HEAD`] answer.
+fn read_pr_head(repo: &RepoName, number: u64, data: &Value) -> Result<PrHead, GitHubError> {
+    let pr = &data["repository"]["pullRequest"];
+    let text = |key: &str| pr[key].as_str().map(str::to_owned);
+    let (Some(branch), Some(sha)) = (text("headRefName"), text("headRefOid")) else {
+        return Err(GitHubError::NotFound(format!("{repo}#{number}")));
+    };
+    // A fork that was deleted leaves no head repository to commit to.
+    let head_repo = pr["headRepository"]["nameWithOwner"]
+        .as_str()
+        .and_then(|name| name.split_once('/'))
+        .map(|(owner, name)| RepoName::new(owner, name))
+        .ok_or_else(|| GitHubError::NotFound(format!("the head repository of {repo}#{number}")))?;
+    Ok(PrHead {
+        repo: head_repo,
+        branch,
+        sha,
+    })
 }
 
 const COMMIT_ON_BRANCH: &str = "
@@ -567,6 +623,7 @@ fn graphql_error(answer: &Value) -> GitHubError {
         },
         Some("NOT_FOUND") => GitHubError::NotFound(message),
         Some("UNPROCESSABLE") => GitHubError::Unprocessable(message),
+        Some("STALE_DATA") => GitHubError::Stale(message),
         _ => GitHubError::Other(message),
     }
 }

@@ -100,6 +100,15 @@ pub enum RunEvent {
         effect: Effect,
         result: EffectResult,
     },
+    /// The daemon committed what write Step `step` changed, as the
+    /// developer, through the GitHub API (ADR 0002). The commit ends the
+    /// Run as pushed.
+    Committed {
+        step: String,
+        sha: String,
+        /// The paths the commit changes.
+        files: Vec<String>,
+    },
     Ended {
         reason: EndReason,
         /// The Gate passed only because of Waivers: the Run reads
@@ -207,6 +216,16 @@ pub struct RunView {
     pub inbox: Vec<InboxEntry>,
     /// Every Effect the Run's Steps requested, in the order they finished.
     pub effects: Vec<EffectView>,
+    /// The commit a write Step's changes became, if any.
+    pub commit: Option<CommitView>,
+}
+
+/// A write Step's changes as the daemon committed them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitView {
+    pub step: String,
+    pub sha: String,
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -375,6 +394,9 @@ impl RunView {
                 effect,
                 result,
             }),
+            RunEvent::Committed { step, sha, files } => {
+                self.commit = Some(CommitView { step, sha, files });
+            }
             RunEvent::Pruned { at } => self.pruned_at = Some(at),
             RunEvent::Ended { reason, waived } => {
                 self.end = Some(reason);

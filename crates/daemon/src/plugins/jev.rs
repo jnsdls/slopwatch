@@ -1522,6 +1522,8 @@ mod tests {
             config: with.as_object().unwrap().clone(),
             snapshot: pr,
             upstream: BTreeMap::new(),
+            gate_failing: vec![],
+            ci_logs: vec![],
             budget_usd: None,
         });
         let input = format!("{}\n", serde_json::to_string(&start).unwrap());
