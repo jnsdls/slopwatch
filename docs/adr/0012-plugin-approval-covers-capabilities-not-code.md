@@ -12,5 +12,5 @@ A third-party Plugin is an executable, or a symlink to one, that the developer p
 
 - Approval limits only what goes through the daemon: Secrets, the worktree and Effects. Network access isn't declared, because nothing could enforce it.
 - The version that Outcome reuse keys on is the manifest version plus a hash of the resolved executable, re-hashed at each spawn. A rebuild without a version bump still reruns, but a script's imports outside the executable go unnoticed.
-- A Step whose Plugin lacks an Approval gets `error(plugin unapproved)` without spawning, and downstream Steps follow their Conditions. The daemon raises one shared Escalation per Plugin, and approving from that Inbox entry offers a same-SHA rerun.
+- A Step whose Plugin lacks an Approval gets `error(plugin unapproved)` without spawning, and downstream Steps follow their Conditions. The daemon raises one shared Escalation per Plugin, and approving the Plugin starts a same-SHA Run for every Watched PR it held back.
 - Built-in names are reserved. A third-party Plugin with one fails to load.

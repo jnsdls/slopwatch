@@ -107,9 +107,9 @@ A Step whose outcome only the developer can supply: approve or reject, with an o
 _Avoid_: approval step, manual step
 
 **Escalation**:
-The daemon's report that a Run can't go further without the developer, such as a Step error, a Fix round cap reached, a stall, or a not-shippable end. It isn't a node in the Pipeline.
+The daemon's report that something can't go further without the developer. It belongs to one of three things. A Run, for a problem mid-Run such as a Step error or a stall, and it closes when answered or when the Run ends. A Watched PR, for a Run that ended needing the developer, such as not shippable or over budget, or for a problem between Runs such as a Stack parent closed unmerged. A PR has at most one open, and it closes when the PR's next Run starts or the PR stops being watched. Or a cause shared across PRs, such as a missing Secret, an unapproved Plugin, an invalid Pipeline or the day's Budget, and it closes when the daemon sees the cause cleared, which starts a same-SHA Run for every PR it held back. A Run the developer ended by rejecting or cancelling raises none. It isn't a node in the Pipeline.
 _Avoid_: alert, failure, incident
 
 **Inbox**:
-The one list, across repos, of open Human Steps and Escalations waiting on the developer, oldest first.
+The one list, across repos, of open Human Steps and Escalations waiting on the developer, oldest first. An Escalation shared across PRs is one entry, however many PRs it holds back. Each Run's record keeps the entries that touched it and how each one closed.
 _Avoid_: queue, notifications, attention list
