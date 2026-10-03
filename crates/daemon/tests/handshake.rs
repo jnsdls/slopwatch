@@ -70,6 +70,7 @@ async fn a_matching_hello_is_answered_with_the_daemons_build_id() {
                 "library".into(),
                 "runs".into(),
                 "run_control".into(),
+                "step_logs".into(),
             ],
             build_id: "0123abcd+dirty.feed".into(),
         })

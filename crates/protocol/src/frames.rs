@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
 use crate::{RepoName, RunId, Topic, TopicUpdate};
 
 /// A frame a client sends to the daemon.
@@ -149,7 +150,9 @@ pub enum Command {
     /// snapshot, then deltas in sequence order, and subscribing again
     /// restarts with a fresh snapshot. On `run/<id>` it's every journal
     /// event after `since`, or all of them without it, then each new one.
-    /// Either way, the updates already due arrive before the response.
+    /// On `log/<run>/<step>/<attempt>` it's the records after `since`, at
+    /// most the latest page of them, then each new one. Either way, the
+    /// updates already due arrive before the response.
     Subscribe {
         topic: Topic,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +192,15 @@ pub enum Command {
         run: RunId,
         step: String,
     },
+    /// One page of a Step log, searched and filtered by the daemon, so a
+    /// log larger than a page never has to cross the wire whole.
+    ReadStepLog {
+        key: LogKey,
+        #[serde(default)]
+        page: LogPage,
+        #[serde(default)]
+        filter: LogFilter,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +231,7 @@ pub enum Reply {
         /// Sorted by name.
         steps: Vec<LibraryStep>,
     },
+    StepLog(StepLogPage),
 }
 
 /// One Step in the developer's Library.

@@ -4,13 +4,16 @@
 //!
 //! The pane follows the PR's newest Run until the developer picks an older
 //! one from the history chips. Each method returns the commands the link
-//! should send to keep the subscription on the Run shown.
+//! should send to keep the subscriptions on what's shown: the Run, and the
+//! Step log of the open Step row.
 
 use slopwatch_core::{EndReason, GateState, Verdict};
 use slopwatch_protocol::{
-    Command, PullRequest, RepoName, RunId, RunSummary, RunView, StepStatus, StepView, Topic,
-    TopicUpdate,
+    Command, LogKey, LogRecord, PullRequest, RepoName, RunId, RunSummary, RunView, StepLogPage,
+    StepStatus, StepView, Topic, TopicUpdate,
 };
+
+use crate::step_log::{LogTail, LogViewer, TimedEvent};
 
 #[derive(Debug, Default)]
 pub struct RunPane {
@@ -20,6 +23,14 @@ pub struct RunPane {
     /// The Run subscribed to and shown.
     shown: Option<RunId>,
     view: RunView,
+    /// The shown Run's events with their timestamps, for the log viewer.
+    events: Vec<TimedEvent>,
+    /// The Step row opened to show its log tail.
+    open_step: Option<String>,
+    /// The open Step's latest attempt, followed live.
+    tail: Option<LogTail>,
+    /// The full log of one of the open Step's attempts.
+    viewer: Option<LogViewer>,
 }
 
 impl RunPane {
@@ -88,23 +99,171 @@ impl RunPane {
     }
 
     /// A new connection has no subscriptions, so it asks again for the Run
-    /// shown, from the last event the pane has.
+    /// shown, from the last event the pane has, and for the open log.
     pub fn reconnected(&self) -> Vec<Command> {
-        self.shown
+        let mut commands: Vec<Command> = self
+            .shown
             .map(|run| Command::Subscribe {
                 topic: Topic::Run(run),
                 since: Some(self.view.seq),
             })
             .into_iter()
-            .collect()
+            .collect();
+        commands.extend(self.tail.as_ref().map(LogTail::subscribe));
+        commands
     }
 
-    pub fn apply(&mut self, update: TopicUpdate) {
-        if let TopicUpdate::Run { id, seq, event } = update
-            && Some(id) == self.shown
-        {
-            self.view.apply(seq, event);
+    pub fn apply(&mut self, update: TopicUpdate) -> Vec<Command> {
+        match update {
+            TopicUpdate::Run { id, seq, ts, event } if Some(id) == self.shown => {
+                if seq <= self.view.seq {
+                    return Vec::new();
+                }
+                self.events.push(TimedEvent {
+                    ts,
+                    event: event.clone(),
+                });
+                self.view.apply(seq, event);
+                self.follow_open_step()
+            }
+            TopicUpdate::StepLog { key, records } => {
+                if let Some(tail) = &mut self.tail
+                    && tail.key == key
+                {
+                    tail.push(&records);
+                }
+                self.viewer
+                    .as_mut()
+                    .and_then(|viewer| viewer.live(&key, &records))
+                    .into_iter()
+                    .collect()
+            }
+            _ => Vec::new(),
         }
+    }
+
+    /// Takes a page of a Step log the daemon sent.
+    pub fn log_page(&mut self, page: StepLogPage) {
+        if let Some(viewer) = &mut self.viewer {
+            viewer.loaded(page);
+        }
+    }
+
+    pub fn open_step(&self) -> Option<&str> {
+        self.open_step.as_deref()
+    }
+
+    /// The open Step row's last lines.
+    pub fn tail(&self) -> impl Iterator<Item = &LogRecord> {
+        self.tail.iter().flat_map(LogTail::lines)
+    }
+
+    pub fn viewer(&self) -> Option<&LogViewer> {
+        self.viewer.as_ref()
+    }
+
+    pub fn viewer_mut(&mut self) -> Option<&mut LogViewer> {
+        self.viewer.as_mut()
+    }
+
+    /// The shown Run's events, timestamped.
+    pub fn events(&self) -> &[TimedEvent] {
+        &self.events
+    }
+
+    /// Opens a Step row to show its log tail, or closes the open one.
+    pub fn toggle_step(&mut self, step: &str) -> Vec<Command> {
+        let mut commands = self.close_step();
+        if self.open_step.as_deref() == Some(step) {
+            self.open_step = None;
+            return commands;
+        }
+        self.open_step = Some(step.to_owned());
+        commands.extend(self.follow_open_step());
+        commands
+    }
+
+    /// Opens the full log of the open Step's `attempt`.
+    pub fn open_log(&mut self, attempt: u32) -> Vec<Command> {
+        let Some(step) = self.open_step.clone() else {
+            return Vec::new();
+        };
+        let Some(run) = self.shown else {
+            return Vec::new();
+        };
+        self.open_viewer(LogKey { run, step, attempt })
+    }
+
+    /// Opens the full log of the open Step in `run`, the earlier Run whose
+    /// Outcome it reused, at that Run's latest attempt.
+    pub fn open_reused_log(&mut self, run: RunId) -> Vec<Command> {
+        let Some(step) = self.open_step.clone() else {
+            return Vec::new();
+        };
+        self.open_viewer(LogKey {
+            run,
+            step,
+            attempt: 0,
+        })
+    }
+
+    fn open_viewer(&mut self, key: LogKey) -> Vec<Command> {
+        let (mut viewer, command) = LogViewer::open(key);
+        if let Some(old) = &self.viewer {
+            viewer.events = old.events;
+        }
+        self.viewer = Some(viewer);
+        vec![command]
+    }
+
+    pub fn close_log(&mut self) {
+        self.viewer = None;
+    }
+
+    /// Keeps the tail subscription on the open Step's latest attempt.
+    fn follow_open_step(&mut self) -> Vec<Command> {
+        let (Some(run), Some(step)) = (self.shown, self.open_step.as_deref()) else {
+            return Vec::new();
+        };
+        let wanted = self
+            .view
+            .step(step)
+            .filter(|view| view.attempt > 0 && self.view.pruned_at.is_none())
+            .map(|view| LogKey {
+                run,
+                step: step.to_owned(),
+                attempt: view.attempt,
+            });
+        if self.tail.as_ref().map(|tail| &tail.key) == wanted.as_ref() {
+            return Vec::new();
+        }
+        let mut commands = Vec::new();
+        if let Some(old) = self.tail.take() {
+            commands.push(Command::Unsubscribe {
+                topic: Topic::StepLog(old.key),
+            });
+        }
+        if self.view.pruned_at.is_some() {
+            self.viewer = None;
+        }
+        if let Some(key) = wanted {
+            let tail = LogTail::new(key);
+            commands.push(tail.subscribe());
+            self.tail = Some(tail);
+        }
+        commands
+    }
+
+    /// Drops the open Step's log subscription and viewer.
+    fn close_step(&mut self) -> Vec<Command> {
+        self.viewer = None;
+        self.tail
+            .take()
+            .map(|tail| Command::Unsubscribe {
+                topic: Topic::StepLog(tail.key),
+            })
+            .into_iter()
+            .collect()
     }
 
     fn retarget(&mut self, runs: &[RunSummary]) -> Vec<Command> {
@@ -115,13 +274,15 @@ impl RunPane {
         if wanted == self.shown {
             return Vec::new();
         }
-        let mut commands = Vec::new();
+        let mut commands = self.close_step();
+        self.open_step = None;
         if let Some(old) = self.shown.take() {
             commands.push(Command::Unsubscribe {
                 topic: Topic::Run(old),
             });
         }
         self.view = RunView::default();
+        self.events.clear();
         if let Some(run) = wanted {
             self.shown = Some(run);
             commands.push(Command::Subscribe {
@@ -168,7 +329,10 @@ pub fn run_tone(run: &RunSummary) -> Tone {
 pub fn step_line(step: &StepView) -> String {
     match &step.status {
         StepStatus::Pending => "pending".to_owned(),
-        StepStatus::Running => "running".to_owned(),
+        StepStatus::Running => match &step.progress {
+            Some(progress) => format!("running: {progress}"),
+            None => "running".to_owned(),
+        },
         StepStatus::Settled {
             verdict,
             reason,
@@ -265,6 +429,7 @@ mod tests {
         TopicUpdate::Run {
             id: RunId(id),
             seq: 1,
+            ts: 1,
             event: RunEvent::Started {
                 repo: RepoName::new("o", "r"),
                 number: 1,
@@ -351,6 +516,7 @@ mod tests {
         TopicUpdate::Run {
             id: RunId(5),
             seq: 2,
+            ts: 2,
             event: RunEvent::StepSettled {
                 step: "ci".into(),
                 verdict,
@@ -387,6 +553,7 @@ mod tests {
         pane.apply(TopicUpdate::Run {
             id: RunId(5),
             seq: 3,
+            ts: 3,
             event: RunEvent::Ended {
                 reason: EndReason::NotShippable,
             },
@@ -420,6 +587,8 @@ mod tests {
                 outputs: Outputs::default(),
                 reused_from: None,
             },
+            attempt: 1,
+            progress: None,
         };
         assert_eq!(step_line(&step), "cancelled: the Run ended superseded");
 
@@ -439,5 +608,193 @@ mod tests {
             step_line(&reused),
             "pass: 1 check passed (reused from Run 3)"
         );
+    }
+
+    fn event(id: u64, seq: u64, event: RunEvent) -> TopicUpdate {
+        TopicUpdate::Run {
+            id: RunId(id),
+            seq,
+            ts: seq as i64 * 10,
+            event,
+        }
+    }
+
+    fn ci_log(run: u64, attempt: u32) -> LogKey {
+        LogKey {
+            run: RunId(run),
+            step: "ci".into(),
+            attempt,
+        }
+    }
+
+    fn log_line(seq: u64, text: &str) -> LogRecord {
+        LogRecord {
+            seq,
+            ts: seq as i64,
+            source: slopwatch_protocol::LogSource::Stderr,
+            level: None,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn an_open_step_row_follows_the_log_of_its_latest_attempt() {
+        let mut pane = RunPane::default();
+        pane.select_pr(&pr(vec![summary(1, None)]));
+        pane.apply(started(1));
+
+        // Opened before it runs, it waits for the first attempt.
+        assert!(pane.toggle_step("ci").is_empty());
+        let commands = pane.apply(event(
+            1,
+            2,
+            RunEvent::StepStarted {
+                step: "ci".into(),
+                attempt: 1,
+            },
+        ));
+        assert_eq!(
+            commands,
+            [Command::Subscribe {
+                topic: Topic::StepLog(ci_log(1, 1)),
+                since: None,
+            }]
+        );
+        pane.apply(TopicUpdate::StepLog {
+            key: ci_log(1, 1),
+            records: vec![log_line(1, "compiling"), log_line(2, "testing")],
+        });
+        let tail: Vec<&str> = pane.tail().map(|record| record.text.as_str()).collect();
+        assert_eq!(tail, ["compiling", "testing"]);
+        assert_eq!(
+            pane.reconnected()[1],
+            Command::Subscribe {
+                topic: Topic::StepLog(ci_log(1, 1)),
+                since: Some(2),
+            },
+            "a reconnect asks from the last line"
+        );
+
+        // A retry is a new attempt with its own log.
+        let commands = pane.apply(event(
+            1,
+            3,
+            RunEvent::StepStarted {
+                step: "ci".into(),
+                attempt: 2,
+            },
+        ));
+        assert_eq!(
+            commands,
+            [
+                Command::Unsubscribe {
+                    topic: Topic::StepLog(ci_log(1, 1)),
+                },
+                Command::Subscribe {
+                    topic: Topic::StepLog(ci_log(1, 2)),
+                    since: None,
+                },
+            ]
+        );
+        assert_eq!(pane.tail().count(), 0);
+
+        assert_eq!(
+            pane.toggle_step("ci"),
+            [Command::Unsubscribe {
+                topic: Topic::StepLog(ci_log(1, 2)),
+            }]
+        );
+        assert_eq!(pane.open_step(), None);
+    }
+
+    #[test]
+    fn the_full_log_follows_live_records_and_sees_the_runs_events() {
+        let mut pane = RunPane::default();
+        pane.select_pr(&pr(vec![summary(1, None)]));
+        pane.apply(started(1));
+        pane.apply(event(
+            1,
+            2,
+            RunEvent::StepStarted {
+                step: "ci".into(),
+                attempt: 1,
+            },
+        ));
+        pane.toggle_step("ci");
+
+        let commands = pane.open_log(1);
+        let [Command::ReadStepLog { key, page, filter }] = &commands[..] else {
+            panic!("the viewer reads the last page: {commands:?}");
+        };
+        assert_eq!(*key, ci_log(1, 1));
+        pane.log_page(StepLogPage {
+            key: key.clone(),
+            page: *page,
+            filter: filter.clone(),
+            records: vec![log_line(1, "compiling")],
+            more_before: false,
+            more_after: false,
+            truncated: None,
+        });
+        pane.apply(TopicUpdate::StepLog {
+            key: ci_log(1, 1),
+            records: vec![log_line(2, "testing")],
+        });
+        pane.apply(event(
+            1,
+            3,
+            RunEvent::StepProgress {
+                step: "ci".into(),
+                message: "halfway".into(),
+            },
+        ));
+
+        let viewer = pane.viewer().unwrap();
+        assert_eq!(viewer.rows(pane.events()).len(), 2);
+        pane.viewer_mut().unwrap().events = true;
+        let rows: Vec<String> = pane
+            .viewer()
+            .unwrap()
+            .rows(pane.events())
+            .iter()
+            .map(crate::step_log::row_text)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "compiling",
+                "testing",
+                "— attempt 1 started",
+                "— progress: halfway"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pruned_run_shows_no_log() {
+        let mut pane = RunPane::default();
+        pane.select_pr(&pr(vec![summary(1, Some(EndReason::Superseded))]));
+        pane.apply(started(1));
+        pane.apply(event(
+            1,
+            2,
+            RunEvent::StepStarted {
+                step: "ci".into(),
+                attempt: 1,
+            },
+        ));
+        pane.toggle_step("ci");
+        assert!(pane.tail.is_some());
+
+        let commands = pane.apply(event(1, 3, RunEvent::Pruned { at: 0 }));
+
+        assert_eq!(
+            commands,
+            [Command::Unsubscribe {
+                topic: Topic::StepLog(ci_log(1, 1)),
+            }]
+        );
+        assert!(pane.viewer().is_none());
+        assert_eq!(pane.view().unwrap().pruned_at, Some(0));
     }
 }

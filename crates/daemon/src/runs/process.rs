@@ -3,13 +3,14 @@
 //!
 //! A task owns the child. It forwards what the Step says as [`Report`]s and
 //! takes [`Control`]s from the engine. Cancel sends `cancel`, then SIGTERM
-//! to the group 10 s later and SIGKILL 5 s after that. Stderr and the
-//! Step's `log` messages go to the Step log file.
+//! to the group 10 s later and SIGKILL 5 s after that. Stderr lines and the
+//! Step's `log` messages go to the Step log, one record each.
 //!
 //! The task also enforces the Step's [`Limits`]: a Step that runs past its
-//! `timeout`, or writes nothing on stdout for `stall_after`, loses its
-//! whole group to SIGKILL on the spot. Tokio's clock is `mach_absolute_time` on macOS,
-//! which stops while the Mac sleeps, so both count awake time only.
+//! `timeout`, or writes nothing on stdout or stderr for `stall_after`, loses
+//! its whole group to SIGKILL on the spot. Tokio's clock is
+//! `mach_absolute_time` on macOS, which stops while the Mac sleeps, so both
+//! count awake time only.
 
 use std::io;
 use std::path::PathBuf;
@@ -19,11 +20,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use slopwatch_protocol::LogSource;
 use slopwatch_protocol::step::{FromStep, ToStep};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 use tokio::time::Sleep;
+
+use super::log;
 
 /// After `cancel`, how long a Step gets before SIGTERM, then before SIGKILL.
 const CANCEL_GRACE: Duration = Duration::from_secs(10);
@@ -39,7 +43,7 @@ pub struct Spawn {
     pub dir: PathBuf,
     /// The whole environment: nothing else leaks in from the daemon's.
     pub env: Vec<(String, String)>,
-    pub log: PathBuf,
+    pub log: log::Writer,
     pub start: ToStep,
     pub limits: Limits,
 }
@@ -113,13 +117,6 @@ impl StepHandle {
 /// Starts the process and its task. `report` gets everything the process
 /// says, last of all its exit.
 pub fn spawn(spawn: Spawn, report: impl Fn(Report) + Send + 'static) -> io::Result<StepHandle> {
-    if let Some(parent) = spawn.log.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&spawn.log)?;
     let mut child = Command::new(&spawn.program)
         .args(&spawn.args)
         .current_dir(&spawn.dir)
@@ -127,7 +124,7 @@ pub fn spawn(spawn: Spawn, report: impl Fn(Report) + Send + 'static) -> io::Resu
         .envs(spawn.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::piped())
         // Its own group, so cancelling reaches whatever it starts.
         .process_group(0)
         .kill_on_drop(false)
@@ -138,6 +135,7 @@ pub fn spawn(spawn: Spawn, report: impl Fn(Report) + Send + 'static) -> io::Resu
     let sid = session_of(0);
     let stdin = child.stdin.take().expect("stdin is piped");
     let stdout = child.stdout.take().expect("stdout is piped");
+    let stderr = child.stderr.take().expect("stderr is piped");
     let (control, controls) = mpsc::unbounded_channel();
     let exited = Arc::new(AtomicBool::new(false));
     let session = Session {
@@ -145,11 +143,11 @@ pub fn spawn(spawn: Spawn, report: impl Fn(Report) + Send + 'static) -> io::Resu
         pgid: pid,
         exited: Arc::clone(&exited),
         to_step: writer(stdin),
-        log: tokio::fs::File::from_std(log),
+        log: spawn.log,
         report,
     };
     let _ = session.to_step.send(spawn.start);
-    tokio::spawn(session.run(stdout, controls, spawn.limits));
+    tokio::spawn(session.run(stdout, stderr, controls, spawn.limits));
     Ok(StepHandle {
         control,
         exited,
@@ -182,7 +180,7 @@ struct Session<R> {
     pgid: i32,
     exited: Arc<AtomicBool>,
     to_step: mpsc::UnboundedSender<ToStep>,
-    log: tokio::fs::File,
+    log: log::Writer,
     report: R,
 }
 
@@ -190,11 +188,15 @@ impl<R: Fn(Report)> Session<R> {
     async fn run(
         mut self,
         stdout: ChildStdout,
+        stderr: ChildStderr,
         mut controls: mpsc::UnboundedReceiver<Control>,
         limits: Limits,
     ) {
         let mut lines = BufReader::new(stdout).lines();
         let mut stdout_open = true;
+        let mut stderr = BufReader::new(stderr);
+        let mut stderr_line = Vec::new();
+        let mut stderr_open = true;
         let mut controls_open = true;
         // The next signal to send to the group, and when.
         let mut kill: Option<(libc::c_int, Pin<Box<Sleep>>)> = None;
@@ -212,9 +214,19 @@ impl<R: Fn(Report)> Session<R> {
                         if let (Some(stall), Some(after)) = (stall.as_mut(), limits.stall_after) {
                             stall.as_mut().reset(tokio::time::Instant::now() + after);
                         }
-                        self.line(&line).await;
+                        self.line(&line);
                     }
                     Ok(None) | Err(_) => stdout_open = false,
+                },
+                line = read_line(&mut stderr, &mut stderr_line, self.log.line_limit()), if stderr_open => match line {
+                    Some(line) => {
+                        // Stderr is output too: a Step busy compiling isn't stalled.
+                        if let (Some(stall), Some(after)) = (stall.as_mut(), limits.stall_after) {
+                            stall.as_mut().reset(tokio::time::Instant::now() + after);
+                        }
+                        self.log.write(LogSource::Stderr, None, &line);
+                    }
+                    None => stderr_open = false,
                 },
                 () = async { timeout.as_mut().expect("guarded").as_mut().await }, if timeout.is_some() => {
                     let after = limits.timeout.expect("armed only with a timeout");
@@ -250,12 +262,20 @@ impl<R: Fn(Report)> Session<R> {
                     // which also closes any stdout it handed down.
                     signal_group(self.pgid, libc::SIGKILL);
                     self.exited.store(true, Ordering::Release);
-                    // Read what's left on stdout: an outcome may be there.
+                    // Read what's left on stdout, where an outcome may be,
+                    // and on stderr.
                     let deadline = tokio::time::Instant::now() + DRAIN;
                     while stdout_open {
                         match tokio::time::timeout_at(deadline, lines.next_line()).await {
-                            Ok(Ok(Some(line))) => self.line(&line).await,
+                            Ok(Ok(Some(line))) => self.line(&line),
                             _ => stdout_open = false,
+                        }
+                    }
+                    let limit = self.log.line_limit();
+                    while stderr_open {
+                        match tokio::time::timeout_at(deadline, read_line(&mut stderr, &mut stderr_line, limit)).await {
+                            Ok(Some(line)) => self.log.write(LogSource::Stderr, None, &line),
+                            _ => stderr_open = false,
                         }
                     }
                     (self.report)(Report::Exited(status.ok().and_then(|status| status.code())));
@@ -274,15 +294,10 @@ impl<R: Fn(Report)> Session<R> {
 
     /// One stdout line: a log message goes to the Step log, and anything
     /// else to the engine.
-    async fn line(&mut self, line: &str) {
+    fn line(&mut self, line: &str) {
         match serde_json::from_str::<FromStep>(line) {
-            Ok(FromStep::Log { message }) => {
-                // tokio's File hands writes to a blocking thread, and only
-                // a flush waits for them to land.
-                let line = format!("{message}\n");
-                if self.log.write_all(line.as_bytes()).await.is_ok() {
-                    let _ = self.log.flush().await;
-                }
+            Ok(FromStep::Log { message, level }) => {
+                self.log.write(LogSource::Log, level, &message);
             }
             Ok(message) => (self.report)(Report::Message(message)),
             Err(error) => (self.report)(Report::ProtocolError(format!(
@@ -291,6 +306,64 @@ impl<R: Fn(Report)> Session<R> {
             ))),
         }
     }
+}
+
+/// The next stderr line, without its line ending, or the first `limit`
+/// bytes of a longer one. `None` once stderr is closed. Cancel-safe: what
+/// it has read so far waits in `pending` for the next call.
+async fn read_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    pending: &mut Vec<u8>,
+    limit: usize,
+) -> Option<String> {
+    loop {
+        let available = match reader.fill_buf().await {
+            Ok(available) => available,
+            Err(_) => &[],
+        };
+        if available.is_empty() {
+            if pending.is_empty() {
+                return None;
+            }
+            return Some(take_line(pending));
+        }
+        let room = limit.saturating_sub(pending.len()).max(1);
+        let window = &available[..available.len().min(room)];
+        match window.iter().position(|&byte| byte == b'\n') {
+            Some(at) => {
+                pending.extend_from_slice(&window[..at]);
+                reader.consume(at + 1);
+                return Some(take_line(pending));
+            }
+            None => {
+                let taken = window.len();
+                pending.extend_from_slice(window);
+                reader.consume(taken);
+                if pending.len() >= limit {
+                    return Some(take_chunk(pending));
+                }
+            }
+        }
+    }
+}
+
+fn take_line(pending: &mut Vec<u8>) -> String {
+    let bytes = std::mem::take(pending);
+    let text = String::from_utf8_lossy(&bytes);
+    text.strip_suffix('\r').unwrap_or(&text).to_owned()
+}
+
+/// The first part of a line too long for one record. A char cut in two
+/// at the end stays in `pending` for the next part.
+fn take_chunk(pending: &mut Vec<u8>) -> String {
+    let whole = match std::str::from_utf8(pending) {
+        Err(error) if error.error_len().is_none() && error.valid_up_to() > 0 => error.valid_up_to(),
+        _ => pending.len(),
+    };
+    let rest = pending.split_off(whole);
+    let chunk = String::from_utf8_lossy(pending).into_owned();
+    *pending = rest;
+    chunk
 }
 
 fn truncate(line: &str) -> String {
@@ -427,15 +500,36 @@ mod tests {
     use super::*;
 
     fn sh(script: &str, dir: &tempfile::TempDir) -> Spawn {
+        let key = slopwatch_protocol::LogKey {
+            run: slopwatch_protocol::RunId(1),
+            step: "step".into(),
+            attempt: 1,
+        };
+        let log = log::Writer::create(
+            dir.path().join("log"),
+            key,
+            log::Limits::default(),
+            log::Hub::default(),
+        )
+        .unwrap();
         Spawn {
             program: "/bin/sh".into(),
             args: vec!["-c".into(), script.into()],
             dir: dir.path().to_owned(),
             env: vec![("PATH".into(), "/usr/bin:/bin".into())],
-            log: dir.path().join("logs/step.log"),
+            log,
             start: ToStep::Cancel,
             limits: Limits::default(),
         }
+    }
+
+    fn step_log(dir: &tempfile::TempDir) -> log::Page {
+        log::read_page(
+            &dir.path().join("log"),
+            slopwatch_protocol::LogPage::default(),
+            &slopwatch_protocol::LogFilter::default(),
+        )
+        .unwrap()
     }
 
     async fn reports(spawn_with: Spawn) -> (StepHandle, mpsc::UnboundedReceiver<Report>) {
@@ -473,16 +567,73 @@ mod tests {
     #[tokio::test]
     async fn stderr_and_log_messages_go_to_the_step_log() {
         let dir = tempfile::tempdir().unwrap();
-        let script = r#"echo to stderr >&2; echo '{"type":"log","message":"logged"}'"#;
+        let script = r#"echo to stderr >&2; sleep 0.2; echo '{"type":"log","message":"logged","level":"warn"}'; printf 'no newline' >&2"#;
         let (_handle, mut reports) = reports(sh(script, &dir)).await;
 
         assert!(matches!(
             reports.recv().await,
             Some(Report::Exited(Some(0)))
         ));
-        let log = std::fs::read_to_string(dir.path().join("logs/step.log")).unwrap();
-        assert!(log.contains("to stderr"), "{log}");
-        assert!(log.contains("logged"), "{log}");
+        let records = step_log(&dir).records;
+        let lines: Vec<_> = records
+            .iter()
+            .map(|record| (record.source, record.level, record.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (LogSource::Stderr, None, "to stderr"),
+                (
+                    LogSource::Log,
+                    Some(slopwatch_protocol::LogLevel::Warn),
+                    "logged"
+                ),
+                (LogSource::Stderr, None, "no newline"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_that_writes_past_the_cap_keeps_running_and_its_log_records_the_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        // About 20 MB of stderr, then an outcome.
+        let script = r#"read line; yes 'a line of build output that keeps on going and going' | head -n 400000 >&2; echo '{"type":"outcome","verdict":"pass"}'"#;
+        let (_handle, mut reports) = reports(sh(script, &dir)).await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(60), reports.recv()).await;
+        assert!(
+            matches!(
+                outcome,
+                Ok(Some(Report::Message(FromStep::Outcome(ref outcome))))
+                    if outcome.verdict == slopwatch_core::Verdict::Pass
+            ),
+            "{outcome:?}"
+        );
+        assert!(matches!(
+            reports.recv().await,
+            Some(Report::Exited(Some(0)))
+        ));
+        let page = step_log(&dir);
+        let truncated = page.truncated.expect("the log records the truncation");
+        assert!(truncated.bytes > 4 * 1024 * 1024, "{truncated:?}");
+        assert_eq!(page.records.last().unwrap().seq, 400_000);
+        let size = log::disk_usage(&dir.path().join("log"));
+        assert!(size <= 16 * 1024 * 1024 + 4096, "{size} bytes on disk");
+    }
+
+    #[tokio::test]
+    async fn a_long_line_splits_without_cutting_a_char() {
+        let mut pending = Vec::new();
+        let text = "ab\u{e9}cd\n";
+        let mut reader = tokio::io::BufReader::new(text.as_bytes());
+
+        let first = read_line(&mut reader, &mut pending, 3).await;
+        let second = read_line(&mut reader, &mut pending, 3).await;
+        let third = read_line(&mut reader, &mut pending, 3).await;
+
+        assert_eq!(first.as_deref(), Some("ab"));
+        assert_eq!(second.as_deref(), Some("\u{e9}c"));
+        assert_eq!(third.as_deref(), Some("d"));
     }
 
     #[tokio::test]

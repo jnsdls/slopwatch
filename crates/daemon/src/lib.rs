@@ -37,7 +37,7 @@ use slopwatch_protocol::{
 };
 
 pub use library::{CONFIG_DIR_ENV, Library, LibraryError};
-pub use runs::{RunError, Runs, RunsConfig, STEP_CAP};
+pub use runs::{Retention, RunError, Runs, RunsConfig, STEP_CAP};
 pub use watching::{RunInfo, Subscription, WatchError, Watching};
 
 /// Who is on the other end of a connection, as the transport reports it.

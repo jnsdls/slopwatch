@@ -8,6 +8,7 @@
 
 mod flavor;
 mod frames;
+pub mod logs;
 pub mod runs;
 pub mod step;
 mod topics;
@@ -16,6 +17,10 @@ pub use flavor::{DATA_DIR_ENV, Flavor, socket_path};
 pub use frames::{
     Actor, Auth, ClientFrame, ClientHello, Command, ErrorBody, ErrorCode, LibraryStep, Refusal,
     RefusalReason, Reply, Request, RequestId, Response, ResponseBody, ServerFrame, ServerHello,
+};
+pub use logs::{
+    LogFilter, LogKey, LogLevel, LogPage, LogRecord, LogSource, MAX_PAGE, StepLogPage,
+    StorageWarning, Truncation,
 };
 pub use runs::{RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView};
 pub use topics::{
@@ -44,7 +49,17 @@ pub const DIALECT: u32 = 1;
 ///
 /// `run_control`: the `cancel_run` and `retry_step` commands, and the
 /// `step_retried` Run event.
-pub const FEATURES: &[&str] = &["watched_prs", "restart", "library", "runs", "run_control"];
+///
+/// `step_logs`: the `log/<run>/<step>/<attempt>` topics, `read_step_log`,
+/// timestamps on Run events, and the storage warning on `watched_prs`.
+pub const FEATURES: &[&str] = &[
+    "watched_prs",
+    "restart",
+    "library",
+    "runs",
+    "run_control",
+    "step_logs",
+];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no
 /// host, so the host here is a placeholder the daemon ignores.

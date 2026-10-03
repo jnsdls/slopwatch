@@ -8,3 +8,4 @@ pub mod link_view;
 pub mod main_view;
 pub mod prs;
 pub mod run_pane;
+pub mod step_log;

@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use slopwatch_protocol::{
-    PollState, PrStatus, PullRequest, RepoName, RunSummary, WatchedPrs, WatchedPrsDelta,
+    PollState, PrStatus, PullRequest, RepoName, RunSummary, StorageWarning, WatchedPrs,
+    WatchedPrsDelta,
 };
 use tokio::sync::broadcast;
 
@@ -44,6 +45,7 @@ struct State {
     /// What Runs report for each PR, shown on its row.
     runs: BTreeMap<(RepoName, u64), RunInfo>,
     poll: PollState,
+    storage: Option<StorageWarning>,
     seq: u64,
     deltas: broadcast::Sender<(u64, WatchedPrsDelta)>,
 }
@@ -105,6 +107,7 @@ impl Watching {
                 polled: HashSet::new(),
                 runs: BTreeMap::new(),
                 poll: PollState::Pending,
+                storage: None,
                 seq: 0,
                 deltas,
             }),
@@ -243,6 +246,15 @@ impl Watching {
             .collect()
     }
 
+    /// Shows or clears the storage warning.
+    pub fn set_storage_warning(&self, warning: Option<StorageWarning>) {
+        let mut state = self.state();
+        if state.storage != warning {
+            state.storage = warning;
+            state.publish(WatchedPrsDelta::Storage { warning });
+        }
+    }
+
     /// Shows `info` on the PR's row.
     pub fn set_run_info(&self, repo: &RepoName, number: u64, info: RunInfo) {
         let mut state = self.state();
@@ -268,6 +280,7 @@ impl State {
                 .map(|((repo, _), pr)| self.row(repo, pr))
                 .collect(),
             poll: self.poll.clone(),
+            storage: self.storage,
         }
     }
 

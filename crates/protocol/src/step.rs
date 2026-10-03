@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 use slopwatch_core::{Verdict, Workspace};
 
 use crate::RepoName;
+use crate::logs::LogLevel;
 use crate::runs::RunId;
 
 /// The Step protocol dialect. A Plugin's manifest must name exactly this
@@ -89,7 +90,11 @@ pub enum FromStep {
         message: Option<String>,
     },
     /// A line for the Step log.
-    Log { message: String },
+    Log {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        level: Option<LogLevel>,
+    },
     /// The Step's one Outcome. It exits after sending it.
     Outcome(Outcome),
 }

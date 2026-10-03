@@ -6,19 +6,22 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{
-    Command, PrStatus, PullRequest, Reply, RepoName, ResponseBody, TopicUpdate,
+    Command, LogLevel, LogSource, PrStatus, PullRequest, Reply, RepoName, ResponseBody, RunView,
+    StepStatus, StepView, TopicUpdate,
 };
 
 use crate::agent::Agent;
 use crate::library_view::LibraryView;
 use crate::link::{LinkEvent, LinkState};
 use crate::link_view::LinkView;
-use crate::prs::{Prs, Source, poll_line, status_line};
+use crate::prs::{Prs, Source, poll_line, status_line, storage_line};
 use crate::run_pane::{RunPane, Tone, gate_tone, run_label, run_tone, step_line, step_tone};
+use crate::step_log::{self, LogViewer, Row};
 
 /// What fills the window right of the sources pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +42,9 @@ pub struct MainView {
     /// The last command that failed, until the next one succeeds.
     error: Option<String>,
     commands: Sender<Command>,
+    /// The log viewer's search field.
+    log_search: Entity<InputState>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl MainView {
@@ -51,7 +57,21 @@ impl MainView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let log_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search the log"));
+        let _subscriptions = vec![cx.subscribe_in(
+            &log_search,
+            window,
+            |this, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let search = input.read(cx).value().to_string();
+                    this.with_viewer(|viewer| Some(viewer.set_search(&search)));
+                    cx.notify();
+                }
+            },
+        )];
         Self {
+            log_search,
+            _subscriptions,
             link: LinkState::Connecting,
             link_view: cx.new(|_| LinkView::new(agent, reregister)),
             pane: Pane::Prs,
@@ -83,7 +103,11 @@ impl MainView {
                 self.link_view
                     .update(cx, |view, cx| view.set_state(state, cx));
             }
-            LinkEvent::Topic(update @ TopicUpdate::Run { .. }) => self.run_pane.apply(update),
+            LinkEvent::Topic(update @ (TopicUpdate::Run { .. } | TopicUpdate::StepLog { .. })) => {
+                for command in self.run_pane.apply(update) {
+                    self.send(command);
+                }
+            }
             LinkEvent::Topic(update) => {
                 self.prs.apply(update);
                 if let Some((repo, number)) = self.run_pane.selected().cloned() {
@@ -108,6 +132,10 @@ impl MainView {
                     self.library
                         .update(cx, |library, cx| library.listed(steps, cx));
                 }
+                ResponseBody::Ok(Reply::StepLog(page)) => {
+                    self.error = None;
+                    self.run_pane.log_page(page);
+                }
                 ResponseBody::Ok(_) => self.error = None,
                 ResponseBody::Error(error) => self.error = Some(error.message),
             },
@@ -118,6 +146,13 @@ impl MainView {
     fn send(&self, command: Command) {
         // The link thread only stops when the app quits.
         let _ = self.commands.send(command);
+    }
+
+    /// Changes the open log viewer and sends the command it asks for.
+    fn with_viewer(&mut self, change: impl FnOnce(&mut LogViewer) -> Option<Command>) {
+        if let Some(command) = self.run_pane.viewer_mut().and_then(change) {
+            self.send(command);
+        }
     }
 
     fn show_prs(&mut self, source: Source) {
@@ -213,7 +248,15 @@ impl MainView {
             );
         }
 
-        match &self.picker {
+        let warning = self.prs.storage().map(|warning| {
+            div()
+                .mt_3()
+                .px_3()
+                .text_xs()
+                .text_color(theme.warning)
+                .child(storage_line(warning))
+        });
+        let pane = match &self.picker {
             None => pane.child(
                 div().px_1().pt_2().child(
                     Button::new("add-repo")
@@ -279,7 +322,8 @@ impl MainView {
                 );
                 pane.child(picker)
             }
-        }
+        };
+        pane.children(warning)
     }
 
     fn pr_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -384,7 +428,7 @@ impl MainView {
     /// The selected PR: its Run history chips, newest first, then the Run
     /// shown as a Step list with the Gate as its last row.
     fn pr_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+        let theme = cx.theme().clone();
         let color = |tone: Tone| match tone {
             Tone::Good => theme.success,
             Tone::Bad => theme.danger,
@@ -507,6 +551,9 @@ impl MainView {
                     )
                 }),
         );
+        if let Some(viewer) = self.run_pane.viewer() {
+            return pane.child(self.log_viewer(viewer, view, cx));
+        }
         let mut steps = div()
             .flex()
             .flex_col()
@@ -514,7 +561,10 @@ impl MainView {
             .border_color(theme.border)
             .rounded_md();
         for step in &view.steps {
+            let open = self.run_pane.open_step() == Some(step.info.id.as_str());
+            let toggled = step.info.id.clone();
             let mut row = div()
+                .id(SharedString::from(format!("step-{}", step.info.id)))
                 .flex()
                 .flex_col()
                 .gap_0p5()
@@ -522,6 +572,13 @@ impl MainView {
                 .py_2()
                 .border_b_1()
                 .border_color(theme.border)
+                .hover(|this| this.bg(theme.list_hover))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    for command in this.run_pane.toggle_step(&toggled) {
+                        this.send(command);
+                    }
+                    cx.notify();
+                }))
                 .child(
                     div()
                         .flex()
@@ -574,6 +631,9 @@ impl MainView {
                     );
                 }
             }
+            if open {
+                row = row.child(self.step_log_tail(step, view, cx));
+            }
             steps = steps.child(row);
         }
         let gate = view.gate.unwrap_or(slopwatch_core::GateState::Pending);
@@ -601,6 +661,272 @@ impl MainView {
             );
         }
         pane
+    }
+
+    /// The open Step row's last lines, with the way into its full log.
+    fn step_log_tail(&self, step: &StepView, view: &RunView, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let mut tail = div().flex().flex_col().gap_1().pt_1();
+        if let Some(at) = view.pruned_at {
+            return tail.child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!("Log pruned on {}", step_log::date(at))),
+            );
+        }
+        if let StepStatus::Settled {
+            reused_from: Some(run),
+            ..
+        } = step.status
+        {
+            return tail.child(
+                Button::new("reused-log")
+                    .label(format!("Full log from Run {run}"))
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        for command in this.run_pane.open_reused_log(run) {
+                            this.send(command);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        if step.attempt == 0 {
+            return tail.child(div().text_xs().text_color(muted).child("Not started yet."));
+        }
+        let mut lines = div()
+            .flex()
+            .flex_col()
+            .p_2()
+            .rounded_md()
+            .bg(theme.muted)
+            .font_family("Menlo")
+            .text_xs();
+        let mut any = false;
+        for record in self.run_pane.tail() {
+            any = true;
+            lines = lines.child(div().child(step_log::line_text(record)));
+        }
+        if !any {
+            let empty = if matches!(step.status, StepStatus::Running) {
+                "Nothing written yet."
+            } else {
+                "The Step wrote nothing."
+            };
+            lines = lines.child(div().text_color(muted).child(empty));
+        }
+        tail = tail.child(lines);
+        let mut buttons = div().flex().flex_wrap().gap_1();
+        for attempt in (1..=step.attempt).rev() {
+            let label = if step.attempt == 1 {
+                "Full log".to_owned()
+            } else {
+                format!("Full log, attempt {attempt}")
+            };
+            buttons = buttons.child(
+                Button::new(SharedString::from(format!("full-log-{attempt}")))
+                    .label(label)
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        for command in this.run_pane.open_log(attempt) {
+                            this.send(command);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        tail.child(buttons)
+    }
+
+    /// The full-log viewer: attempt tabs, search, the source and level
+    /// filters, the Events toggle, then one page of the log.
+    fn log_viewer(&self, viewer: &LogViewer, view: &RunView, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let attempts = view
+            .step(&viewer.key.step)
+            .map_or(viewer.key.attempt, |step| step.attempt.max(1));
+
+        let mut header = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("close-log")
+                    .label("← Steps")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.run_pane.close_log();
+                        cx.notify();
+                    })),
+            )
+            .child(div().text_sm().child(viewer.key.step.clone()));
+        if attempts > 1 {
+            for attempt in (1..=attempts).rev() {
+                let shown = attempt == viewer.key.attempt;
+                header = header.child(
+                    Button::new(SharedString::from(format!("attempt-{attempt}")))
+                        .label(format!("Attempt {attempt}"))
+                        .small()
+                        .when(shown, |button| button.primary())
+                        .when(!shown, |button| button.ghost())
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            for command in this.run_pane.open_log(attempt) {
+                                this.send(command);
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+
+        let toggle = |id: &'static str, label: &'static str, on: bool| {
+            Button::new(id)
+                .label(label)
+                .small()
+                .when(on, |button| button.primary())
+                .when(!on, |button| button.ghost())
+        };
+        let filter = &viewer.filter;
+        let mut filters = div().flex().flex_wrap().gap_1();
+        for (id, label, source) in [
+            ("source-stderr", "stderr", LogSource::Stderr),
+            ("source-log", "log", LogSource::Log),
+        ] {
+            filters = filters.child(
+                toggle(id, label, step_log::shows(&filter.sources, &source)).on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| {
+                        this.with_viewer(|viewer| Some(viewer.toggle_source(source)));
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        for (id, label, level) in [
+            ("level-debug", "debug", LogLevel::Debug),
+            ("level-info", "info", LogLevel::Info),
+            ("level-warn", "warn", LogLevel::Warn),
+            ("level-error", "error", LogLevel::Error),
+        ] {
+            filters = filters.child(
+                toggle(id, label, step_log::shows(&filter.levels, &level)).on_click(cx.listener(
+                    move |this, _: &ClickEvent, _, cx| {
+                        this.with_viewer(|viewer| Some(viewer.toggle_level(level)));
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        filters = filters.child(
+            toggle("events", "Events", viewer.events).on_click(cx.listener(
+                |this, _: &ClickEvent, _, cx| {
+                    this.with_viewer(|viewer| {
+                        viewer.events = !viewer.events;
+                        None
+                    });
+                    cx.notify();
+                },
+            )),
+        );
+        let copied = viewer.text(self.run_pane.events());
+        filters = filters.child(
+            Button::new("copy-log")
+                .label("Copy")
+                .small()
+                .ghost()
+                .on_click(move |_: &ClickEvent, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+                }),
+        );
+
+        let mut lines = div()
+            .flex()
+            .flex_col()
+            .p_2()
+            .rounded_md()
+            .bg(theme.muted)
+            .font_family("Menlo")
+            .text_xs();
+        if viewer.has_older() {
+            lines = lines.child(
+                Button::new("log-older")
+                    .label("Older")
+                    .small()
+                    .ghost()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.with_viewer(LogViewer::older);
+                        cx.notify();
+                    })),
+            );
+        }
+        let rows = viewer.rows(self.run_pane.events());
+        if rows.is_empty() {
+            let empty = if viewer.loading() {
+                "Loading…"
+            } else if filter.is_empty() {
+                "The log is empty."
+            } else {
+                "No lines match."
+            };
+            lines = lines.child(div().text_color(muted).child(empty));
+        }
+        for row in &rows {
+            let line = div().child(step_log::row_text(row));
+            lines = lines.child(match row {
+                Row::Line(_) => line,
+                Row::Truncated(_) => line.text_color(theme.warning),
+                Row::Event { .. } => line.text_color(theme.info),
+            });
+        }
+        if viewer.has_newer() {
+            lines = lines.child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        Button::new("log-newer")
+                            .label("Newer")
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.with_viewer(LogViewer::newer);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("log-follow")
+                            .label("Latest")
+                            .small()
+                            .ghost()
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.with_viewer(|viewer| Some(viewer.follow()));
+                                cx.notify();
+                            })),
+                    ),
+            );
+        } else if viewer.following()
+            && matches!(
+                view.step(&viewer.key.step).map(|step| (&step.status, step.attempt)),
+                Some((StepStatus::Running, attempt)) if attempt == viewer.key.attempt
+            )
+        {
+            lines = lines.child(div().text_color(muted).child("Following live…"));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(header)
+            .child(Input::new(&self.log_search).small())
+            .child(filters)
+            .child(lines)
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {

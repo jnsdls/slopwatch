@@ -15,7 +15,7 @@ use slopwatch_daemon::github::fake::FakeGitHub;
 use slopwatch_daemon::plugins::Plugins;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::in_process::InProcessClient;
-use slopwatch_daemon::{Daemon, Library, Runs, RunsConfig, STEP_CAP, Watching};
+use slopwatch_daemon::{Daemon, Library, Retention, Runs, RunsConfig, STEP_CAP, Watching};
 use slopwatch_protocol::step::{Manifest, STEP_DIALECT};
 use slopwatch_protocol::{
     ClientFrame, ClientHello, Command, ErrorCode, Reply, RepoName, ResponseBody, RunId, RunView,
@@ -128,6 +128,7 @@ impl Harness {
                 data_dir: data.path().to_owned(),
                 plugins,
                 login_path: login_path.map(str::to_owned),
+                retention: Retention::default(),
             },
         )
         .unwrap();
@@ -228,11 +229,12 @@ impl Client {
                 WatchedPrsUpdate::Snapshot(snapshot) => self.prs = snapshot,
                 WatchedPrsUpdate::Delta(delta) => self.prs.apply(delta),
             },
-            TopicUpdate::Run { id, seq, event } => {
+            TopicUpdate::Run { id, seq, event, .. } => {
                 let view = self.runs.entry(id).or_default();
                 assert_eq!(seq, view.seq + 1, "Run events arrive in order, once each");
                 view.apply(seq, event);
             }
+            TopicUpdate::StepLog { .. } => {}
         }
     }
 

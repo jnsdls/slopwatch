@@ -95,6 +95,12 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE runs ADD COLUMN files TEXT NOT NULL DEFAULT '[]';
 ",
+    // Journal timestamps, for interleaving events with Step logs, and when
+    // a Run's detail was pruned.
+    "
+    ALTER TABLE run_events ADD COLUMN ts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE runs ADD COLUMN pruned_at INTEGER;
+",
 ];
 
 #[derive(Clone)]
@@ -140,6 +146,33 @@ pub struct Reusable {
     pub verdict: Verdict,
     pub reason: Option<String>,
     pub outputs: Outputs,
+}
+
+/// One journal event as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub seq: u64,
+    /// Milliseconds since the epoch, 0 for events from before timestamps.
+    pub ts: i64,
+    pub event: String,
+}
+
+/// A Run whose detail is still on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnprunedRun {
+    pub id: RunId,
+    /// Seconds since the epoch. `None` while the Run is going.
+    pub ended_at: Option<i64>,
+    /// The newest Run of its PR.
+    pub latest: bool,
+    /// The PR is one of the developer's open PRs.
+    pub pr_open: bool,
+    /// The PR is open and watched.
+    pub pr_watched: bool,
+    /// What the Run's event journal takes in the database.
+    pub journal_bytes: u64,
+    /// A Run whose detail is kept reuses one of this Run's Outcomes.
+    pub reused: bool,
 }
 
 /// A Run that hasn't ended, as the store keeps it.
@@ -670,6 +703,18 @@ impl Store {
         rows.collect()
     }
 
+    /// The latest attempt of the Run's `step`, or `None` if the Run has
+    /// no such Step.
+    pub fn step_attempt(&self, run: RunId, step: &str) -> Result<Option<u32>, StoreError> {
+        self.db()
+            .query_row(
+                "SELECT attempt FROM run_steps WHERE run_id = ?1 AND step = ?2",
+                params![run.0 as i64, step],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
     pub fn run_exists(&self, run: RunId) -> Result<bool, StoreError> {
         self.db()
             .query_row(
@@ -682,31 +727,105 @@ impl Store {
     }
 
     /// Appends to the Run's event journal and returns the event's sequence
-    /// number, counting from 1.
-    pub fn append_event(&self, run: RunId, event: &str) -> Result<u64, StoreError> {
+    /// number, counting from 1. `ts` is in milliseconds since the epoch.
+    pub fn append_event(&self, run: RunId, ts: i64, event: &str) -> Result<u64, StoreError> {
         let db = self.db();
         let tx = db.unchecked_transaction()?;
-        let seq: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
-            params![run.0 as i64],
-            |row| row.get(0),
-        )?;
-        tx.execute(
-            "INSERT INTO run_events (run_id, seq, event) VALUES (?1, ?2, ?3)",
-            params![run.0 as i64, seq, event],
-        )?;
+        let seq = append_event(&tx, run, ts, event)?;
         tx.commit()?;
-        Ok(seq as u64)
+        Ok(seq)
     }
 
-    /// The Run's journal after sequence number `after`, in order.
-    pub fn events_after(&self, run: RunId, after: u64) -> Result<Vec<(u64, String)>, StoreError> {
+    /// The Run's journal after sequence number `after`, in order, with
+    /// each event's timestamp.
+    pub fn events_after(&self, run: RunId, after: u64) -> Result<Vec<StoredEvent>, StoreError> {
         let db = self.db();
         let mut query = db.prepare(
-            "SELECT seq, event FROM run_events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq",
+            "SELECT seq, ts, event FROM run_events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq",
         )?;
         let rows = query.query_map(params![run.0 as i64, after as i64], |row| {
-            Ok((row.get::<_, i64>(0)? as u64, row.get(1)?))
+            Ok(StoredEvent {
+                seq: row.get::<_, i64>(0)? as u64,
+                ts: row.get(1)?,
+                event: row.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Prunes a Run's journal: keeps only the events in `keep`, appends
+    /// `pruned`, and marks the Run pruned at `at`, in seconds.
+    pub fn prune_journal(
+        &self,
+        run: RunId,
+        keep: &[u64],
+        ts: i64,
+        pruned: &str,
+        at: i64,
+    ) -> Result<u64, StoreError> {
+        let db = self.db();
+        let tx = db.unchecked_transaction()?;
+        // The pruned event numbers on from the last event ever journalled,
+        // which may be among those deleted.
+        let seq = append_event(&tx, run, ts, pruned)?;
+        let mut kept = tx.prepare("SELECT seq FROM run_events WHERE run_id = ?1")?;
+        let all: Vec<i64> = kept
+            .query_map(params![run.0 as i64], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        drop(kept);
+        for old in all {
+            if old as u64 != seq && !keep.contains(&(old as u64)) {
+                tx.execute(
+                    "DELETE FROM run_events WHERE run_id = ?1 AND seq = ?2",
+                    params![run.0 as i64, old],
+                )?;
+            }
+        }
+        tx.execute(
+            "UPDATE runs SET pruned_at = ?2 WHERE id = ?1",
+            params![run.0 as i64, at],
+        )?;
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// When the Run's detail was pruned, in seconds, if it was.
+    pub fn pruned_at(&self, run: RunId) -> Result<Option<i64>, StoreError> {
+        self.db()
+            .query_row(
+                "SELECT pruned_at FROM runs WHERE id = ?1",
+                params![run.0 as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+    }
+
+    /// Every Run whose detail hasn't been pruned, oldest first, with what
+    /// retention needs to know about it.
+    pub fn unpruned_runs(&self) -> Result<Vec<UnprunedRun>, StoreError> {
+        let db = self.db();
+        let mut query = db.prepare(
+            "SELECT r.id, r.ended_at,
+                    r.id = (SELECT MAX(id) FROM runs l WHERE l.repo = r.repo AND l.number = r.number),
+                    p.labeled,
+                    (SELECT COALESCE(SUM(LENGTH(event)), 0) FROM run_events e WHERE e.run_id = r.id),
+                    EXISTS (SELECT 1 FROM run_steps s JOIN runs k ON k.id = s.run_id
+                            WHERE s.reused_from = r.id AND k.id != r.id AND k.pruned_at IS NULL)
+             FROM runs r LEFT JOIN prs p ON p.repo = r.repo AND p.number = r.number
+             WHERE r.pruned_at IS NULL ORDER BY r.id",
+        )?;
+        let rows = query.query_map([], |row| {
+            let labeled: Option<bool> = row.get(3)?;
+            Ok(UnprunedRun {
+                id: RunId(row.get::<_, i64>(0)? as u64),
+                ended_at: row.get(1)?,
+                latest: row.get(2)?,
+                pr_open: labeled.is_some(),
+                pr_watched: labeled.unwrap_or(false),
+                journal_bytes: row.get::<_, i64>(4)? as u64,
+                reused: row.get(5)?,
+            })
         })?;
         rows.collect()
     }
@@ -731,6 +850,19 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn append_event(db: &Connection, run: RunId, ts: i64, event: &str) -> Result<u64, StoreError> {
+    let seq: i64 = db.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
+        params![run.0 as i64],
+        |row| row.get(0),
+    )?;
+    db.execute(
+        "INSERT INTO run_events (run_id, seq, ts, event) VALUES (?1, ?2, ?3, ?4)",
+        params![run.0 as i64, seq, ts, event],
+    )?;
+    Ok(seq as u64)
 }
 
 /// A [`StepRow`]'s state as `run_steps` columns.
@@ -918,11 +1050,50 @@ mod tests {
         let first = store.insert_run(&new_run(&repo, "aaa"), 1).unwrap();
         let second = store.insert_run(&new_run(&repo, "bbb"), 1).unwrap();
 
-        assert_eq!(store.append_event(first, "a").unwrap(), 1);
-        assert_eq!(store.append_event(first, "b").unwrap(), 2);
-        assert_eq!(store.append_event(second, "c").unwrap(), 1);
+        assert_eq!(store.append_event(first, 10, "a").unwrap(), 1);
+        assert_eq!(store.append_event(first, 20, "b").unwrap(), 2);
+        assert_eq!(store.append_event(second, 30, "c").unwrap(), 1);
 
-        assert_eq!(store.events_after(first, 1).unwrap(), [(2, "b".to_owned())]);
+        assert_eq!(
+            store.events_after(first, 1).unwrap(),
+            [StoredEvent {
+                seq: 2,
+                ts: 20,
+                event: "b".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn pruning_a_journal_keeps_the_listed_events_and_numbers_on() {
+        let store = Store::in_memory();
+        let repo = RepoName::new("o", "r");
+        let run = store.insert_run(&new_run(&repo, "aaa"), 1).unwrap();
+        for event in ["a", "b", "c", "d"] {
+            store.append_event(run, 1, event).unwrap();
+        }
+        assert_eq!(store.pruned_at(run).unwrap(), None);
+        assert_eq!(store.unpruned_runs().unwrap().len(), 1);
+
+        let seq = store.prune_journal(run, &[1, 3], 5, "pruned", 99).unwrap();
+
+        assert_eq!(seq, 5);
+        let left: Vec<_> = store
+            .events_after(run, 0)
+            .unwrap()
+            .into_iter()
+            .map(|stored| (stored.seq, stored.event))
+            .collect();
+        assert_eq!(
+            left,
+            [
+                (1, "a".to_owned()),
+                (3, "c".to_owned()),
+                (5, "pruned".to_owned())
+            ]
+        );
+        assert_eq!(store.pruned_at(run).unwrap(), Some(99));
+        assert!(store.unpruned_runs().unwrap().is_empty());
     }
 
     fn running(attempt: u32) -> StepRow {

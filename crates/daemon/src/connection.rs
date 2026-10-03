@@ -3,15 +3,16 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use slopwatch_protocol::{
-    ClientFrame, Command, ErrorBody, ErrorCode, Reply, Request, RequestId, Response, ResponseBody,
-    RunEvent, RunId, ServerFrame, Topic, TopicUpdate, WatchedPrsDelta, WatchedPrsUpdate,
+    ClientFrame, Command, ErrorBody, ErrorCode, LogKey, LogRecord, Reply, Request, RequestId,
+    Response, ResponseBody, RunId, ServerFrame, Topic, TopicUpdate, WatchedPrsDelta,
+    WatchedPrsUpdate,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
-use crate::runs::{Live, RunError, Runs, SubscribeError};
+use crate::runs::{Journalled, Live, LiveLog, LogError, RunError, Runs, SubscribeError};
 use crate::{Daemon, LibraryError, Peer, Subscription, WatchError};
 
 /// How long a client gets to send its hello before the daemon hangs up.
@@ -25,6 +26,10 @@ struct Subscriptions {
     runs: HashMap<RunId, u64>,
     /// Events appended to any Run. Only subscribed Runs' get through.
     live: Option<Live>,
+    /// Each subscribed Step log, with the last record sent from it.
+    logs: HashMap<LogKey, u64>,
+    /// Records written to any Step log. Only subscribed logs' get through.
+    live_logs: Option<LiveLog>,
 }
 
 /// What a subscription has next.
@@ -32,9 +37,12 @@ enum Next {
     WatchedPrs(u64, WatchedPrsDelta),
     /// The subscriber fell behind on `watched_prs` and lost deltas.
     WatchedPrsLagged,
-    Run(RunId, u64, RunEvent),
+    Run(RunId, Journalled),
     /// The subscriber fell behind on Run events. The journal has them.
     RunsLagged,
+    Log(LogKey, LogRecord),
+    /// The subscriber fell behind on Step logs. The files have them.
+    LogsLagged,
     Nothing,
 }
 
@@ -71,7 +79,7 @@ impl Daemon {
                     };
                     let result = match command {
                         Command::Subscribe { topic, since } => {
-                            match self.subscribe(topic, since, &mut subs) {
+                            match self.subscribe(topic, since, &mut subs).await {
                                 Ok(frames) => {
                                     for frame in frames {
                                         send(&mut ws, &frame).await?;
@@ -91,6 +99,12 @@ impl Daemon {
                                         subs.live = None;
                                     }
                                 }
+                                Topic::StepLog(key) => {
+                                    subs.logs.remove(&key);
+                                    if subs.logs.is_empty() {
+                                        subs.live_logs = None;
+                                    }
+                                }
                             }
                             ResponseBody::Ok(Reply::Done)
                         }
@@ -104,7 +118,7 @@ impl Daemon {
                         if matches!(next, Next::Nothing) {
                             break;
                         }
-                        for frame in self.frames(next, &mut subs) {
+                        for frame in self.frames(next, &mut subs).await {
                             send(&mut ws, &frame).await?;
                         }
                     }
@@ -115,7 +129,7 @@ impl Daemon {
                     }
                 }
                 next = recv(&mut subs) => {
-                    for frame in self.frames(next, &mut subs) {
+                    for frame in self.frames(next, &mut subs).await {
                         send(&mut ws, &frame).await?;
                     }
                 }
@@ -125,7 +139,7 @@ impl Daemon {
 
     /// Starts or restarts a subscription and returns the frames due now:
     /// the `watched_prs` snapshot, or a Run's events after `since`.
-    fn subscribe(
+    async fn subscribe(
         &self,
         topic: Topic,
         since: Option<u64>,
@@ -151,8 +165,24 @@ impl Daemon {
                 subs.runs.insert(run, since);
                 Ok(events
                     .into_iter()
-                    .filter_map(|(seq, event)| run_frame(subs, run, seq, event))
+                    .filter_map(|event| run_frame(subs, run, event))
                     .collect())
+            }
+            Topic::StepLog(key) => {
+                let Some(runs) = &self.runs else {
+                    return Err(ErrorBody {
+                        code: ErrorCode::NotFound,
+                        message: format!("Not found: Run {}", key.run),
+                    });
+                };
+                let since = since.unwrap_or(0);
+                let (records, live) = runs
+                    .subscribe_log(&key, since)
+                    .await
+                    .map_err(ErrorBody::from)?;
+                subs.live_logs.get_or_insert(live);
+                subs.logs.insert(key.clone(), since);
+                Ok(log_frame(subs, key, records).into_iter().collect())
             }
         }
     }
@@ -173,14 +203,41 @@ impl Daemon {
     /// The frames for `next`. A subscriber that fell too far behind to
     /// catch up starts over: from a fresh snapshot on `watched_prs`, and
     /// from the journal on a Run.
-    fn frames(&self, next: Next, subs: &mut Subscriptions) -> Vec<ServerFrame> {
+    async fn frames(&self, next: Next, subs: &mut Subscriptions) -> Vec<ServerFrame> {
         match next {
             Next::WatchedPrs(seq, delta) => vec![ServerFrame::Topic(TopicUpdate::WatchedPrs {
                 seq,
                 update: WatchedPrsUpdate::Delta(delta),
             })],
             Next::WatchedPrsLagged => vec![self.subscribe_watched_prs(subs)],
-            Next::Run(run, seq, event) => run_frame(subs, run, seq, event).into_iter().collect(),
+            Next::Run(run, event) => run_frame(subs, run, event).into_iter().collect(),
+            Next::Log(key, record) => log_frame(subs, key, vec![record]).into_iter().collect(),
+            Next::LogsLagged => {
+                subs.live_logs = None;
+                let mut frames = Vec::new();
+                let Some(runs) = &self.runs else {
+                    return frames;
+                };
+                let subscribed: Vec<(LogKey, u64)> = subs
+                    .logs
+                    .iter()
+                    .map(|(key, &last)| (key.clone(), last))
+                    .collect();
+                for (key, last) in subscribed {
+                    match runs.subscribe_log(&key, last).await {
+                        Ok((records, live)) => {
+                            subs.live_logs.get_or_insert(live);
+                            frames.extend(log_frame(subs, key, records));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "slopwatchd: can't catch a client up on log {key}: {error:?}"
+                            );
+                        }
+                    }
+                }
+                frames
+            }
             Next::RunsLagged => {
                 subs.live = None;
                 let mut frames = Vec::new();
@@ -196,7 +253,7 @@ impl Daemon {
                             frames.extend(
                                 events
                                     .into_iter()
-                                    .filter_map(|(seq, event)| run_frame(subs, run, seq, event)),
+                                    .filter_map(|event| run_frame(subs, run, event)),
                             );
                         }
                         Err(error) => {
@@ -297,6 +354,15 @@ impl Daemon {
                     Err(error) => Err(error),
                 });
             }
+            Command::ReadStepLog { key, page, filter } => {
+                let Some(runs) = &self.runs else {
+                    return ResponseBody::Error(ErrorBody {
+                        code: ErrorCode::NotFound,
+                        message: format!("Not found: Run {}", key.run),
+                    });
+                };
+                return respond(runs.read_log(key, page, filter).await.map(Reply::StepLog));
+            }
         };
         if changes_prs {
             // What changed, even with a failed poll, may start or end a Run.
@@ -317,22 +383,34 @@ impl Daemon {
 
 /// The frame for a Run event, if the connection subscribed to the Run and
 /// hasn't had the event yet.
-fn run_frame(
-    subs: &mut Subscriptions,
-    run: RunId,
-    seq: u64,
-    event: RunEvent,
-) -> Option<ServerFrame> {
+fn run_frame(subs: &mut Subscriptions, run: RunId, event: Journalled) -> Option<ServerFrame> {
     let last = subs.runs.get_mut(&run)?;
-    if seq <= *last {
+    if event.seq <= *last {
         return None;
     }
-    *last = seq;
+    *last = event.seq;
     Some(ServerFrame::Topic(TopicUpdate::Run {
         id: run,
-        seq,
-        event,
+        seq: event.seq,
+        ts: event.ts,
+        event: event.event,
     }))
+}
+
+/// The frame for Step log records, holding the ones the connection
+/// subscribed to and hasn't had yet.
+fn log_frame(
+    subs: &mut Subscriptions,
+    key: LogKey,
+    records: Vec<LogRecord>,
+) -> Option<ServerFrame> {
+    let last = subs.logs.get_mut(&key)?;
+    let records: Vec<LogRecord> = records
+        .into_iter()
+        .filter(|record| record.seq > *last)
+        .collect();
+    *last = records.last()?.seq;
+    Some(ServerFrame::Topic(TopicUpdate::StepLog { key, records }))
 }
 
 fn run_not_found(run: RunId) -> ErrorBody {
@@ -353,8 +431,15 @@ fn try_next(subs: &mut Subscriptions) -> Next {
     }
     if let Some(live) = &mut subs.live {
         match live.try_recv() {
-            Ok((run, seq, event)) => return Next::Run(run, seq, event),
+            Ok((run, event)) => return Next::Run(run, event),
             Err(broadcast::error::TryRecvError::Lagged(_)) => return Next::RunsLagged,
+            Err(_) => {}
+        }
+    }
+    if let Some(live) = &mut subs.live_logs {
+        match live.try_recv() {
+            Ok((key, record)) => return Next::Log(key, record),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => return Next::LogsLagged,
             Err(_) => {}
         }
     }
@@ -365,7 +450,10 @@ fn try_next(subs: &mut Subscriptions) -> Next {
 /// subscribed to anything.
 async fn recv(subs: &mut Subscriptions) -> Next {
     let Subscriptions {
-        watched_prs, live, ..
+        watched_prs,
+        live,
+        live_logs,
+        ..
     } = subs;
     tokio::select! {
         received = async {
@@ -384,8 +472,18 @@ async fn recv(subs: &mut Subscriptions) -> Next {
                 None => std::future::pending().await,
             }
         } => match received {
-            Ok((run, seq, event)) => Next::Run(run, seq, event),
+            Ok((run, event)) => Next::Run(run, event),
             Err(broadcast::error::RecvError::Lagged(_)) => Next::RunsLagged,
+            Err(broadcast::error::RecvError::Closed) => Next::Nothing,
+        },
+        received = async {
+            match live_logs {
+                Some(live) => live.recv().await,
+                None => std::future::pending().await,
+            }
+        } => match received {
+            Ok((key, record)) => Next::Log(key, record),
+            Err(broadcast::error::RecvError::Lagged(_)) => Next::LogsLagged,
             Err(broadcast::error::RecvError::Closed) => Next::Nothing,
         },
     }
@@ -415,6 +513,21 @@ impl From<RunError> for ErrorBody {
             RunError::NotFound(message) => (ErrorCode::NotFound, message),
             RunError::Invalid(message) => (ErrorCode::Invalid, message),
             RunError::Store(error) => (ErrorCode::Internal, format!("Database error: {error}")),
+        };
+        ErrorBody { code, message }
+    }
+}
+
+impl From<LogError> for ErrorBody {
+    fn from(error: LogError) -> Self {
+        let (code, message) = match error {
+            LogError::NotFound(what) => (ErrorCode::NotFound, format!("Not found: {what}")),
+            LogError::Pruned(at) => (
+                ErrorCode::NotFound,
+                format!("The Run's detail was pruned at {at}, and its Step logs with it"),
+            ),
+            LogError::Store(error) => (ErrorCode::Internal, format!("Database error: {error}")),
+            LogError::Io(error) => (ErrorCode::Internal, format!("Can't read the log: {error}")),
         };
         ErrorBody { code, message }
     }
