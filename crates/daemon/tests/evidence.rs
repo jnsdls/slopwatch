@@ -108,6 +108,15 @@ impl Harness {
         };
         let (m, p, a) = script("judge", vec![PR_DIFF.to_owned()]);
         let (plain_m, plain_p, plain_a) = script("plain", vec![]);
+        for manifest in [&m, &plain_m] {
+            store
+                .put_approval(&slopwatch_daemon::approvals::Approval::granting(
+                    manifest,
+                    slopwatch_protocol::Actor::Developer { via: "test".into() },
+                    0,
+                ))
+                .unwrap();
+        }
         let plugins = Plugins::new(env!("CARGO_BIN_EXE_slopwatchd"), Arc::clone(&library))
             .with_plugin(m, p, a)
             .with_plugin(plain_m, plain_p, plain_a);

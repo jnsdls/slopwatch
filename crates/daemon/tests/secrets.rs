@@ -121,8 +121,8 @@ struct Harness {
 
 impl Harness {
     /// My labelled PRs `prs` in `jnsdls/app`, with `pipeline` on main. The
-    /// `script` Plugin requires `TEST_SECRET`, approved when `approved`;
-    /// `plain` asks for no Secret.
+    /// `script` Plugin requires `TEST_SECRET`, which its Approval covers
+    /// when `approved`; `plain` asks for no Secret.
     fn new(pipeline: &str, prs: &[u64], approved: bool) -> Self {
         let github = Arc::new(FakeGitHub::new("me"));
         github.add_repo(&repo());
@@ -134,14 +134,17 @@ impl Harness {
         let data = tempfile::tempdir().unwrap();
         let control = tempfile::tempdir().unwrap();
         let store = Store::open(&data.path().join("state.db")).unwrap();
-        if approved {
+        for (plugin, secrets) in [
+            ("script", if approved { vec![NAME.into()] } else { vec![] }),
+            ("plain", vec![]),
+        ] {
             store
                 .put_approval(&Approval {
-                    plugin: "script".into(),
+                    plugin: plugin.into(),
                     grant: Grant {
                         workspace: Workspace::None,
                         effects: vec![],
-                        secrets: vec![NAME.into()],
+                        secrets,
                     },
                     actor: None,
                     approved_at: 0,
@@ -646,7 +649,7 @@ async fn a_steps_log_and_outcome_never_hold_a_value_it_received_even_when_it_ech
 }
 
 #[tokio::test]
-async fn a_secret_the_plugins_approval_doesnt_cover_errors_the_step_without_a_cause() {
+async fn a_secret_the_plugins_approval_doesnt_cover_holds_the_pr_on_the_plugins_entry() {
     let harness = Harness::new(&needs_secret(), &[1], false);
     let mut client = Client::connect(&harness.daemon).await;
     client.set(VALUE).await;
@@ -657,12 +660,24 @@ async fn a_secret_the_plugins_approval_doesnt_cover_errors_the_step_without_a_ca
         .until("the Run to end", |c| c.end(run).is_some())
         .await;
 
+    // The manifest asks for more than the Approval covers, which is the
+    // Plugin's Approval to renew (ADR 0012), not a Secret to set.
     assert_eq!(
         client.reason(run, "check").as_deref(),
-        Some("error(secret ungranted): Plugin `script` has no Approval for `TEST_SECRET`")
+        Some(
+            "error(plugin unapproved): Plugin `script` now asks for Secret `TEST_SECRET`, \
+             which its Approval doesn't cover"
+        )
     );
     assert_eq!(client.inbox.count(), 1);
-    assert_eq!(client.inbox.entries[0].scope, Scope::Pr);
+    assert_eq!(
+        client.inbox.entries[0].scope,
+        Scope::Cause {
+            cause: Cause::UnapprovedPlugin {
+                plugin: "script".into()
+            }
+        }
+    );
     assert!(
         !std::fs::exists(harness.control.join(format!("{run}-check.secret.1"))).unwrap(),
         "the Step never spawned"

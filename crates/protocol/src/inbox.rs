@@ -117,6 +117,10 @@ pub enum Cause {
     /// No value is set for the Secret `name`, which a Step requires. It
     /// clears once the developer sets it.
     MissingSecret { name: String },
+    /// The Plugin `plugin` has no Approval, or its manifest asks for more
+    /// than its Approval covers (ADR 0012). It clears once the developer
+    /// approves it.
+    UnapprovedPlugin { plugin: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

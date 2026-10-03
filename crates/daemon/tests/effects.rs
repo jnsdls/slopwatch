@@ -124,6 +124,13 @@ done
                 "effects": ["comment", "label"],
             }))
             .unwrap();
+            store
+                .put_approval(&slopwatch_daemon::approvals::Approval::granting(
+                    &manifest,
+                    slopwatch_protocol::Actor::Developer { via: "test".into() },
+                    0,
+                ))
+                .unwrap();
             let plugins = Plugins::new(env!("CARGO_BIN_EXE_slopwatchd"), Arc::clone(&library))
                 .with_plugin(manifest, self.poster(), vec!["run".into()]);
             let runs = Runs::start(

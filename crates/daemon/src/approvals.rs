@@ -4,41 +4,91 @@
 //! Plugin's manifest asked for when it was approved. It is the Secret
 //! grant: a Step gets a Secret only when its Plugin's Approval names it.
 //! Built-in Plugins ship approved through the same record, written again
-//! from their manifests each time the daemon starts. Nothing approves a
-//! third-party Plugin yet, so only built-ins and tests have Approvals.
+//! from their manifests each time the daemon starts. The developer
+//! approves a third-party Plugin from the Plugins list, and the Approval
+//! keeps through rebuilds until a manifest asks for more.
 
-use serde::{Deserialize, Serialize};
-use slopwatch_core::Workspace;
-use slopwatch_protocol::Actor;
-use slopwatch_protocol::step::{EffectKind, Manifest};
+use slopwatch_protocol::step::Manifest;
+use slopwatch_protocol::{Actor, Cause};
 
-/// What an Approval lets a Plugin have.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Grant {
-    pub workspace: Workspace,
-    #[serde(default)]
-    pub effects: Vec<EffectKind>,
-    /// Secret names.
-    #[serde(default)]
-    pub secrets: Vec<String>,
+pub use slopwatch_protocol::Grant;
+
+/// How a Step errors when its Plugin has no Approval, or its manifest
+/// asks for more than the Approval covers. A shared Inbox entry per
+/// Plugin holds its PR back.
+const PLUGIN_UNAPPROVED: &str = "error(plugin unapproved)";
+
+/// Why a Plugin can't run: it has no Approval, or its manifest asks for
+/// more than its Approval covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unapproved {
+    pub plugin: String,
+    /// What the manifest asks for beyond its Approval, one phrase each.
+    /// `None` when it was never approved.
+    pub more: Option<Vec<String>>,
 }
 
-impl Grant {
-    /// Everything `manifest` asks for.
-    pub fn of(manifest: &Manifest) -> Self {
-        Self {
-            workspace: manifest.workspace,
-            effects: manifest.effects.clone(),
-            secrets: manifest
-                .secrets
-                .iter()
-                .map(|spec| spec.name.clone())
-                .collect(),
+impl Unapproved {
+    /// Whether `plugin` may run under `approval` with what its manifest
+    /// `asks` for. `None` when it may.
+    pub fn check(plugin: &str, asks: &Grant, approval: Option<&Approval>) -> Option<Self> {
+        let more = match approval {
+            None => None,
+            Some(approval) => {
+                let more = approval.grant.beyond(asks);
+                if more.is_empty() {
+                    return None;
+                }
+                Some(more)
+            }
+        };
+        Some(Self {
+            plugin: plugin.to_owned(),
+            more,
+        })
+    }
+
+    /// What's wrong, after "Plugin `<name>`".
+    fn what(&self) -> String {
+        match &self.more {
+            None => "hasn't been approved".to_owned(),
+            Some(more) => format!(
+                "now asks for {}, which its Approval doesn't cover",
+                more.join(", ")
+            ),
         }
     }
 
-    pub fn covers_secret(&self, name: &str) -> bool {
-        self.secrets.iter().any(|granted| granted == name)
+    /// The error its Step settles with.
+    pub fn reason(&self) -> String {
+        format!(
+            "{PLUGIN_UNAPPROVED}: Plugin `{}` {}",
+            self.plugin,
+            self.what()
+        )
+    }
+
+    /// The line its Inbox entry shows.
+    pub fn summary(&self) -> String {
+        format!("Plugin `{}` {}", self.plugin, self.what())
+    }
+}
+
+/// Whether a Step's error came from its Plugin `plugin` lacking an
+/// Approval.
+pub fn unapproved_plugin(reason: &str, plugin: &str) -> bool {
+    reason.starts_with(&format!("{PLUGIN_UNAPPROVED}: Plugin `{plugin}`"))
+}
+
+/// Whether a Step's error is one an unapproved Plugin's entry explains.
+pub fn held_by_approval(reason: &str) -> bool {
+    reason.starts_with(PLUGIN_UNAPPROVED)
+}
+
+/// The shared cause an unapproved Plugin holds PRs back on.
+pub fn cause(plugin: &str) -> Cause {
+    Cause::UnapprovedPlugin {
+        plugin: plugin.to_owned(),
     }
 }
 
@@ -63,13 +113,22 @@ impl Approval {
             approved_at: now,
         }
     }
+
+    /// `actor`'s Approval of everything `manifest` asks for.
+    pub fn granting(manifest: &Manifest, actor: Actor, now: i64) -> Self {
+        Self {
+            actor: Some(actor),
+            ..Self::builtin(manifest, now)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Store;
-    use slopwatch_protocol::step::{STEP_DIALECT, SecretSpec};
+    use slopwatch_core::Workspace;
+    use slopwatch_protocol::step::{EffectKind, STEP_DIALECT, SecretSpec};
 
     fn manifest() -> Manifest {
         Manifest {
@@ -98,6 +157,28 @@ mod tests {
         assert!(approval.grant.covers_secret("EXTRA"));
         assert!(!approval.grant.covers_secret("OTHER"));
         assert_eq!(approval.actor, None);
+    }
+
+    #[test]
+    fn a_plugin_runs_only_under_an_approval_that_covers_what_it_asks() {
+        let asks = Grant::of(&manifest());
+        let mut approval = Approval::builtin(&manifest(), 10);
+
+        assert_eq!(Unapproved::check("jev", &asks, Some(&approval)), None);
+        let none = Unapproved::check("jev", &asks, None).unwrap().reason();
+        assert!(unapproved_plugin(&none, "jev"));
+        assert!(!unapproved_plugin(&none, "je"));
+        assert!(held_by_approval(&none));
+
+        approval.grant.secrets = vec!["JEV_API_KEY".into()];
+        approval.grant.effects.clear();
+        assert_eq!(
+            Unapproved::check("jev", &asks, Some(&approval))
+                .unwrap()
+                .reason(),
+            "error(plugin unapproved): Plugin `jev` now asks for the `comment` Effect, \
+             Secret `EXTRA`, which its Approval doesn't cover"
+        );
     }
 
     #[test]

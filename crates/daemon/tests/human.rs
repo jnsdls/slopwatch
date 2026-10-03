@@ -184,6 +184,13 @@ fn daemon(github: &Arc<FakeGitHub>, store: &Store, data: &Path, control: &Path) 
         "script".to_owned(),
         control.to_str().unwrap().to_owned(),
     ];
+    store
+        .put_approval(&slopwatch_daemon::approvals::Approval::granting(
+            &manifest(),
+            slopwatch_protocol::Actor::Developer { via: "test".into() },
+            0,
+        ))
+        .unwrap();
     let plugins = Plugins::new(env!("CARGO_BIN_EXE_slopwatchd"), Arc::clone(&library)).with_plugin(
         manifest(),
         PathBuf::from("/bin/sh"),

@@ -112,6 +112,13 @@ fn daemon(github: &Arc<FakeGitHub>, data: &Path) -> (Arc<Daemon>, Arc<Runs>) {
     let watching = Arc::new(Watching::new(store.clone(), Arc::clone(&dyn_github)).unwrap());
     let library = Arc::new(Library::open(data.join("steps")).unwrap());
     let args = vec!["-c".to_owned(), SCRIPT.to_owned(), "script".to_owned()];
+    store
+        .put_approval(&slopwatch_daemon::approvals::Approval::granting(
+            &manifest(),
+            slopwatch_protocol::Actor::Developer { via: "test".into() },
+            0,
+        ))
+        .unwrap();
     let plugins = Plugins::new(env!("CARGO_BIN_EXE_slopwatchd"), Arc::clone(&library)).with_plugin(
         manifest(),
         PathBuf::from("/bin/sh"),

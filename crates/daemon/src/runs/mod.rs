@@ -64,18 +64,19 @@ use slopwatch_protocol::step::{
     PR_DIFF, PrSnapshot, Start, ToStep,
 };
 use slopwatch_protocol::{
-    Actor, Answer, Cause, Closing, GateTerm, LogFilter, LogKey, LogPage, LogRecord, PrRef,
-    RepoName, RunEvent, RunId, SecretInfo, SecretValue, StepInfo, StepLogPage, Waiver,
+    Actor, Answer, Cause, Closing, GateTerm, LogFilter, LogKey, LogPage, LogRecord, PluginListing,
+    PluginSettings, PrRef, RepoName, RunEvent, RunId, SecretInfo, SecretValue, StepInfo,
+    StepLogPage, Waiver,
 };
 use tokio::sync::mpsc;
 
-use crate::approvals::Approval;
+use crate::approvals::{self, Approval, Grant, Unapproved, unapproved_plugin};
 use crate::clones::{Clones, PipelineAt};
 use crate::github::{GitHub, GitHubError, OpenPr};
 use crate::inbox::Inbox;
 use crate::notifications::Notifications;
-use crate::plugins::{Plugins, human};
-use crate::secrets::{Keychain, Mask, SecretError, Secrets, held_by_cause, missing_secret};
+use crate::plugins::{NotApprovable, Plugins, human};
+use crate::secrets::{Keychain, Mask, SecretError, Secrets, held_by_secret, missing_secret};
 use crate::shell_env;
 use crate::store::{ActiveRun, NewRun, NewStep, StepRow, StepRowState, Store, StoreError};
 use crate::watching::{RunInfo, Watching};
@@ -127,6 +128,7 @@ pub struct Runs {
     inbox: Arc<Inbox>,
     notifications: Arc<Notifications>,
     secrets: Arc<Secrets>,
+    plugins: Arc<Plugins>,
 }
 
 /// Where Runs keep their files, and for how long.
@@ -134,6 +136,8 @@ pub struct RunsConfig {
     /// Clones under `repos/`, Step directories under `worktrees/`, Step
     /// logs under `logs/`.
     pub data_dir: PathBuf,
+    /// Built-in Plugins, and the third-party ones found so far. A
+    /// sync looks in the Plugins folder again.
     pub plugins: Plugins,
     /// The `PATH` the developer's login shell reports
     /// ([`shell_env::login_shell_path`]). Steps get the daemon's own `PATH`
@@ -220,6 +224,7 @@ impl Runs {
         for manifest in config.plugins.builtin_manifests() {
             store.put_approval(&Approval::builtin(&manifest, now()))?;
         }
+        let plugins = Arc::new(config.plugins.with_settings(store.plugin_settings()?));
         let secrets = Arc::new(Secrets::new(config.keychain, store.clone()));
         {
             let secrets = Arc::clone(&secrets);
@@ -230,7 +235,7 @@ impl Runs {
             inbox: Arc::clone(&inbox),
             notifications: Arc::clone(&notifications),
             data_dir: config.data_dir.clone(),
-            plugins: config.plugins,
+            plugins: Arc::clone(&plugins),
             step_path,
             ready: VecDeque::new(),
             processes: HashMap::new(),
@@ -267,6 +272,7 @@ impl Runs {
             inbox,
             notifications,
             secrets,
+            plugins,
         });
         let driver = Arc::clone(&runs);
         tokio::spawn(async move {
@@ -289,6 +295,9 @@ impl Runs {
     /// GitHub has answered for every repo since the daemon started, the
     /// PRs are only what the store kept, so nothing moves (ADR 0009).
     pub async fn sync(&self) {
+        // A Plugin dropped in or rebuilt since the last sync, before any
+        // Pipeline loads.
+        self.plugins.scan().await;
         let wanted = {
             let engine = self.engine.lock().await;
             if !engine.watching.fresh() {
@@ -449,6 +458,74 @@ impl Runs {
         self.on_secrets(move |secrets| secrets.delete(&name)).await
     }
 
+    /// Every Plugin, after looking in the Plugins folder again, with what
+    /// each asks for and what its Approval covers.
+    pub async fn list_plugins(&self) -> Result<Vec<PluginListing>, StoreError> {
+        self.plugins.scan().await;
+        Ok(self.plugins.listings(&self.store.approvals()?))
+    }
+
+    /// The developer approves the third-party Plugin `plugin` for
+    /// `grant`, what they saw it ask for. The Approval covers what the
+    /// manifest asks for now, so a `grant` that falls short of it, as
+    /// after a rebuild that asks for more, is refused. The Plugin's Inbox
+    /// entry clears, and the PRs it held start again.
+    pub async fn approve_plugin(
+        &self,
+        plugin: &str,
+        grant: &Grant,
+        actor: &Actor,
+    ) -> Result<(), RunError> {
+        let manifest = self.plugins.approvable(plugin).map_err(|why| match why {
+            NotApprovable::Builtin => {
+                RunError::Invalid(format!("`{plugin}` is built in and ships approved"))
+            }
+            NotApprovable::Failed(problem) => RunError::Invalid(format!(
+                "Plugin `{plugin}` didn't load, so it can't be approved: {problem}"
+            )),
+            NotApprovable::Unknown => RunError::NotFound(format!("No Plugin `{plugin}`")),
+        })?;
+        let asks = Grant::of(&manifest);
+        let unseen = grant.beyond(&asks);
+        if !unseen.is_empty() {
+            return Err(RunError::Invalid(format!(
+                "Plugin `{plugin}` now asks for {}, which this Approval didn't show. Look at it \
+                 again.",
+                unseen.join(", ")
+            )));
+        }
+        self.store.put_approval(&Approval {
+            plugin: plugin.to_owned(),
+            grant: asks,
+            actor: Some(actor.clone()),
+            approved_at: now(),
+        })?;
+        self.command(|engine| Ok(engine.plugin_approved(plugin)?))
+            .await
+    }
+
+    /// Replaces the developer's settings for `plugin`: `PATH` dirs put in
+    /// front for its `describe` and Steps, and a cap in place of its
+    /// manifest's.
+    pub async fn set_plugin_settings(
+        &self,
+        plugin: &str,
+        settings: PluginSettings,
+    ) -> Result<(), RunError> {
+        if let Some(problem) = settings.problem() {
+            return Err(RunError::Invalid(problem));
+        }
+        if !self.plugins.knows(plugin) {
+            return Err(RunError::NotFound(format!("No Plugin `{plugin}`")));
+        }
+        self.store.put_plugin_settings(plugin, &settings)?;
+        self.plugins.set_settings(plugin, settings);
+        // A new `PATH` may be what its `describe` lacked.
+        self.plugins.scan().await;
+        // A higher cap may free a Step waiting for a slot.
+        self.command(|_| Ok(())).await
+    }
+
     /// Runs `work` on the blocking pool, since it waits on the Keychain.
     async fn on_secrets(
         &self,
@@ -476,6 +553,11 @@ impl Runs {
     ) -> Result<(), RunError> {
         self.command(|engine| engine.answer_step(run, step, answer, note, actor))
             .await
+    }
+
+    /// The Plugins these Runs run, which a Pipeline draft resolves too.
+    pub fn plugins(&self) -> &Arc<Plugins> {
+        &self.plugins
     }
 
     /// The Inbox, which these Runs raise and close entries in.
@@ -691,7 +773,7 @@ struct Engine {
     secrets: Arc<Secrets>,
     inbox: Arc<Inbox>,
     notifications: Arc<Notifications>,
-    plugins: Plugins,
+    plugins: Arc<Plugins>,
     logs: log::Hub,
     journal: Arc<Journal>,
     watching: Arc<Watching>,
@@ -960,7 +1042,7 @@ impl Engine {
                     row.state = StepRowState::Interrupted { restarts };
                 }
             }
-            let pipeline = match load(&stored.pipeline, &self.plugins) {
+            let pipeline = match load(&stored.pipeline, &*self.plugins) {
                 Ok(pipeline) => pipeline,
                 Err(errors) => {
                     let reason = format!("the Pipeline no longer loads: {}", join(&errors));
@@ -1110,7 +1192,7 @@ impl Engine {
     /// Whether a Step in the Pipeline `text` asks for the PR's diff
     /// ([`PR_DIFF`]). A Pipeline that doesn't load asks for nothing.
     fn wants_diff(&self, text: &str) -> bool {
-        load(text, &self.plugins).is_ok_and(|pipeline| {
+        load(text, &*self.plugins).is_ok_and(|pipeline| {
             pipeline.steps().any(|step| {
                 self.plugins
                     .manifest(&step.plugin)
@@ -1239,6 +1321,7 @@ impl Engine {
             self.reconciled = true;
         }
         self.clear_set_secrets()?;
+        self.clear_approved_plugins()?;
 
         let gone: Vec<PrKey> = self
             .blocked
@@ -1265,7 +1348,7 @@ impl Engine {
             if let Some(invalid) = self.blocked.get(key).and_then(|b| b.invalid.as_ref())
                 && invalid.base_sha == pr.detail.base_sha
             {
-                if load(&invalid.text, &self.plugins).is_err() {
+                if load(&invalid.text, &*self.plugins).is_err() {
                     continue;
                 }
                 cleared = true;
@@ -1398,7 +1481,7 @@ impl Engine {
                 return self.unblock(&key, Closing::NothingHeld);
             }
         }
-        let pipeline = match load(&text, &self.plugins) {
+        let pipeline = match load(&text, &*self.plugins) {
             Ok(pipeline) => pipeline,
             Err(errors) => {
                 let message = format!("The Pipeline on {base} is invalid: {}", join(&errors));
@@ -1608,7 +1691,7 @@ impl Engine {
             for (step, decision) in plan.decisions {
                 match decision {
                     Decision::Start => {
-                        if self.reuse(key, &step)? {
+                        if self.hold_unapproved(key, &step)? || self.reuse(key, &step)? {
                             replan = true;
                             continue;
                         }
@@ -1660,7 +1743,8 @@ impl Engine {
         for step in run.pipeline.steps() {
             if run.state.steps.get(&step.id) == Some(&StepState::Settled(Verdict::Error)) {
                 let reason = run.reasons.get(&step.id).map_or("error", String::as_str);
-                // A missing Secret's shared entry already asks for it.
+                // A missing Secret's or an unapproved Plugin's shared
+                // entry already asks for it.
                 if held_by_cause(reason) {
                     continue;
                 }
@@ -1689,10 +1773,7 @@ impl Engine {
                 let Some(step) = self.run(*run).and_then(|run| run.pipeline.step(step)) else {
                     return true;
                 };
-                let cap = self
-                    .plugins
-                    .manifest(&step.plugin)
-                    .and_then(|manifest| manifest.concurrency);
+                let cap = self.plugins.cap(&step.plugin);
                 // A cap of 0 would hold the Plugin's Steps forever.
                 cap.is_none_or(|cap| {
                     let running = self.working().filter(|plugin| **plugin == step.plugin);
@@ -1761,6 +1842,14 @@ impl Engine {
             );
         };
 
+        if self.hold_unapproved(key, step_id)? {
+            return Ok(());
+        }
+        let run = self.active.get_mut(key).expect("only active Runs advance");
+        let step = run
+            .pipeline
+            .step(step_id)
+            .expect("the plan names Pipeline Steps");
         let manifest = self.plugins.manifest(&step.plugin);
         let handed = match self.secrets.for_step(&step.plugin, manifest.as_ref()) {
             Ok(handed) => handed,
@@ -1815,7 +1904,8 @@ impl Engine {
                 .filter_map(|id| Some((id.clone(), run.outcomes.get(&id)?.clone())))
                 .collect(),
         });
-        let mut env = step_env(run.id, step_id, &self.step_path);
+        let path = self.plugins.path(&step.plugin, &self.step_path);
+        let mut env = step_env(run.id, step_id, &path);
         env.extend(
             handed
                 .iter()
@@ -2358,33 +2448,51 @@ impl Engine {
     }
 
     /// The developer set the Secret `name`. Its Inbox entry clears, and
-    /// every PR it held starts again: a Run still going reruns the Steps
-    /// that missed it, and an ended latest Run gets a same-SHA Run.
+    /// every PR it held starts again.
     fn secret_set(&mut self, name: &str) -> Result<(), StoreError> {
+        let cause = Cause::MissingSecret {
+            name: name.to_owned(),
+        };
+        self.cause_cleared(cause, &|reason| missing_secret(reason, name))
+    }
+
+    /// The developer approved the Plugin `plugin`, or it left the Plugins
+    /// folder. Its Inbox entry clears, and every PR it held starts again.
+    fn plugin_approved(&mut self, plugin: &str) -> Result<(), StoreError> {
+        let cause = approvals::cause(plugin);
+        self.cause_cleared(cause, &|reason| unapproved_plugin(reason, plugin))
+    }
+
+    /// `cause` is cleared. Its Inbox entry closes, and every PR it held
+    /// starts again: a Run still going reruns the Steps that `missed`
+    /// picks out by their error, and an ended latest Run that has one gets
+    /// a same-SHA Run.
+    fn cause_cleared(
+        &mut self,
+        cause: Cause,
+        missed: &dyn Fn(&str) -> bool,
+    ) -> Result<(), StoreError> {
         // Until GitHub has answered since the start, no held PR can start
         // again, so the entry stays and the first sync clears it.
         if !self.watching.fresh() {
             return Ok(());
         }
-        let cause = Cause::MissingSecret {
-            name: name.to_owned(),
-        };
         let held = self.inbox.held_by(&cause);
         self.inbox.clear(cause)?;
         for pr in held {
             let key = (pr.repo.clone(), pr.number);
-            match self.restart_held(&key, name) {
+            match self.restart_held(&key, missed) {
                 Ok(()) => {}
                 Err(RunError::Store(error)) => return Err(error),
                 Err(RunError::NotFound(why) | RunError::Invalid(why)) => {
-                    eprintln!("slopwatchd: {pr} stays as it is after `{name}` was set: {why}");
+                    eprintln!("slopwatchd: {pr} stays as it is after its cause cleared: {why}");
                 }
             }
         }
         Ok(())
     }
 
-    fn restart_held(&mut self, key: &PrKey, name: &str) -> Result<(), RunError> {
+    fn restart_held(&mut self, key: &PrKey, missed: &dyn Fn(&str) -> bool) -> Result<(), RunError> {
         if let Some(run) = self.active.get(key) {
             let missed: Vec<String> = run
                 .pipeline
@@ -2394,7 +2502,7 @@ impl Engine {
                         && run
                             .reasons
                             .get(&step.id)
-                            .is_some_and(|reason| missing_secret(reason, name))
+                            .is_some_and(|reason| missed(reason))
                 })
                 .map(|step| step.id.clone())
                 .collect();
@@ -2416,14 +2524,14 @@ impl Engine {
             .store
             .run(latest)?
             .ok_or_else(|| RunError::NotFound(format!("No Run {latest}")))?;
-        let missed = stored.steps.iter().any(|row| {
+        let hit = stored.steps.iter().any(|row| {
             matches!(
                 &row.state,
                 StepRowState::Settled { verdict: Verdict::Error, reason: Some(reason), .. }
-                    if missing_secret(reason, name)
+                    if missed(reason)
             )
         });
-        if !missed {
+        if !hit {
             return Ok(());
         }
         let pr = self.same_sha_pr(&stored)?;
@@ -2441,6 +2549,72 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Clears the entries of Plugins approved by now, as when the daemon
+    /// stopped between an Approval and restarting what it held. A Plugin
+    /// that left the folder, or whose `describe` stopped loading, clears
+    /// too: no Approval can help it, and the held PRs' next Runs fail
+    /// their Pipeline's load, which raises that cause instead.
+    fn clear_approved_plugins(&mut self) -> Result<(), StoreError> {
+        for cause in self.inbox.open_causes() {
+            if let Cause::UnapprovedPlugin { plugin } = cause
+                && self.unapproved(&plugin)?.is_none()
+            {
+                self.plugin_approved(&plugin)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Why `plugin` can't run now for lack of an Approval, if it can't.
+    /// `None` too for a Plugin that isn't installed, which errors on its
+    /// own.
+    fn unapproved(&self, plugin: &str) -> Result<Option<Unapproved>, StoreError> {
+        let Some(manifest) = self.plugins.manifest(plugin) else {
+            return Ok(None);
+        };
+        let approvals = self.store.approvals()?;
+        let approval = approvals.iter().find(|approval| approval.plugin == plugin);
+        Ok(Unapproved::check(plugin, &Grant::of(&manifest), approval))
+    }
+
+    /// Errors the Step without spawning it if its Plugin's Approval
+    /// doesn't cover what its manifest asks for, and holds its PR on the
+    /// Plugin's shared entry (ADR 0012). Returns whether it did.
+    fn hold_unapproved(&mut self, key: &PrKey, step_id: &str) -> Result<bool, StoreError> {
+        let run = &self.active[key];
+        let plugin = run
+            .pipeline
+            .step(step_id)
+            .expect("the plan names Pipeline Steps")
+            .plugin
+            .clone();
+        let Some(unapproved) = self.unapproved(&plugin)? else {
+            return Ok(false);
+        };
+        let (pr, id) = (pr_ref(&run.repo, run.number), run.id);
+        self.inbox.hold(
+            approvals::cause(&plugin),
+            pr,
+            Some(id),
+            &format!("Plugin `{plugin}` needs approval"),
+            vec![
+                unapproved.summary(),
+                "Its Steps error until it's approved in the Plugins list. Approving it starts \
+                 the PRs it holds back again."
+                    .to_owned(),
+            ],
+        )?;
+        let reason = unapproved.reason();
+        self.settle(
+            key,
+            step_id,
+            Verdict::Error,
+            Some(reason),
+            Outputs::default(),
+        )?;
+        Ok(true)
     }
 
     /// The developer waives `what` in Run `id`. A Run that's still going
@@ -2475,7 +2649,7 @@ impl Engine {
             )),
             error => error,
         })?;
-        let pipeline = load(&stored.pipeline, &self.plugins).map_err(|errors| {
+        let pipeline = load(&stored.pipeline, &*self.plugins).map_err(|errors| {
             RunError::Invalid(format!(
                 "Run {id}'s Pipeline no longer loads: {}",
                 join(&errors)
@@ -2683,6 +2857,13 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(work)
         .await
         .unwrap_or_else(|error| Err(std::io::Error::other(error)))
+}
+
+/// Whether a Step's error is one a shared cause's entry explains, a
+/// missing Secret's or an unapproved Plugin's, so the developer hears of
+/// it there and not again on its Run or PR.
+fn held_by_cause(reason: &str) -> bool {
+    held_by_secret(reason) || approvals::held_by_approval(reason)
 }
 
 /// How a refusal to start a same-SHA Run on a PR whose head moved begins.
