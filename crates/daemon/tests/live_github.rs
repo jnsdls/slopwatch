@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use slopwatch_daemon::auth::GhToken;
+use slopwatch_daemon::clones::Clones;
 use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::api::Api;
 use slopwatch_protocol::RepoName;
@@ -74,4 +75,33 @@ async fn the_api_lists_labels_and_polls_a_real_repo() {
             .any(|pr| pr.labeled)
     );
     assert_eq!(poll.repos[1].prs, None);
+}
+
+#[tokio::test]
+#[ignore = "needs the network, a gh login and a scratch repo"]
+async fn a_blobless_clone_reads_the_pipeline_from_a_real_base_branch() {
+    let (repo, on_pipeline, _) = fixture();
+    let api = Api::new(Arc::new(GhToken::default()));
+    let poll = api.poll(std::slice::from_ref(&repo)).await.unwrap();
+    let pr = poll.repos[0]
+        .prs
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|pr| pr.number == on_pipeline)
+        .unwrap()
+        .clone();
+    let dir = tempfile::tempdir().unwrap();
+    let clones = Clones::new(dir.path());
+    let remote = api.git_remote(&repo).await.unwrap();
+
+    let read = clones.pipeline_at(&repo, &remote, &pr.base).await.unwrap();
+
+    assert_eq!(read.sha, pr.detail.base_sha);
+    assert!(read.text.is_some());
+    let config = std::fs::read_to_string(clones.path(&repo).join("config")).unwrap();
+    assert!(
+        !config.contains("AUTHORIZATION"),
+        "the token stays out of the clone"
+    );
 }

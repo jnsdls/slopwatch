@@ -68,6 +68,7 @@ impl Client {
         client
             .ok(Command::Subscribe {
                 topic: Topic::WatchedPrs,
+                since: None,
             })
             .await;
         assert!(client.seq.is_some(), "subscribing sends a snapshot");
@@ -96,7 +97,9 @@ impl Client {
     }
 
     fn apply(&mut self, update: TopicUpdate) {
-        let TopicUpdate::WatchedPrs { seq, update } = update;
+        let TopicUpdate::WatchedPrs { seq, update } = update else {
+            panic!("only subscribed to watched_prs, got {update:?}");
+        };
         match update {
             WatchedPrsUpdate::Snapshot(snapshot) => self.view = snapshot,
             WatchedPrsUpdate::Delta(delta) => {

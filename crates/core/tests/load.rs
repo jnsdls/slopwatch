@@ -411,3 +411,18 @@ fn rejects_needs_in_a_library_step() {
         errors[0]
     );
 }
+
+#[test]
+fn steps_list_after_what_they_need_and_the_gate_names_what_it_reads() {
+    let pipeline = load_ok(
+        "version: 1\nsteps:\n  review: { uses: claude, needs: [ci] }\n  ci: { uses: ci }\n  notes: { uses: jev }\ngate: [review, { or: [ci] }]\n",
+    );
+
+    let order: Vec<&str> = pipeline.ordered_steps().map(|s| s.id.as_str()).collect();
+    let at = |id: &str| order.iter().position(|s| *s == id).unwrap();
+    assert!(at("ci") < at("review"), "{order:?}");
+    assert_eq!(order.len(), 3);
+    assert!(pipeline.gate_reads("review"));
+    assert!(pipeline.gate_reads("ci"), "nested in or:");
+    assert!(!pipeline.gate_reads("notes"), "advisory");
+}

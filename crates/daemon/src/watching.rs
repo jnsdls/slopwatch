@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use slopwatch_protocol::{PollState, PrStatus, PullRequest, RepoName, WatchedPrs, WatchedPrsDelta};
+use slopwatch_protocol::{
+    PollState, PrStatus, PullRequest, RepoName, RunSummary, WatchedPrs, WatchedPrsDelta,
+};
 use tokio::sync::broadcast;
 
 use crate::github::{GitHub, GitHubError, OpenPr, Poll, RepoPoll};
@@ -35,9 +37,19 @@ struct State {
     store: Store,
     repos: Vec<RepoName>,
     prs: BTreeMap<(RepoName, u64), OpenPr>,
+    /// What Runs report for each PR, shown on its row.
+    runs: BTreeMap<(RepoName, u64), RunInfo>,
     poll: PollState,
     seq: u64,
     deltas: broadcast::Sender<(u64, WatchedPrsDelta)>,
+}
+
+/// A PR's Run history and what holds its next Run back, for its row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunInfo {
+    /// Newest first.
+    pub runs: Vec<RunSummary>,
+    pub blocked: Option<String>,
 }
 
 /// A subscriber's view of the topic: the state as of `seq`, then every
@@ -86,6 +98,7 @@ impl Watching {
                 store,
                 repos,
                 prs,
+                runs: BTreeMap::new(),
                 poll: PollState::Pending,
                 seq: 0,
                 deltas,
@@ -201,15 +214,32 @@ impl Watching {
         self.pace.lock().expect("no panics while holding the pace")
     }
 
-    /// Polls forever, at the pace the rate budget allows.
-    pub async fn run(self: Arc<Self>) {
-        loop {
-            if let Err(error) = self.poll().await {
-                eprintln!("slopwatchd: poll failed: {error:?}");
-            }
-            // No Runs exist yet, so nothing is ever live.
-            let next = self.pace().next_poll(Instant::now(), false);
-            tokio::time::sleep_until(next.into()).await;
+    /// When to poll next, at the pace the rate budget allows. `live` means
+    /// a Run is going.
+    pub fn next_poll(&self, live: bool) -> Instant {
+        self.pace().next_poll(Instant::now(), live)
+    }
+
+    /// Every open PR the daemon knows, with its repo.
+    pub fn prs(&self) -> Vec<(RepoName, OpenPr)> {
+        self.state()
+            .prs
+            .iter()
+            .map(|((repo, _), pr)| (repo.clone(), pr.clone()))
+            .collect()
+    }
+
+    /// Shows `info` on the PR's row.
+    pub fn set_run_info(&self, repo: &RepoName, number: u64, info: RunInfo) {
+        let mut state = self.state();
+        let key = (repo.clone(), number);
+        if state.runs.get(&key) == Some(&info) {
+            return;
+        }
+        state.runs.insert(key.clone(), info);
+        if let Some(pr) = state.prs.get(&key) {
+            let changed = state.row(repo, pr);
+            state.publish(WatchedPrsDelta::PrChanged { pr: changed });
         }
     }
 }
@@ -221,7 +251,7 @@ impl State {
             prs: self
                 .prs
                 .iter()
-                .map(|((repo, _), pr)| row(repo, pr))
+                .map(|((repo, _), pr)| self.row(repo, pr))
                 .collect(),
             poll: self.poll.clone(),
         }
@@ -240,16 +270,46 @@ impl State {
         }
     }
 
+    /// Stores `pr`, and publishes its row if what the row shows changed. A
+    /// poll often changes only detail, such as a check finishing.
     fn put(&mut self, repo: &RepoName, pr: OpenPr) -> Result<(), StoreError> {
         let key = (repo.clone(), pr.number);
-        if self.prs.get(&key) == Some(&pr) {
+        let old = self.prs.get(&key);
+        if old == Some(&pr) {
             return Ok(());
         }
+        let old_row = old.map(|old| self.row(repo, old));
         self.store.put_pr(repo, &pr)?;
-        let changed = row(repo, &pr);
+        let changed = self.row(repo, &pr);
         self.prs.insert(key, pr);
-        self.publish(WatchedPrsDelta::PrChanged { pr: changed });
+        if old_row.as_ref() != Some(&changed) {
+            self.publish(WatchedPrsDelta::PrChanged { pr: changed });
+        }
         Ok(())
+    }
+
+    fn row(&self, repo: &RepoName, pr: &OpenPr) -> PullRequest {
+        let info = self
+            .runs
+            .get(&(repo.clone(), pr.number))
+            .cloned()
+            .unwrap_or_default();
+        PullRequest {
+            repo: repo.clone(),
+            number: pr.number,
+            title: pr.title.clone(),
+            url: pr.url.clone(),
+            draft: pr.draft,
+            head_sha: pr.head_sha.clone(),
+            base: pr.base.clone(),
+            status: match (pr.labeled, pr.base_has_pipeline) {
+                (false, _) => PrStatus::NotWatched,
+                (true, false) => PrStatus::Waiting,
+                (true, true) => PrStatus::Ready,
+            },
+            runs: info.runs,
+            blocked: info.blocked,
+        }
     }
 
     /// Makes `repo`'s PRs exactly `prs`.
@@ -272,22 +332,5 @@ impl State {
             self.put(repo, pr)?;
         }
         Ok(())
-    }
-}
-
-fn row(repo: &RepoName, pr: &OpenPr) -> PullRequest {
-    PullRequest {
-        repo: repo.clone(),
-        number: pr.number,
-        title: pr.title.clone(),
-        url: pr.url.clone(),
-        draft: pr.draft,
-        head_sha: pr.head_sha.clone(),
-        base: pr.base.clone(),
-        status: match (pr.labeled, pr.base_has_pipeline) {
-            (false, _) => PrStatus::NotWatched,
-            (true, false) => PrStatus::Waiting,
-            (true, true) => PrStatus::Ready,
-        },
     }
 }

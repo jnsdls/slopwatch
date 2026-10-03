@@ -8,6 +8,8 @@
 
 mod flavor;
 mod frames;
+pub mod runs;
+pub mod step;
 mod topics;
 
 pub use flavor::{DATA_DIR_ENV, Flavor, socket_path};
@@ -15,6 +17,7 @@ pub use frames::{
     Actor, Auth, ClientFrame, ClientHello, Command, ErrorBody, ErrorCode, LibraryStep, Refusal,
     RefusalReason, Reply, Request, RequestId, Response, ResponseBody, ServerFrame, ServerHello,
 };
+pub use runs::{RunEvent, RunId, RunSummary, RunView, StepInfo, StepStatus, StepView};
 pub use topics::{
     PollState, PrStatus, PullRequest, RepoName, Topic, TopicUpdate, WatchedPrs, WatchedPrsDelta,
     WatchedPrsUpdate,
@@ -35,7 +38,10 @@ pub const DIALECT: u32 = 1;
 /// another build (ADR 0009).
 ///
 /// `library`: the commands that list, save and delete Library Steps.
-pub const FEATURES: &[&str] = &["watched_prs", "restart", "library"];
+///
+/// `runs`: Run history on `watched_prs` rows, the `run/<id>` topics, and
+/// `unsubscribe`.
+pub const FEATURES: &[&str] = &["watched_prs", "restart", "library", "runs"];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no
 /// host, so the host here is a placeholder the daemon ignores.

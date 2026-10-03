@@ -69,7 +69,8 @@ impl StepState {
 }
 
 /// What the Gate says. It is determined as early as its logic allows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum GateState {
     Pass,
     Fail,
@@ -82,6 +83,42 @@ impl fmt::Display for GateState {
             GateState::Pass => "pass",
             GateState::Fail => "fail",
             GateState::Pending => "pending",
+        })
+    }
+}
+
+/// Why a Run stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndReason {
+    /// The Merge Step merged the PR.
+    Merged,
+    /// The Gate passed and the Pipeline has no Merge Step.
+    Shippable,
+    NotShippable,
+    /// slopwatch pushed to the PR, such as a Fix commit or a Merge rebase.
+    Pushed,
+    /// A push or a base change from outside the Run.
+    Superseded,
+    /// Merged or closed on GitHub by someone else.
+    Closed,
+    /// The Watched PR's or the day's Budget ran out.
+    OverBudget,
+    /// The developer ended it.
+    Cancelled,
+}
+
+impl fmt::Display for EndReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            EndReason::Merged => "merged",
+            EndReason::Shippable => "shippable",
+            EndReason::NotShippable => "not shippable",
+            EndReason::Pushed => "pushed",
+            EndReason::Superseded => "superseded",
+            EndReason::Closed => "closed",
+            EndReason::OverBudget => "over budget",
+            EndReason::Cancelled => "cancelled",
         })
     }
 }

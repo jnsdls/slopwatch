@@ -1,19 +1,42 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use slopwatch_protocol::{
     ClientFrame, Command, ErrorBody, ErrorCode, Reply, Request, RequestId, Response, ResponseBody,
-    ServerFrame, Topic, TopicUpdate, WatchedPrsDelta, WatchedPrsUpdate,
+    RunEvent, RunId, ServerFrame, Topic, TopicUpdate, WatchedPrsDelta, WatchedPrsUpdate,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::broadcast;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error, Message};
 
+use crate::runs::{Live, SubscribeError};
 use crate::{Daemon, LibraryError, Peer, Subscription, WatchError};
 
 /// How long a client gets to send its hello before the daemon hangs up.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What one connection subscribed to.
+#[derive(Default)]
+struct Subscriptions {
+    watched_prs: Option<broadcast::Receiver<(u64, WatchedPrsDelta)>>,
+    /// Each subscribed Run, with the last sequence number sent for it.
+    runs: HashMap<RunId, u64>,
+    /// Events appended to any Run. Only subscribed Runs' get through.
+    live: Option<Live>,
+}
+
+/// What a subscription has next.
+enum Next {
+    WatchedPrs(u64, WatchedPrsDelta),
+    /// The subscriber fell behind on `watched_prs` and lost deltas.
+    WatchedPrsLagged,
+    Run(RunId, u64, RunEvent),
+    /// The subscriber fell behind on Run events. The journal has them.
+    RunsLagged,
+    Nothing,
+}
 
 impl Daemon {
     /// Serves one client: the WebSocket handshake, the hello exchange, then
@@ -38,7 +61,7 @@ impl Daemon {
             }
         }
 
-        let mut deltas: Option<Deltas> = None;
+        let mut subs = Subscriptions::default();
         loop {
             tokio::select! {
                 text = next_text(&mut ws) => {
@@ -46,17 +69,44 @@ impl Daemon {
                     let Some((id, command)) = self.parse(&text, &mut ws).await? else {
                         continue;
                     };
-                    let subscribe = matches!(command, Command::Subscribe { .. });
-                    let result = self.execute(command).await;
-                    if subscribe && matches!(result, ResponseBody::Ok(_)) {
-                        send(&mut ws, &self.subscribe(&mut deltas)).await?;
-                    }
-                    // A command's deltas reach the client before its
+                    let result = match command {
+                        Command::Subscribe { topic, since } => {
+                            match self.subscribe(topic, since, &mut subs) {
+                                Ok(frames) => {
+                                    for frame in frames {
+                                        send(&mut ws, &frame).await?;
+                                    }
+                                    ResponseBody::Ok(Reply::Done)
+                                }
+                                Err(error) => ResponseBody::Error(error),
+                            }
+                        }
+                        Command::Unsubscribe { topic } => {
+                            match topic {
+                                Topic::WatchedPrs => subs.watched_prs = None,
+                                Topic::Run(run) => {
+                                    subs.runs.remove(&run);
+                                    if subs.runs.is_empty() {
+                                        // Nothing left to filter for.
+                                        subs.live = None;
+                                    }
+                                }
+                            }
+                            ResponseBody::Ok(Reply::Done)
+                        }
+                        command => self.execute(command).await,
+                    };
+                    // A command's updates reach the client before its
                     // response, so a client that waits for the response
                     // sees what the command changed.
-                    while let Some(next) = deltas.as_mut().map(|deltas| Next::from(deltas.try_recv())) {
-                        let Some(frame) = self.frame(next, &mut deltas) else { break };
-                        send(&mut ws, &frame).await?;
+                    loop {
+                        let next = try_next(&mut subs);
+                        if matches!(next, Next::Nothing) {
+                            break;
+                        }
+                        for frame in self.frames(next, &mut subs) {
+                            send(&mut ws, &frame).await?;
+                        }
                     }
                     let restarting = result == ResponseBody::Ok(Reply::Restarting);
                     send(&mut ws, &ServerFrame::Response(Response { id, result })).await?;
@@ -64,8 +114,8 @@ impl Daemon {
                         self.restart.send_replace(true);
                     }
                 }
-                next = recv(&mut deltas) => {
-                    if let Some(frame) = self.frame(next, &mut deltas) {
+                next = recv(&mut subs) => {
+                    for frame in self.frames(next, &mut subs) {
                         send(&mut ws, &frame).await?;
                     }
                 }
@@ -73,31 +123,92 @@ impl Daemon {
         }
     }
 
-    /// Starts or restarts the connection's subscription and returns the
-    /// snapshot to send.
-    fn subscribe(&self, deltas: &mut Option<Deltas>) -> ServerFrame {
+    /// Starts or restarts a subscription and returns the frames due now:
+    /// the `watched_prs` snapshot, or a Run's events after `since`.
+    fn subscribe(
+        &self,
+        topic: Topic,
+        since: Option<u64>,
+        subs: &mut Subscriptions,
+    ) -> Result<Vec<ServerFrame>, ErrorBody> {
+        match topic {
+            Topic::WatchedPrs => Ok(vec![self.subscribe_watched_prs(subs)]),
+            Topic::Run(run) => {
+                let Some(runs) = &self.runs else {
+                    return Err(run_not_found(run));
+                };
+                let since = since.unwrap_or(0);
+                let (events, live) = runs.subscribe(run, since).map_err(|error| match error {
+                    SubscribeError::NotFound(run) => run_not_found(run),
+                    SubscribeError::Store(error) => ErrorBody {
+                        code: ErrorCode::Internal,
+                        message: format!("Database error: {error}"),
+                    },
+                })?;
+                // A receiver from an earlier subscription already sees
+                // every event since; the replay covers the rest.
+                subs.live.get_or_insert(live);
+                subs.runs.insert(run, since);
+                Ok(events
+                    .into_iter()
+                    .filter_map(|(seq, event)| run_frame(subs, run, seq, event))
+                    .collect())
+            }
+        }
+    }
+
+    fn subscribe_watched_prs(&self, subs: &mut Subscriptions) -> ServerFrame {
         let Subscription {
             seq,
             snapshot,
-            deltas: receiver,
+            deltas,
         } = self.watching.subscribe();
-        *deltas = Some(receiver);
+        subs.watched_prs = Some(deltas);
         ServerFrame::Topic(TopicUpdate::WatchedPrs {
             seq,
             update: WatchedPrsUpdate::Snapshot(snapshot),
         })
     }
 
-    /// The frame for `next`. A subscriber that fell too far behind to catch
-    /// up starts over from a fresh snapshot.
-    fn frame(&self, next: Next, deltas: &mut Option<Deltas>) -> Option<ServerFrame> {
+    /// The frames for `next`. A subscriber that fell too far behind to
+    /// catch up starts over: from a fresh snapshot on `watched_prs`, and
+    /// from the journal on a Run.
+    fn frames(&self, next: Next, subs: &mut Subscriptions) -> Vec<ServerFrame> {
         match next {
-            Next::Delta(seq, delta) => Some(ServerFrame::Topic(TopicUpdate::WatchedPrs {
+            Next::WatchedPrs(seq, delta) => vec![ServerFrame::Topic(TopicUpdate::WatchedPrs {
                 seq,
                 update: WatchedPrsUpdate::Delta(delta),
-            })),
-            Next::Lagged => Some(self.subscribe(deltas)),
-            Next::Nothing => None,
+            })],
+            Next::WatchedPrsLagged => vec![self.subscribe_watched_prs(subs)],
+            Next::Run(run, seq, event) => run_frame(subs, run, seq, event).into_iter().collect(),
+            Next::RunsLagged => {
+                subs.live = None;
+                let mut frames = Vec::new();
+                let Some(runs) = &self.runs else {
+                    return frames;
+                };
+                let subscribed: Vec<(RunId, u64)> =
+                    subs.runs.iter().map(|(&run, &last)| (run, last)).collect();
+                for (run, last) in subscribed {
+                    match runs.subscribe(run, last) {
+                        Ok((events, live)) => {
+                            subs.live.get_or_insert(live);
+                            frames.extend(
+                                events
+                                    .into_iter()
+                                    .filter_map(|(seq, event)| run_frame(subs, run, seq, event)),
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "slopwatchd: can't catch a client up on Run {run}: {error:?}"
+                            );
+                        }
+                    }
+                }
+                frames
+            }
+            Next::Nothing => Vec::new(),
         }
     }
 
@@ -134,6 +245,13 @@ impl Daemon {
 
     async fn execute(&self, command: Command) -> ResponseBody {
         let watching = &self.watching;
+        let changes_prs = matches!(
+            command,
+            Command::AddRepo { .. }
+                | Command::Watch { .. }
+                | Command::Unwatch { .. }
+                | Command::Refresh
+        );
         let result = match command {
             Command::Ping => Ok(Reply::Pong),
             Command::Restart => Ok(Reply::Restarting),
@@ -151,9 +269,9 @@ impl Daemon {
                 .await
                 .map(|()| Reply::Done),
             Command::Refresh => watching.poll().await.map(|()| Reply::Done),
-            Command::Subscribe {
-                topic: Topic::WatchedPrs,
-            } => Ok(Reply::Done),
+            Command::Subscribe { .. } | Command::Unsubscribe { .. } => {
+                unreachable!("the connection handles its own subscriptions")
+            }
             Command::ListLibrarySteps => {
                 return respond(
                     self.library
@@ -168,40 +286,87 @@ impl Daemon {
                 return respond(self.library.delete(&step).map(|()| Reply::Done));
             }
         };
+        if changes_prs {
+            // What changed, even with a failed poll, may start or end a Run.
+            self.sync_runs().await;
+        }
         respond(result)
     }
 }
 
-type Deltas = broadcast::Receiver<(u64, WatchedPrsDelta)>;
-
-/// What a subscription has next.
-enum Next {
-    Delta(u64, WatchedPrsDelta),
-    /// The subscriber fell behind and lost deltas.
-    Lagged,
-    Nothing,
+/// The frame for a Run event, if the connection subscribed to the Run and
+/// hasn't had the event yet.
+fn run_frame(
+    subs: &mut Subscriptions,
+    run: RunId,
+    seq: u64,
+    event: RunEvent,
+) -> Option<ServerFrame> {
+    let last = subs.runs.get_mut(&run)?;
+    if seq <= *last {
+        return None;
+    }
+    *last = seq;
+    Some(ServerFrame::Topic(TopicUpdate::Run {
+        id: run,
+        seq,
+        event,
+    }))
 }
 
-impl From<Result<(u64, WatchedPrsDelta), broadcast::error::TryRecvError>> for Next {
-    fn from(received: Result<(u64, WatchedPrsDelta), broadcast::error::TryRecvError>) -> Self {
-        match received {
-            Ok((seq, delta)) => Next::Delta(seq, delta),
-            Err(broadcast::error::TryRecvError::Lagged(_)) => Next::Lagged,
-            Err(_) => Next::Nothing,
-        }
+fn run_not_found(run: RunId) -> ErrorBody {
+    ErrorBody {
+        code: ErrorCode::NotFound,
+        message: format!("Not found: Run {run}"),
     }
 }
 
-/// The next delta for a subscribed connection. Never resolves for one that
-/// hasn't subscribed.
-async fn recv(deltas: &mut Option<Deltas>) -> Next {
-    let Some(deltas) = deltas else {
-        return std::future::pending().await;
-    };
-    match deltas.recv().await {
-        Ok((seq, delta)) => Next::Delta(seq, delta),
-        Err(broadcast::error::RecvError::Lagged(_)) => Next::Lagged,
-        Err(broadcast::error::RecvError::Closed) => Next::Nothing,
+/// What a connection's subscriptions have ready, without waiting.
+fn try_next(subs: &mut Subscriptions) -> Next {
+    if let Some(deltas) = &mut subs.watched_prs {
+        match deltas.try_recv() {
+            Ok((seq, delta)) => return Next::WatchedPrs(seq, delta),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => return Next::WatchedPrsLagged,
+            Err(_) => {}
+        }
+    }
+    if let Some(live) = &mut subs.live {
+        match live.try_recv() {
+            Ok((run, seq, event)) => return Next::Run(run, seq, event),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => return Next::RunsLagged,
+            Err(_) => {}
+        }
+    }
+    Next::Nothing
+}
+
+/// The next update for a connection. Never resolves for one that hasn't
+/// subscribed to anything.
+async fn recv(subs: &mut Subscriptions) -> Next {
+    let Subscriptions {
+        watched_prs, live, ..
+    } = subs;
+    tokio::select! {
+        received = async {
+            match watched_prs {
+                Some(deltas) => deltas.recv().await,
+                None => std::future::pending().await,
+            }
+        } => match received {
+            Ok((seq, delta)) => Next::WatchedPrs(seq, delta),
+            Err(broadcast::error::RecvError::Lagged(_)) => Next::WatchedPrsLagged,
+            Err(broadcast::error::RecvError::Closed) => Next::Nothing,
+        },
+        received = async {
+            match live {
+                Some(live) => live.recv().await,
+                None => std::future::pending().await,
+            }
+        } => match received {
+            Ok((run, seq, event)) => Next::Run(run, seq, event),
+            Err(broadcast::error::RecvError::Lagged(_)) => Next::RunsLagged,
+            Err(broadcast::error::RecvError::Closed) => Next::Nothing,
+        },
     }
 }
 

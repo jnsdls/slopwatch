@@ -4,17 +4,31 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use slopwatch_daemon::auth::GhToken;
+use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::api::Api;
+use slopwatch_daemon::plugins::{self, Plugins};
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::transport::unix::Listener;
-use slopwatch_daemon::{Daemon, DataDir, Library, Watching};
+use slopwatch_daemon::{Daemon, DataDir, Library, Runs, RunsConfig, Watching};
 use slopwatch_protocol::Flavor;
 
 /// A log past this size starts over when the daemon starts.
 const LOG_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Built-in Plugins run from this executable (the `plugins` module).
+    if args.first().map(String::as_str) == Some("plugin") {
+        return plugins::main(&args[1..]);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("start the tokio runtime")
+        .block_on(serve())
+}
+
+async fn serve() -> ExitCode {
     let path = Flavor::CURRENT.data_dir();
     let data_dir = match DataDir::lock(&path) {
         Ok(data_dir) => data_dir,
@@ -43,8 +57,8 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let github = Arc::new(Api::new(Arc::new(GhToken::default())));
-    let watching = match Watching::new(store, github) {
+    let github: Arc<dyn GitHub> = Arc::new(Api::new(Arc::new(GhToken::default())));
+    let watching = match Watching::new(store.clone(), Arc::clone(&github)) {
         Ok(watching) => Arc::new(watching),
         Err(error) => {
             eprintln!("slopwatchd: can't load {}: {error}", db.display());
@@ -62,22 +76,40 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let daemon = Arc::new(Daemon::new(Arc::clone(&watching), library));
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            eprintln!("slopwatchd: can't find its own executable: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config = RunsConfig {
+        data_dir: data_dir.path().to_owned(),
+        plugins: Plugins::new(exe, Arc::clone(&library)),
+    };
+    let runs = match Runs::start(store, github, Arc::clone(&watching), config) {
+        Ok(runs) => runs,
+        Err(error) => {
+            eprintln!("slopwatchd: can't load Runs from {}: {error}", db.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let daemon = Arc::new(Daemon::new(watching, library).with_runs(runs));
     eprintln!(
         "slopwatchd: build {} listening on {}",
         daemon.build_id(),
         listener.path().display()
     );
 
-    tokio::spawn(watching.run());
+    tokio::spawn(Arc::clone(&daemon).poll_forever());
     // Crash-only (ADR 0009): no shutdown path. A signal kills the process,
     // and the next start replaces the stale socket. `restart` exits without
     // draining, and launchd starts whatever binary the bundle holds now.
     tokio::select! {
         () = listener.run(Arc::clone(&daemon)) => {}
         () = daemon.restart_requested() => {
-            // No Steps run yet. Once they do, their process groups die here.
             eprintln!("slopwatchd: restarting on a client's request");
+            daemon.kill_steps().await;
         }
     }
     ExitCode::SUCCESS

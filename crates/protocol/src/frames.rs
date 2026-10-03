@@ -11,7 +11,7 @@ pub enum ClientFrame {
 }
 
 /// A frame the daemon sends to a client.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     Hello(ServerHello),
@@ -145,9 +145,18 @@ pub enum Command {
     },
     /// Polls GitHub now instead of waiting for the next tick.
     Refresh,
-    /// Starts sending updates on `topic`: a snapshot, then deltas in
-    /// sequence order. Subscribing again restarts with a fresh snapshot.
+    /// Starts sending updates on `topic`. On `watched_prs` that's a
+    /// snapshot, then deltas in sequence order, and subscribing again
+    /// restarts with a fresh snapshot. On `run/<id>` it's every journal
+    /// event after `since`, or all of them without it, then each new one.
+    /// Either way, the updates already due arrive before the response.
     Subscribe {
+        topic: Topic,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+    },
+    /// Stops the updates on `topic`.
+    Unsubscribe {
         topic: Topic,
     },
     /// Kill every Step process group and exit, so launchd starts the binary

@@ -7,17 +7,21 @@
 //! carries the same WebSocket frames, for tests.
 //!
 //! [`Watching`] keeps added repos and their PRs in step with GitHub, which
-//! it reaches only through the [`github::GitHub`] trait.
+//! it reaches only through the [`github::GitHub`] trait. [`Runs`] runs each
+//! Watched PR through its Pipeline, following what each poll saw.
 //!
 //! [`Library`] holds the developer's Library Steps, which clients list and
 //! edit, and which a Pipeline's resolver reads live.
 
 pub mod auth;
+pub mod clones;
 mod connection;
 mod data_dir;
 pub mod github;
 mod library;
 mod pace;
+pub mod plugins;
+pub mod runs;
 pub mod store;
 pub mod transport;
 mod watching;
@@ -32,7 +36,8 @@ use slopwatch_protocol::{
 };
 
 pub use library::{CONFIG_DIR_ENV, Library, LibraryError};
-pub use watching::{Subscription, WatchError, Watching};
+pub use runs::{Runs, RunsConfig};
+pub use watching::{RunInfo, Subscription, WatchError, Watching};
 
 /// Who is on the other end of a connection, as the transport reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +49,8 @@ pub struct Daemon {
     build_id: String,
     uid: u32,
     watching: Arc<Watching>,
+    /// `None` for a daemon that only watches PRs, as some tests build.
+    runs: Option<Arc<Runs>>,
     restart: tokio::sync::watch::Sender<bool>,
     library: Arc<Library>,
 }
@@ -64,8 +71,48 @@ impl Daemon {
             build_id: build_id.into(),
             uid: current_uid(),
             watching,
+            runs: None,
             restart: tokio::sync::watch::Sender::new(false),
             library,
+        }
+    }
+
+    /// Gives the daemon Runs to drive and serve.
+    pub fn with_runs(mut self, runs: Arc<Runs>) -> Self {
+        self.runs = Some(runs);
+        self
+    }
+
+    /// Polls GitHub, then brings Runs in line with what the poll saw.
+    pub async fn poll(&self) -> Result<(), WatchError> {
+        let polled = self.watching.poll().await;
+        self.sync_runs().await;
+        polled
+    }
+
+    async fn sync_runs(&self) {
+        if let Some(runs) = &self.runs {
+            runs.sync().await;
+        }
+    }
+
+    /// Polls forever, at the pace the rate budget allows: faster while a
+    /// Run is going.
+    pub async fn poll_forever(self: Arc<Self>) {
+        loop {
+            if let Err(error) = self.poll().await {
+                eprintln!("slopwatchd: poll failed: {error:?}");
+            }
+            let live = self.runs.as_ref().is_some_and(|runs| runs.live());
+            tokio::time::sleep_until(self.watching.next_poll(live).into()).await;
+        }
+    }
+
+    /// Kills every running Step's process group, for an exit with no drain
+    /// (ADR 0009).
+    pub async fn kill_steps(&self) {
+        if let Some(runs) = &self.runs {
+            runs.kill_steps().await;
         }
     }
 

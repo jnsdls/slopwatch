@@ -53,7 +53,7 @@ pub enum LinkState {
 }
 
 /// Something the link reports to the window.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LinkEvent {
     State(LinkState),
     /// An update on a subscribed topic. Each connection starts with a fresh
@@ -453,6 +453,7 @@ fn serve(
     let commands = controls.commands;
     let subscribe = Command::Subscribe {
         topic: Topic::WatchedPrs,
+        since: None,
     };
     if session.send(subscribe).is_err()
         || session

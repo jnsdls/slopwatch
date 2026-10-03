@@ -64,7 +64,12 @@ async fn a_matching_hello_is_answered_with_the_daemons_build_id() {
         answer,
         ServerFrame::Hello(ServerHello {
             dialect: DIALECT,
-            features: vec!["watched_prs".into(), "restart".into(), "library".into()],
+            features: vec![
+                "watched_prs".into(),
+                "restart".into(),
+                "library".into(),
+                "runs".into(),
+            ],
             build_id: "0123abcd+dirty.feed".into(),
         })
     );
