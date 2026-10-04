@@ -3,8 +3,6 @@
 //! refuses text that wouldn't load, and the next Run of every Pipeline that
 //! uses the Step reads what was saved.
 
-use std::sync::mpsc::Sender;
-
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::{ActiveTheme, Disableable, Sizable};
@@ -13,6 +11,14 @@ use gpui_kit::*;
 use slopwatch_protocol::{Command, LibraryStep};
 
 use crate::library::{LibraryEditor, NEW_STEP_TEXT};
+use crate::outbox::Outbox;
+use crate::outbox_view::{Pending, loading, refusal};
+
+/// What the view's commands go out for ([`Outbox`]).
+const LIST: &str = "library-list";
+const SAVE: &str = "library-save";
+const DELETE: &str = "library-delete";
+const NEW: &str = "library-new";
 
 pub struct LibraryView {
     library: LibraryEditor,
@@ -21,12 +27,12 @@ pub struct LibraryView {
     /// Text for the editor that arrived outside a render. Rendering puts it
     /// in, because replacing an input's text needs the window.
     replace_with: Option<String>,
-    commands: Sender<Command>,
+    outbox: Outbox,
     _subscriptions: Vec<Subscription>,
 }
 
 impl LibraryView {
-    pub fn new(commands: Sender<Command>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(outbox: Outbox, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| TextareaState::new(window, cx));
         let new_name = cx.new(|cx| InputState::new(window, cx).placeholder("new-step-name"));
         let _subscriptions = vec![
@@ -51,14 +57,14 @@ impl LibraryView {
             editor,
             new_name,
             replace_with: None,
-            commands,
+            outbox,
             _subscriptions,
         }
     }
 
     /// Asks the daemon for the Library. The answer comes to [`Self::listed`].
     pub fn refresh(&self) {
-        self.send(Command::ListLibrarySteps);
+        self.outbox.load(LIST, Command::ListLibrarySteps);
     }
 
     /// Takes the daemon's listing of the Library.
@@ -68,11 +74,6 @@ impl LibraryView {
             self.replace_with = Some(text);
         }
         cx.notify();
-    }
-
-    fn send(&self, command: Command) {
-        // The link thread only stops when the app quits.
-        let _ = self.commands.send(command);
     }
 
     fn editor_text(&self, cx: &App) -> String {
@@ -90,16 +91,18 @@ impl LibraryView {
 
     /// Saves the open Step, then lists the Library again, so the listing
     /// shows what the daemon kept. A refused save keeps the edits, and its
-    /// reason shows in the footer.
+    /// reason shows by the Save button.
     fn save(&mut self, cx: &mut Context<Self>) {
         let Some(step) = self.library.open_step() else {
             return;
         };
-        self.send(Command::SaveLibraryStep {
+        let command = Command::SaveLibraryStep {
             step: step.name.clone(),
             text: self.editor_text(cx),
-        });
-        self.refresh();
+        };
+        if self.outbox.press(SAVE, command) {
+            self.refresh();
+        }
     }
 
     fn revert(&mut self, cx: &mut Context<Self>) {
@@ -112,10 +115,12 @@ impl LibraryView {
         let Some(step) = self.library.open_step() else {
             return;
         };
-        self.send(Command::DeleteLibraryStep {
+        let command = Command::DeleteLibraryStep {
             step: step.name.clone(),
-        });
-        self.refresh();
+        };
+        if self.outbox.press(DELETE, command) {
+            self.refresh();
+        }
     }
 
     fn create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -126,10 +131,13 @@ impl LibraryView {
         if self.library.steps().iter().any(|step| step.name == name) {
             self.open(&name, cx);
         } else {
-            self.send(Command::SaveLibraryStep {
+            let command = Command::SaveLibraryStep {
                 step: name.clone(),
                 text: NEW_STEP_TEXT.to_owned(),
-            });
+            };
+            if !self.outbox.press(NEW, command) {
+                return;
+            }
             self.library.open_when_listed(&name);
             self.refresh();
         }
@@ -198,31 +206,30 @@ impl LibraryView {
                 .gap_1()
                 .child(div().flex_1().child(Input::new(&self.new_name).small()))
                 .child(
-                    Button::new("library-new")
+                    Button::new(NEW)
                         .label("New")
                         .small()
                         .ghost()
+                        .pending(self.outbox.waiting(NEW))
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.create(window, cx);
                         })),
                 ),
         )
+        .children(refusal(&self.outbox, NEW, theme))
     }
 
     fn editor_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let Some(step) = self.library.open_step() else {
-            let empty = if self.library.loaded() {
-                "Pick a Library Step, or create one."
-            } else {
-                "Loading the Library…"
-            };
-            return div()
-                .flex_1()
-                .p_6()
+            let pane = div().flex_1().p_6();
+            if !self.library.loaded() {
+                return pane.child(loading(&self.outbox, LIST, "the Library", theme));
+            }
+            return pane
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child(empty);
+                .child("Pick a Library Step, or create one.");
         };
         let unsaved = self.library.unsaved(&self.editor_text(cx));
         let header = div()
@@ -252,18 +259,20 @@ impl LibraryView {
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.revert(cx))),
             )
             .child(
-                Button::new("library-delete")
+                Button::new(DELETE)
                     .label("Delete")
                     .small()
                     .ghost()
+                    .pending(self.outbox.waiting(DELETE))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, _| this.delete())),
             )
             .child(
-                Button::new("library-save")
+                Button::new(SAVE)
                     .label("Save")
                     .small()
                     .primary()
                     .disabled(!unsaved)
+                    .pending(self.outbox.waiting(SAVE))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save(cx))),
             );
         div()
@@ -274,6 +283,8 @@ impl LibraryView {
             .gap_2()
             .p_3()
             .child(header)
+            .children(refusal(&self.outbox, SAVE, theme))
+            .children(refusal(&self.outbox, DELETE, theme))
             .children(step.problem.as_ref().map(|problem| {
                 div().text_xs().text_color(theme.danger).child(format!(
                     "Pipelines that use this Step won't load: {problem}"

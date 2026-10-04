@@ -21,6 +21,10 @@ use crate::agent::{Agent, AgentStatus};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a read waits before the link checks for commands to send.
 const COMMAND_POLL: Duration = Duration::from_millis(50);
+/// Where the ids of the link's own requests, such as its subscriptions,
+/// start. The window numbers its commands from 1 ([`crate::outbox`]), so an
+/// answer never matches a request from the other side.
+const OWN_IDS: u64 = 1 << 63;
 
 /// What the window shows about the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,10 +99,18 @@ impl Session {
         &self.daemon
     }
 
-    /// Sends `command` as the developer through the GUI.
+    /// Sends `command` as the developer through the GUI, under an id of
+    /// the link's own.
     pub fn send(&mut self, command: Command) -> tungstenite::Result<RequestId> {
         let id = RequestId(self.next_id);
         self.next_id += 1;
+        self.send_as(id, command)?;
+        Ok(id)
+    }
+
+    /// Sends `command` as the developer through the GUI, under the id the
+    /// window gave it.
+    pub fn send_as(&mut self, id: RequestId, command: Command) -> tungstenite::Result<()> {
         let request = ClientFrame::Request(Request {
             id,
             actor: Actor::Developer {
@@ -107,8 +119,7 @@ impl Session {
             command,
         });
         let text = serde_json::to_string(&request).expect("client frames always serialize");
-        self.ws.send(Message::text(text))?;
-        Ok(id)
+        self.ws.send(Message::text(text))
     }
 
     /// Asks the daemon to restart and waits until it answers or hangs up.
@@ -186,7 +197,7 @@ pub fn connect(path: &Path, hello: &ClientHello) -> Result<Session, ConnectError
             ServerFrame::Hello(daemon) => Ok(Session {
                 ws,
                 daemon,
-                next_id: 1,
+                next_id: OWN_IDS,
             }),
             ServerFrame::Refused(refusal) => Err(ConnectError::Refused(refusal)),
             ServerFrame::Response(_) | ServerFrame::Topic(_) => Err(ConnectError::Failed(
@@ -297,10 +308,10 @@ impl<'a> Handoff<'a> {
 }
 
 /// What the window hands the link: the developer's commands for the
-/// daemon, and Re-register presses.
+/// daemon, each under the id the window gave it, and Re-register presses.
 #[derive(Clone, Copy)]
 pub struct Controls<'a> {
-    pub commands: &'a Receiver<Command>,
+    pub commands: &'a Receiver<(RequestId, Command)>,
     pub reregister: &'a Receiver<()>,
 }
 
@@ -470,8 +481,8 @@ fn serve(
     loop {
         loop {
             match commands.try_recv() {
-                Ok(command) => {
-                    if session.send(command).is_err() {
+                Ok((id, command)) => {
+                    if session.send_as(id, command).is_err() {
                         return true;
                     }
                 }

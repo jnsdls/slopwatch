@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use slopwatch_core::EndReason;
 use slopwatch_protocol::{
-    InboxEntry, PollState, PrStatus, PullRequest, RepoName, StackParent, StorageWarning,
+    Command, InboxEntry, PollState, PrStatus, PullRequest, RepoName, StackParent, StorageWarning,
     TopicUpdate, WatchedPrs, WatchedPrsUpdate,
 };
 
@@ -548,6 +548,19 @@ pub fn status_line(pr: &PullRequest) -> String {
     } else {
         status
     }
+}
+
+/// What a PR's Watch or Unwatch button sends, and the action it goes out
+/// for ([`crate::outbox`]), the same in the PR list and the tour.
+pub fn toggle_watch(pr: &PullRequest) -> (String, Command) {
+    let (repo, number) = (pr.repo.clone(), pr.number);
+    let action = format!("toggle-{repo}-{number}");
+    let command = if pr.watched() {
+        Command::Unwatch { repo, number }
+    } else {
+        Command::Watch { repo, number }
+    };
+    (action, command)
 }
 
 /// What the sources pane says about the storage warning.

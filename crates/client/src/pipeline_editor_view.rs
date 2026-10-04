@@ -12,7 +12,6 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::mpsc::Sender;
 
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -26,8 +25,10 @@ use slopwatch_protocol::pipeline::PipelineDraft;
 use slopwatch_protocol::{Command, GateTerm, PullRequest, RepoName, SecretValue};
 
 use crate::onboarding::{Anchor, Stop, Tour, intersect, place_card, watch_line};
-
+use crate::outbox::Outbox;
+use crate::outbox_view::{Pending, refusal};
 use crate::pipeline_editor::{DropOn, PipelineEditor, Selection};
+use crate::prs::toggle_watch;
 use crate::run_graph::{
     self, ALL_OF_HEIGHT, ANY_OF_HEADER, EdgeKind, GATE_BORDER, GATE_PADDING, GATE_TITLE_HEIGHT,
     Layout, NodeId, Rect, Role, TERM_HEIGHT,
@@ -42,6 +43,13 @@ const CARD_WIDTH: f32 = 340.;
 const CARD_HEIGHT: f32 = 200.;
 /// Room the spotlight leaves around its anchor.
 const SPOT_PAD: f32 = 6.;
+
+/// What the editor's buttons send for ([`Outbox`]). The toolbar and the
+/// tour share them, so either shows the other's wait.
+const PUBLISH: &str = "publish-pipeline";
+const MERGE: &str = "merge-pipeline";
+const DISCARD: &str = "discard-draft";
+const PASTE: &str = "paste-set";
 
 /// The roles the inspector offers, in order.
 const ROLES: [(GateRole, &str); 4] = [
@@ -81,7 +89,7 @@ impl Render for Ghost {
 
 pub struct PipelineEditorView {
     editor: PipelineEditor,
-    commands: Sender<Command>,
+    outbox: Outbox,
     with_input: Entity<InputState>,
     when_input: Entity<InputState>,
     /// The Step and the `with:` and Condition text the inputs were last
@@ -117,11 +125,14 @@ pub struct PipelineEditorView {
     /// The anchor the canvas last scrolled into sight for the tour, so it
     /// scrolls once per Stop and the developer can scroll away.
     revealed: Option<Anchor>,
+    /// What the last gesture from a button went out for, whose refusal shows
+    /// under the canvas until the next one.
+    last_edit: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl PipelineEditorView {
-    pub fn new(commands: Sender<Command>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(outbox: Outbox, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let with_input = cx.new(|cx| InputState::new(window, cx).placeholder("{ model: opus }"));
         let when_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("default: every upstream Step passed")
@@ -135,9 +146,9 @@ impl PipelineEditorView {
             cx.subscribe_in(
                 &secret_input,
                 window,
-                |this, _, event: &InputEvent, window, cx| {
+                |this, _, event: &InputEvent, _, cx| {
                     if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.set_secret(window, cx);
+                        this.set_secret(cx);
                     }
                 },
             ),
@@ -172,7 +183,7 @@ impl PipelineEditorView {
         ];
         Self {
             editor: PipelineEditor::default(),
-            commands,
+            outbox,
             with_input,
             when_input,
             inputs_show: None,
@@ -191,6 +202,7 @@ impl PipelineEditorView {
             card_at: Rc::default(),
             this: cx.entity().downgrade(),
             revealed: None,
+            last_edit: None,
             _subscriptions,
         }
     }
@@ -209,8 +221,9 @@ impl PipelineEditorView {
     }
 
     /// Sends the pasted value for the Secret whose dialog is open. The
-    /// daemon sends the draft again, without that Step's badge.
-    fn set_secret(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// dialog closes once the daemon has kept it, and the daemon sends the
+    /// draft again, without that Step's badge.
+    fn set_secret(&mut self, cx: &mut Context<Self>) {
         let value = self.secret_input.read(cx).value().to_string();
         let Some(secret) = self.pasting.clone() else {
             return;
@@ -218,13 +231,65 @@ impl PipelineEditorView {
         if value.trim().is_empty() {
             return;
         }
-        self.send(vec![Command::SetSecret {
+        let command = Command::SetSecret {
             secret,
             value: SecretValue::new(value),
-        }]);
-        self.secret_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
-        self.pasting = None;
+        };
+        self.outbox.press(PASTE, command);
+        cx.notify();
+    }
+
+    /// Opens the paste dialog on `secret`.
+    fn paste(&mut self, secret: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.pasting = Some(secret);
+        self.outbox.forget(PASTE);
+        self.secret_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// What the editor waits on GitHub for, such as "Publishing…".
+    fn busy(&self) -> Option<&'static str> {
+        [
+            (PUBLISH, "Publishing…"),
+            (MERGE, "Merging…"),
+            (DISCARD, "Starting over…"),
+        ]
+        .into_iter()
+        .find(|(action, _)| self.outbox.waiting(action))
+        .map(|(_, text)| text)
+    }
+
+    /// Whether another of the editor's GitHub actions is under way, which
+    /// holds `action` back.
+    fn held(&self, action: &str) -> bool {
+        self.busy().is_some() && !self.outbox.waiting(action)
+    }
+
+    /// The refusal of the last publish, merge or discard.
+    fn busy_refusal(&self, theme: &Theme) -> Option<Div> {
+        [PUBLISH, MERGE, DISCARD]
+            .into_iter()
+            .find_map(|action| refusal(&self.outbox, action, theme))
+    }
+
+    fn publish(&mut self, cx: &mut Context<Self>) {
+        if self.busy().is_none()
+            && let Some(command) = self.editor.publish()
+        {
+            self.outbox.press(PUBLISH, command);
+        }
+        cx.notify();
+    }
+
+    fn merge_now(&mut self, cx: &mut Context<Self>) {
+        if self.busy().is_none()
+            && let Some(command) = self.editor.merge_now()
+        {
+            self.outbox.press(MERGE, command);
+        }
         cx.notify();
     }
 
@@ -261,8 +326,19 @@ impl PipelineEditorView {
 
     fn send(&self, commands: Vec<Command>) {
         for command in commands {
-            // The link thread only stops when the app quits.
-            let _ = self.commands.send(command);
+            self.outbox.send(command);
+        }
+    }
+
+    /// Sends a gesture's commands for the button `action`, unless its last
+    /// one is still out.
+    fn edit(&mut self, action: String, commands: Vec<Command>) {
+        let mut commands = commands.into_iter();
+        if let Some(first) = commands.next()
+            && self.outbox.press(&action, first)
+        {
+            commands.for_each(|command| self.outbox.load(&action, command));
+            self.last_edit = Some(action);
         }
     }
 
@@ -402,7 +478,7 @@ impl PipelineEditorView {
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let commands = this.editor.pick_starter(key);
-                        this.send(commands);
+                        this.edit(format!("starter-{key}"), commands);
                         cx.notify();
                     })),
             );
@@ -798,15 +874,17 @@ impl PipelineEditorView {
         let mut uses = div().flex().flex_wrap().gap_1();
         for item in self.editor.palette() {
             let (step_id, chosen) = (id.to_owned(), item.uses.clone());
+            let action = format!("uses-{}", item.uses);
             uses = uses.child(
-                Button::new(SharedString::from(format!("uses-{}", item.uses)))
+                Button::new(SharedString::from(action.clone()))
                     .label(item.uses.clone())
                     .xsmall()
                     .outline()
                     .when(item.uses == step.uses, |button| button.primary())
+                    .pending(self.outbox.waiting(&action))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let commands = this.editor.set_uses(&step_id, &chosen);
-                        this.send(commands);
+                        this.edit(action.clone(), commands);
                         cx.notify();
                     })),
             );
@@ -821,15 +899,17 @@ impl PipelineEditorView {
             .chain([GATE.to_owned()]);
         for other in others {
             let (step_id, need) = (id.to_owned(), other.clone());
+            let action = format!("need-{other}");
             needs = needs.child(
-                Button::new(SharedString::from(format!("need-{other}")))
+                Button::new(SharedString::from(action.clone()))
                     .label(other.clone())
                     .xsmall()
                     .outline()
                     .when(step.info.needs.contains(&other), |button| button.primary())
+                    .pending(self.outbox.waiting(&action))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let commands = this.editor.toggle_need(&step_id, &need);
-                        this.send(commands);
+                        this.edit(action.clone(), commands);
                         cx.notify();
                     })),
             );
@@ -850,11 +930,13 @@ impl PipelineEditorView {
                             Button::new(SharedString::from(format!("role-{name}")))
                                 .label(name)
                                 .when(role == each, |button| button.primary())
+                                .pending(self.outbox.waiting(&format!("role-{name}")))
                         }))
                         .on_click(cx.listener(move |this, clicked: &Vec<usize>, _, cx| {
-                            if let Some(&(role, _)) = clicked.first().and_then(|&i| ROLES.get(i)) {
+                            if let Some(&(role, name)) = clicked.first().and_then(|&i| ROLES.get(i))
+                            {
                                 let commands = this.editor.set_gate_role(&step_id, role);
-                                this.send(commands);
+                                this.edit(format!("role-{name}"), commands);
                                 cx.notify();
                             }
                         })),
@@ -932,9 +1014,10 @@ impl PipelineEditorView {
                         .label("Remove Step")
                         .small()
                         .danger()
+                        .pending(self.outbox.waiting("remove-step"))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             let commands = this.editor.remove_step(&removed);
-                            this.send(commands);
+                            this.edit("remove-step".to_owned(), commands);
                             cx.notify();
                         })),
                 ),
@@ -959,11 +1042,12 @@ impl PipelineEditorView {
                         Button::new(SharedString::from(format!("gate-{id}-{name}")))
                             .label(name)
                             .when(role == each, |button| button.primary())
+                            .pending(self.outbox.waiting(&format!("gate-{id}-{name}")))
                     }))
                     .on_click(cx.listener(move |this, clicked: &Vec<usize>, _, cx| {
-                        if let Some(&(role, _)) = clicked.first().and_then(|&i| ROLES.get(i)) {
+                        if let Some(&(role, name)) = clicked.first().and_then(|&i| ROLES.get(i)) {
                             let commands = this.editor.set_gate_role(&id, role);
-                            this.send(commands);
+                            this.edit(format!("gate-{id}-{name}"), commands);
                             cx.notify();
                         }
                     }))
@@ -1001,7 +1085,11 @@ impl PipelineEditorView {
         let legend = "Solid: needs · dashed: read by the Gate · dashed box: advisory · drag nodes \
                       to arrange, ports to wire";
         footer = footer.child(div().text_color(theme.muted_foreground).child(legend));
-        if let Some(notice) = self.editor.notice() {
+        let notice = self.editor.notice().map(str::to_owned).or_else(|| {
+            let action = self.last_edit.as_deref()?;
+            self.outbox.error(action)
+        });
+        if let Some(notice) = notice {
             footer = footer.child(
                 div()
                     .text_color(theme.danger)
@@ -1073,13 +1161,18 @@ impl PipelineEditorView {
         }
         panel.child(
             div().child(
-                Button::new("discard-draft")
+                Button::new(DISCARD)
                     .label(format!("Start over from {branch}"))
                     .small()
                     .outline()
+                    .disabled(self.held(DISCARD))
+                    .pending(self.outbox.waiting(DISCARD))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        let commands = this.editor.discard();
-                        this.send(commands);
+                        if this.busy().is_none()
+                            && let Some(command) = this.editor.discard()
+                        {
+                            this.outbox.press(DISCARD, command);
+                        }
                         cx.notify();
                     })),
             ),
@@ -1104,7 +1197,7 @@ impl PipelineEditorView {
             .editor
             .draft()
             .and_then(|draft| draft.published.clone());
-        let busy = self.editor.busy();
+        let busy = self.busy();
         div()
             .flex()
             .items_center()
@@ -1124,6 +1217,7 @@ impl PipelineEditorView {
                         .child(busy),
                 )
             })
+            .children(self.busy_refusal(theme))
             .when(!self.tour.on(), |toolbar| {
                 toolbar.child(
                     Button::new("tour")
@@ -1142,9 +1236,10 @@ impl PipelineEditorView {
                     .small()
                     .ghost()
                     .disabled(!self.editor.arranged())
+                    .pending(self.outbox.waiting("tidy"))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         let commands = this.editor.tidy();
-                        this.send(commands);
+                        this.edit("tidy".to_owned(), commands);
                         cx.notify();
                     })),
             )
@@ -1163,11 +1258,10 @@ impl PipelineEditorView {
                             .label("Merge it now")
                             .small()
                             .outline()
-                            .disabled(busy.is_some())
+                            .disabled(self.held(MERGE))
+                            .pending(self.outbox.waiting(MERGE))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                let commands = this.editor.merge_now();
-                                this.send(commands);
-                                cx.notify();
+                                this.merge_now(cx);
                             })),
                     )
             })
@@ -1176,11 +1270,10 @@ impl PipelineEditorView {
                     .label("Publish")
                     .small()
                     .primary()
-                    .disabled(!self.editor.can_publish())
+                    .disabled(!self.editor.can_publish() || self.held(PUBLISH))
+                    .pending(self.outbox.waiting(PUBLISH))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        let commands = this.editor.publish();
-                        this.send(commands);
-                        cx.notify();
+                        this.publish(cx);
                     })),
             )
     }
@@ -1212,6 +1305,11 @@ impl PipelineEditorView {
 impl Render for PipelineEditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_inputs(window, cx);
+        if self.pasting.is_some() && self.outbox.done(PASTE) {
+            self.pasting = None;
+            self.secret_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
         // A drag let go outside the canvas leaves things where they were.
         if !cx.has_active_drag() {
             self.moving = None;
@@ -1451,7 +1549,7 @@ impl PipelineEditorView {
     /// Publish as a PR, then "Merge it now" (ADR 0007).
     fn publish_actions(&self, draft: &PipelineDraft, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
-        let busy = self.editor.busy();
+        let busy = self.busy();
         let row = div().flex().items_center().gap_2();
         match &draft.published {
             None => row.child(
@@ -1459,11 +1557,10 @@ impl PipelineEditorView {
                     .label("Publish as PR")
                     .small()
                     .primary()
-                    .disabled(!self.editor.can_publish())
+                    .disabled(!self.editor.can_publish() || self.held(PUBLISH))
+                    .pending(self.outbox.waiting(PUBLISH))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        let commands = this.editor.publish();
-                        this.send(commands);
-                        cx.notify();
+                        this.publish(cx);
                     })),
             ),
             Some(pr) => row.child(format!("PR #{} is open.", pr.number)).child(
@@ -1471,11 +1568,10 @@ impl PipelineEditorView {
                     .label("Merge it now")
                     .small()
                     .primary()
-                    .disabled(busy.is_some())
+                    .disabled(self.held(MERGE))
+                    .pending(self.outbox.waiting(MERGE))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        let commands = this.editor.merge_now();
-                        this.send(commands);
-                        cx.notify();
+                        this.merge_now(cx);
                     })),
             ),
         }
@@ -1485,6 +1581,7 @@ impl PipelineEditorView {
                 .text_color(theme.muted_foreground)
                 .child(busy)
         }))
+        .children(self.busy_refusal(theme))
     }
 
     /// The repo's open PRs, each with Watch or Unwatch.
@@ -1500,7 +1597,9 @@ impl PipelineEditorView {
             );
         }
         for pr in &self.prs {
-            let (repo, number, watched) = (pr.repo.clone(), pr.number, pr.watched());
+            let (number, watched) = (pr.number, pr.watched());
+            let (action, command) = toggle_watch(pr);
+            let refused = refusal(&self.outbox, &action, theme);
             list = list.child(
                 div()
                     .flex()
@@ -1513,13 +1612,9 @@ impl PipelineEditorView {
                             .xsmall()
                             .outline()
                             .when(watched, |button| button.primary())
+                            .pending(self.outbox.waiting(&action))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
-                                let repo = repo.clone();
-                                this.send(vec![if watched {
-                                    Command::Unwatch { repo, number }
-                                } else {
-                                    Command::Watch { repo, number }
-                                }]);
+                                this.outbox.press(&action, command.clone());
                             })),
                     )
                     .child(
@@ -1530,7 +1625,8 @@ impl PipelineEditorView {
                     .child(div().flex_1().truncate().child(pr.title.clone()))
                     .children(
                         watch_line(pr).map(|line| div().text_color(theme.warning).child(line)),
-                    ),
+                    )
+                    .children(refused),
             );
         }
         if draft.published.is_some() {
@@ -1568,6 +1664,7 @@ impl PipelineEditorView {
                 "The daemon keeps it in the Keychain and never shows it back. Every Step that needs it gets it.",
             ))
             .child(Input::new(&self.secret_input).small())
+            .children(refusal(&self.outbox, PASTE, &theme))
             .child(
                 div()
                     .flex()
@@ -1584,12 +1681,13 @@ impl PipelineEditorView {
                             })),
                     )
                     .child(
-                        Button::new("paste-set")
+                        Button::new(PASTE)
                             .label("Set Secret")
                             .small()
                             .primary()
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.set_secret(window, cx);
+                            .pending(self.outbox.waiting(PASTE))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.set_secret(cx);
                             })),
                     ),
             );
@@ -1715,10 +1813,7 @@ fn badges(
                 .child(format!("set {secret}"))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     cx.stop_propagation();
-                    this.pasting = Some(name.clone());
-                    this.secret_input
-                        .update(cx, |input, cx| input.focus(window, cx));
-                    cx.notify();
+                    this.paste(name.clone(), window, cx);
                 })),
         );
     }

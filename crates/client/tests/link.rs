@@ -13,7 +13,7 @@ use slopwatch_daemon::transport::unix::Listener;
 use slopwatch_daemon::{Daemon, DataDir, Library, Watching};
 use slopwatch_protocol::{
     BUILD_ID, ClientHello, Command, DIALECT, NotificationsUpdate, PrStatus, RefusalReason, Reply,
-    RepoName, ResponseBody, TopicUpdate, WatchedPrsUpdate, socket_path,
+    RepoName, RequestId, Response, ResponseBody, TopicUpdate, WatchedPrsUpdate, socket_path,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -123,7 +123,7 @@ fn run_link_with(
     dir: &Path,
     agent: Option<Arc<FakeAgent>>,
     reregister: Receiver<()>,
-) -> (Sender<Command>, Receiver<LinkEvent>) {
+) -> (Sender<(RequestId, Command)>, Receiver<LinkEvent>) {
     let (events, received) = mpsc::channel();
     let (commands, to_send) = mpsc::channel();
     let path = socket_path(dir);
@@ -142,7 +142,7 @@ fn run_link_with(
 
 /// Runs the link outside a bundle: no agent, and nobody presses
 /// Re-register.
-fn run_link(dir: &Path) -> (Sender<Command>, Receiver<LinkEvent>) {
+fn run_link(dir: &Path) -> (Sender<(RequestId, Command)>, Receiver<LinkEvent>) {
     let (_, reregister) = mpsc::channel();
     run_link_with(dir, None, reregister)
 }
@@ -192,12 +192,12 @@ fn next_update(events: &Receiver<LinkEvent>) -> WatchedPrsUpdate {
     }
 }
 
-fn next_reply(events: &Receiver<LinkEvent>) -> ResponseBody {
+fn next_reply(events: &Receiver<LinkEvent>) -> Response {
     loop {
         if let LinkEvent::Response(response) = events.recv_timeout(WAIT).unwrap()
             && response.result != ResponseBody::Ok(Reply::Done)
         {
-            return response.result;
+            return response;
         }
     }
 }
@@ -300,22 +300,31 @@ fn the_link_subscribes_sends_commands_and_resubscribes_after_a_reconnect() {
     };
     assert!(empty.repos.is_empty());
 
-    commands.send(Command::ListAvailableRepos).unwrap();
+    commands
+        .send((RequestId(1), Command::ListAvailableRepos))
+        .unwrap();
     assert_eq!(
         next_reply(&events),
-        ResponseBody::Ok(Reply::AvailableRepos {
-            repos: vec![repo.clone()]
-        })
+        Response {
+            id: RequestId(1),
+            result: ResponseBody::Ok(Reply::AvailableRepos {
+                repos: vec![repo.clone()]
+            }),
+        },
+        "the answer carries the id the window gave"
     );
 
     commands
-        .send(Command::AddRepo { repo: repo.clone() })
+        .send((RequestId(2), Command::AddRepo { repo: repo.clone() }))
         .unwrap();
     commands
-        .send(Command::Watch {
-            repo: repo.clone(),
-            number: 1,
-        })
+        .send((
+            RequestId(3),
+            Command::Watch {
+                repo: repo.clone(),
+                number: 1,
+            },
+        ))
         .unwrap();
     let mut statuses = Vec::new();
     while statuses.last() != Some(&PrStatus::Waiting) {

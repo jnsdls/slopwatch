@@ -30,10 +30,14 @@ use crate::notifications::{
     NotificationCenter, Permission, Poster, SystemCenter, notice, settings_url,
 };
 use crate::onboarding::Landing;
+use crate::outbox::Outbox;
+use crate::outbox_view::{Pending, refusal};
 use crate::pipeline_editor_view::PipelineEditorView;
 use crate::plugins::unapproved_plugin;
 use crate::plugins_view::PluginsView;
-use crate::prs::{PrState, Prs, Row as PrRow, Source, Stack, poll_line, status_line, storage_line};
+use crate::prs::{
+    PrState, Prs, Row as PrRow, Source, Stack, poll_line, status_line, storage_line, toggle_watch,
+};
 use crate::run_graph_view::{run_graph, tone_color};
 use crate::run_pane::{
     GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, commit_line, end_label,
@@ -46,6 +50,27 @@ use crate::step_log::{self, LogViewer, Row};
 
 /// How see-through a PR list row is when it doesn't open.
 const DIM: f32 = 0.55;
+
+/// What the window's own commands go out for ([`Outbox`]).
+const ADD_REPO: &str = "add-repo";
+const CANCEL_RUN: &str = "cancel-run";
+/// Every page the full-log viewer reads.
+const LOG: &str = "step-log";
+
+/// What an Inbox entry's button sends for. The Inbox and the PR pane share
+/// it, so a press in one shows in the other.
+fn entry_action(label: &str, entry: &InboxEntry) -> String {
+    format!("entry-{label}-{}", entry.id)
+}
+
+/// What a Waiver sends for: the Waive or Override Gate button that opened
+/// its form, which shows the wait once the form closes.
+fn waive_action(target: &WaiveTarget) -> String {
+    match target {
+        WaiveTarget::Step(step) => format!("waive-{step}"),
+        WaiveTarget::Gate => "override-gate".to_owned(),
+    }
+}
 
 /// A PR list row's left padding: a Stack's PRs step in one level per
 /// parent.
@@ -89,9 +114,10 @@ pub struct MainView {
     /// without one it gets the tour, with one the developer goes to its
     /// PRs.
     onboarding: Option<RepoName>,
-    /// The last command that failed, until the next one succeeds.
+    /// The last command that failed with no control to show it, until the
+    /// next one succeeds.
     error: Option<String>,
-    commands: Sender<Command>,
+    outbox: Outbox,
     /// The log viewer's search field.
     log_search: Entity<InputState>,
     /// The Waiver form's reason field.
@@ -105,7 +131,7 @@ impl MainView {
     /// `agent` is `None` when the GUI runs outside its bundle. `reregister`
     /// asks the link to unregister and register the agent.
     pub fn new(
-        commands: Sender<Command>,
+        outbox: Outbox,
         agent: Option<Arc<dyn Agent>>,
         reregister: Sender<()>,
         window: &mut Window,
@@ -157,22 +183,24 @@ impl MainView {
             inbox: InboxModel::default(),
             poster: Poster::default(),
             pending_reveal: None,
-            library: cx.new(|cx| LibraryView::new(commands.clone(), window, cx)),
-            secrets: cx.new(|cx| SecretsView::new(commands.clone(), window, cx)),
-            pipeline: cx.new(|cx| PipelineEditorView::new(commands.clone(), window, cx)),
-            plugins: cx.new(|cx| PluginsView::new(commands.clone(), window, cx)),
-            settings: cx.new(|cx| SettingsView::new(commands.clone(), window, cx)),
+            library: cx.new(|cx| LibraryView::new(outbox.clone(), window, cx)),
+            secrets: cx.new(|cx| SecretsView::new(outbox.clone(), window, cx)),
+            pipeline: cx.new(|cx| PipelineEditorView::new(outbox.clone(), window, cx)),
+            plugins: cx.new(|cx| PluginsView::new(outbox.clone(), window, cx)),
+            settings: cx.new(|cx| SettingsView::new(outbox.clone(), window, cx)),
             run_pane: RunPane::default(),
             picker: None,
             onboarding: None,
             error: None,
-            commands,
+            outbox,
         }
     }
 
     pub fn handle(&mut self, event: LinkEvent, cx: &mut Context<Self>) {
         match event {
             LinkEvent::State(state) => {
+                // Nothing sent before can be answered now.
+                self.outbox.reset();
                 let connected = matches!(state, LinkState::Connected { .. });
                 if !connected {
                     self.picker = None;
@@ -251,58 +279,69 @@ impl MainView {
                     }
                 }
             }
-            LinkEvent::Response(response) => match response.result {
-                ResponseBody::Ok(Reply::AvailableRepos { repos }) => {
-                    self.error = None;
-                    let added = self.prs.repos();
-                    self.picker = Some(
-                        repos
-                            .into_iter()
-                            .filter(|repo| !added.contains(repo))
-                            .collect(),
-                    );
-                }
-                ResponseBody::Ok(Reply::LibrarySteps { steps }) => {
-                    self.library
-                        .update(cx, |library, cx| library.listed(steps, cx));
-                }
-                ResponseBody::Ok(Reply::Secrets { secrets }) => {
-                    self.secrets.update(cx, |view, cx| view.listed(secrets, cx));
-                }
-                ResponseBody::Ok(Reply::Plugins { plugins }) => {
-                    self.plugins.update(cx, |view, cx| view.listed(plugins, cx));
-                }
-                ResponseBody::Ok(Reply::Settings {
-                    settings,
-                    spent_today,
-                }) => {
-                    self.settings
-                        .update(cx, |view, cx| view.listed(settings, spent_today, cx));
-                }
-                ResponseBody::Ok(Reply::Clis { clis }) => {
-                    self.settings
-                        .update(cx, |view, cx| view.clis_listed(clis, cx));
-                }
-                ResponseBody::Ok(Reply::StepLog(page)) => {
-                    self.error = None;
-                    self.run_pane.log_page(page);
-                }
-                ResponseBody::Ok(_) => self.error = None,
-                // While the editor is open, its gestures are what get
-                // refused, and it shows why next to the canvas.
-                ResponseBody::Error(error) if self.pane == Pane::Pipeline => {
-                    // A repo whose draft won't open gets no tour, but the
-                    // first repo still asks for notifications.
-                    if self.onboarding.take().is_some() {
-                        self.ask_permission(cx);
-                    }
-                    self.pipeline
-                        .update(cx, |editor, cx| editor.refused(error.message, cx));
-                }
-                ResponseBody::Error(error) => self.error = Some(error.message),
-            },
+            LinkEvent::Response(response) => {
+                let tracked = self.outbox.answered(&response);
+                self.respond(response.result, tracked, cx);
+            }
         }
         cx.notify();
+    }
+
+    /// Takes the daemon's answer to a command. `tracked` when a control
+    /// waited on it.
+    fn respond(&mut self, result: ResponseBody, tracked: bool, cx: &mut Context<Self>) {
+        match result {
+            // The control that sent it shows why.
+            ResponseBody::Error(_) if tracked => {}
+            ResponseBody::Ok(Reply::AvailableRepos { repos }) => {
+                self.error = None;
+                let added = self.prs.repos();
+                self.picker = Some(
+                    repos
+                        .into_iter()
+                        .filter(|repo| !added.contains(repo))
+                        .collect(),
+                );
+            }
+            ResponseBody::Ok(Reply::LibrarySteps { steps }) => {
+                self.library
+                    .update(cx, |library, cx| library.listed(steps, cx));
+            }
+            ResponseBody::Ok(Reply::Secrets { secrets }) => {
+                self.secrets.update(cx, |view, cx| view.listed(secrets, cx));
+            }
+            ResponseBody::Ok(Reply::Plugins { plugins }) => {
+                self.plugins.update(cx, |view, cx| view.listed(plugins, cx));
+            }
+            ResponseBody::Ok(Reply::Settings {
+                settings,
+                spent_today,
+            }) => {
+                self.settings
+                    .update(cx, |view, cx| view.listed(settings, spent_today, cx));
+            }
+            ResponseBody::Ok(Reply::Clis { clis }) => {
+                self.settings
+                    .update(cx, |view, cx| view.clis_listed(clis, cx));
+            }
+            ResponseBody::Ok(Reply::StepLog(page)) => {
+                self.error = None;
+                self.run_pane.log_page(page);
+            }
+            ResponseBody::Ok(_) => self.error = None,
+            // While the editor is open, its gestures are what get
+            // refused, and it shows why next to the canvas.
+            ResponseBody::Error(error) if self.pane == Pane::Pipeline => {
+                // A repo whose draft won't open gets no tour, but the
+                // first repo still asks for notifications.
+                if self.onboarding.take().is_some() {
+                    self.ask_permission(cx);
+                }
+                self.pipeline
+                    .update(cx, |editor, cx| editor.refused(error.message, cx));
+            }
+            ResponseBody::Error(error) => self.error = Some(error.message),
+        }
     }
 
     /// Shows `pr` in the PR pane, with its open Inbox entries above its
@@ -358,8 +397,14 @@ impl MainView {
     /// Sends the Waiver form with the reason typed in, if it has one.
     fn submit_waiver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let reason = self.waiver_reason.read(cx).value().to_string();
-        if let Some(command) = self.run_pane.submit_waiver(&reason) {
-            self.send(command);
+        let action = self
+            .run_pane
+            .waiver_form()
+            .map(|form| waive_action(&form.target));
+        if let Some(action) = action.filter(|action| !self.outbox.waiting(action))
+            && let Some(command) = self.run_pane.submit_waiver(&reason)
+        {
+            self.outbox.press(&action, command);
             self.waiver_reason
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -367,8 +412,12 @@ impl MainView {
     }
 
     fn send(&self, command: Command) {
-        // The link thread only stops when the app quits.
-        let _ = self.commands.send(command);
+        // A page of the open log shows it's loading, or why it didn't.
+        if matches!(command, Command::ReadStepLog { .. }) {
+            self.outbox.load(LOG, command);
+        } else {
+            self.outbox.send(command);
+        }
     }
 
     /// Changes the open log viewer and sends the command it asks for.
@@ -578,15 +627,20 @@ impl MainView {
         });
         let pane = match &self.picker {
             None => pane.child(
-                div().px_1().pt_2().child(
-                    Button::new("add-repo")
-                        .label("Add repo…")
-                        .small()
-                        .ghost()
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
-                            this.send(Command::ListAvailableRepos);
-                        })),
-                ),
+                div()
+                    .px_1()
+                    .pt_2()
+                    .child(
+                        Button::new(ADD_REPO)
+                            .label("Add repo…")
+                            .small()
+                            .ghost()
+                            .pending(self.outbox.waiting(ADD_REPO))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
+                                this.outbox.press(ADD_REPO, Command::ListAvailableRepos);
+                            })),
+                    )
+                    .children(refusal(&self.outbox, ADD_REPO, theme)),
             ),
             Some(available) => {
                 let mut picker = div()
@@ -820,20 +874,17 @@ impl MainView {
             PrStatus::Waiting => theme.warning,
             PrStatus::Ready => theme.success,
         };
-        let (repo, number) = (pr.repo.clone(), pr.number);
         let watched = pr.watched();
-        let toggle = Button::new(SharedString::from(format!("toggle-{repo}-{number}")))
+        let (action, command) = toggle_watch(pr);
+        let refused = refusal(&self.outbox, &action, theme);
+        let toggle = Button::new(SharedString::from(action.clone()))
             .label(if watched { "Unwatch" } else { "Watch" })
             .small()
             .when(watched, |button| button.ghost())
             .when(!watched, |button| button.primary())
+            .pending(self.outbox.waiting(&action))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
-                let (repo, number) = (repo.clone(), number);
-                this.send(if watched {
-                    Command::Unwatch { repo, number }
-                } else {
-                    Command::Watch { repo, number }
-                });
+                this.outbox.press(&action, command.clone());
             }));
 
         let selected = self.run_pane.selected() == Some(&(pr.repo.clone(), pr.number));
@@ -878,7 +929,8 @@ impl MainView {
                                     .child(format!("{}#{}", pr.repo, pr.number)),
                             )
                             .child(div().text_color(tone).child(status_line(pr))),
-                    ),
+                    )
+                    .children(refused),
             )
             .child(toggle)
     }
@@ -975,13 +1027,25 @@ impl MainView {
     ) -> Stateful<Div> {
         let theme = cx.theme().clone();
         let mut buttons = div().flex().gap_1();
+        // What the entry's buttons sent, to show their refusals under it.
+        let mut sent = Vec::new();
         for (label, command) in actions(entry) {
             let id = SharedString::from(format!("{prefix}-{label}-{}", entry.id));
-            buttons = buttons.child(Button::new(id).label(label).small().ghost().on_click(
-                cx.listener(move |this, _: &ClickEvent, _, _| {
-                    this.send(command.clone());
-                }),
-            ));
+            let action = entry_action(&label, entry);
+            buttons = buttons.child(
+                Button::new(id)
+                    .label(label)
+                    .small()
+                    .ghost()
+                    .pending(self.outbox.waiting(&action))
+                    .on_click(cx.listener({
+                        let action = action.clone();
+                        move |this, _: &ClickEvent, _, _| {
+                            this.outbox.press(&action, command.clone());
+                        }
+                    })),
+            );
+            sent.push(action);
         }
         if matches!(
             entry.scope,
@@ -1017,17 +1081,28 @@ impl MainView {
         if with_answers && matches!(entry.scope, Scope::Human { .. }) {
             for (label, answer) in ANSWERS {
                 let id = SharedString::from(format!("{prefix}-{label}-{}", entry.id));
+                let action = entry_action(label, entry);
                 let entry = entry.clone();
-                buttons = buttons.child(Button::new(id).label(label).small().ghost().on_click(
-                    cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        let note = this.answer_note.read(cx).value().to_string();
-                        if let Some(command) = answer_entry(&entry, answer, &note) {
-                            this.send(command);
-                            this.answer_note
-                                .update(cx, |input, cx| input.set_value("", window, cx));
-                        }
-                    }),
-                ));
+                buttons = buttons.child(
+                    Button::new(id)
+                        .label(label)
+                        .small()
+                        .ghost()
+                        .pending(self.outbox.waiting(&action))
+                        .on_click(cx.listener({
+                            let action = action.clone();
+                            move |this, _: &ClickEvent, window, cx| {
+                                let note = this.answer_note.read(cx).value().to_string();
+                                if let Some(command) = answer_entry(&entry, answer, &note)
+                                    && this.outbox.press(&action, command)
+                                {
+                                    this.answer_note
+                                        .update(cx, |input, cx| input.set_value("", window, cx));
+                                }
+                            }
+                        })),
+                );
+                sent.push(action);
             }
         }
         if let Some(plugin) = unapproved_plugin(entry).map(str::to_owned) {
@@ -1071,6 +1146,9 @@ impl MainView {
                     .text_color(theme.muted_foreground)
                     .child(format!("• {reason}")),
             );
+        }
+        for action in &sent {
+            card = card.children(refusal(&self.outbox, action, &theme));
         }
         card
     }
@@ -1230,16 +1308,18 @@ impl MainView {
                 )
                 .when_some(self.run_pane.cancel(), |this, cancel| {
                     this.child(
-                        Button::new("cancel-run")
+                        Button::new(CANCEL_RUN)
                             .label("Cancel Run")
                             .small()
                             .ghost()
+                            .pending(self.outbox.waiting(CANCEL_RUN))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
-                                this.send(cancel.clone());
+                                this.outbox.press(CANCEL_RUN, cancel.clone());
                             })),
                     )
                 }),
         );
+        pane = pane.children(refusal(&self.outbox, CANCEL_RUN, &theme));
         if let Some(viewer) = self.run_pane.viewer() {
             return pane.child(self.log_viewer(viewer, view, cx));
         }
@@ -1285,6 +1365,7 @@ impl MainView {
                             .label("Override Gate")
                             .small()
                             .ghost()
+                            .pending(self.outbox.waiting(&waive_action(&WaiveTarget::Gate)))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.run_pane.start_waiver(WaiveTarget::Gate);
                                 cx.notify();
@@ -1295,6 +1376,11 @@ impl MainView {
         } else {
             pane = pane.child(self.step_list(view, cx));
         }
+        pane = pane.children(refusal(
+            &self.outbox,
+            &waive_action(&WaiveTarget::Gate),
+            &theme,
+        ));
         if self.run_pane.waiver_form().is_some() {
             pane = pane.child(self.waiver_form(cx));
         }
@@ -1365,6 +1451,7 @@ impl MainView {
                                     .label("Override Gate")
                                     .small()
                                     .ghost()
+                                    .pending(self.outbox.waiting(&waive_action(&WaiveTarget::Gate)))
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                         this.run_pane.start_waiver(WaiveTarget::Gate);
                                         cx.notify();
@@ -1451,6 +1538,8 @@ impl MainView {
         let color = |tone| tone_color(&theme, tone);
         let open = self.run_pane.open_step() == Some(step.info.id.as_str());
         let toggled = step.info.id.clone();
+        let retry_action = format!("retry-{}", step.info.id);
+        let waive = waive_action(&WaiveTarget::Step(step.info.id.clone()));
         let mut row = div()
             .id(SharedString::from(format!("step-{}", step.info.id)))
             .flex()
@@ -1499,22 +1588,27 @@ impl MainView {
                     )
                     .when_some(self.run_pane.retry(&step.info.id), |this, retry| {
                         this.child(
-                            Button::new(SharedString::from(format!("retry-{}", step.info.id)))
+                            Button::new(SharedString::from(retry_action.clone()))
                                 .label("Retry")
                                 .small()
                                 .ghost()
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
-                                    this.send(retry.clone());
+                                .pending(self.outbox.waiting(&retry_action))
+                                .on_click(cx.listener({
+                                    let action = retry_action.clone();
+                                    move |this, _: &ClickEvent, _, _| {
+                                        this.outbox.press(&action, retry.clone());
+                                    }
                                 })),
                         )
                     })
                     .when(self.run_pane.can_waive(&step.info.id), |this| {
                         let target = WaiveTarget::Step(step.info.id.clone());
                         this.child(
-                            Button::new(SharedString::from(format!("waive-{}", step.info.id)))
+                            Button::new(SharedString::from(waive.clone()))
                                 .label("Waive")
                                 .small()
                                 .ghost()
+                                .pending(self.outbox.waiting(&waive))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.run_pane.start_waiver(target.clone());
                                     cx.notify();
@@ -1533,7 +1627,9 @@ impl MainView {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(line)
-            }));
+            }))
+            .children(refusal(&self.outbox, &retry_action, &theme))
+            .children(refusal(&self.outbox, &waive, &theme));
         if let slopwatch_protocol::StepStatus::Settled { outputs, .. } = &step.status {
             for finding in &outputs.findings {
                 row = row.child(
@@ -1746,14 +1842,16 @@ impl MainView {
                     .label("Older")
                     .small()
                     .ghost()
+                    .pending(self.outbox.waiting(LOG))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.with_viewer(LogViewer::older);
                         cx.notify();
                     })),
             );
         }
+        let refused = refusal(&self.outbox, LOG, theme);
         let rows = viewer.rows(self.run_pane.events());
-        if rows.is_empty() {
+        if rows.is_empty() && refused.is_none() {
             let empty = if viewer.loading() {
                 "Loading…"
             } else if filter.is_empty() {
@@ -1763,6 +1861,7 @@ impl MainView {
             };
             lines = lines.child(div().text_color(muted).child(empty));
         }
+        lines = lines.children(refused);
         for row in &rows {
             let line = div().child(step_log::row_text(row));
             lines = lines.child(match row {
@@ -1781,6 +1880,7 @@ impl MainView {
                             .label("Newer")
                             .small()
                             .ghost()
+                            .pending(self.outbox.waiting(LOG))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.with_viewer(LogViewer::newer);
                                 cx.notify();
@@ -1791,6 +1891,7 @@ impl MainView {
                             .label("Latest")
                             .small()
                             .ghost()
+                            .pending(self.outbox.waiting(LOG))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.with_viewer(|viewer| Some(viewer.follow()));
                                 cx.notify();
