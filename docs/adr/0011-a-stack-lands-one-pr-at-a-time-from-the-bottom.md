@@ -19,7 +19,7 @@ When a parent merges outside a native stack, the daemon retargets each child to 
 - The update after a retarget counts as a rebase made by slopwatch. It doesn't touch the Fix round cap, doesn't reset the Watched PR's Budget, and doesn't count toward ADR 0004's 3-rebase Escalation.
 - A parent closed without merging leaves its child on a dead branch. The daemon raises an Escalation on the child and doesn't retarget it, since the developer may want to drop it.
 - Opting in stays per PR. Labelling the bottom PR doesn't watch the rest of the Stack. A parent that isn't watched, or isn't the developer's, still makes the child stacked.
-- The Watched PR list shows a Stack as a tree, with children indented in stack order: `stackEntry.position` for native stacks, the base chain otherwise. An unwatched parent shows as a dim row you can't select.
+- The Watched PR list shows a Stack as one summary row, which expands to a tree with children indented in stack order: `stackEntry.position` for native stacks, the base chain otherwise. An unwatched parent shows as a dim row you can't select. [#115](https://github.com/jnsdls/slopwatch/issues/115) added the summary row.
 - The `MERGE` choice after a squash relies on git's 3-way merge seeing identical changes on both sides. [#76](https://github.com/jnsdls/slopwatch/issues/76) tested it against real squash-merged stacks (see "What the build showed"). It comes out clean unless the child changed what the parent changed, and `REBASE` fails even then.
 
 ## What the build showed

@@ -76,7 +76,7 @@ One developer, me, on one Mac running macOS 13 or later, watching my own open PR
 ### Stacks
 
 32. As the developer, I watch each PR of a Stack on its own, and every one runs right away against its parent's head.
-33. As the developer, I see a Stack as a tree in the PR list, with an unwatched parent as a dim row.
+33. As the developer, I see a Stack as one row in the PR list, collapsed by default, with its repo and root base, how many PRs it has and how many I watch, its PRs' states worst first, and why the PR that needs me does. Expanding it shows the Stack as a tree, with an unwatched parent as a dim row.
 34. As the developer, I let a Stack land bottom-up, each PR through its own Gate and Merge, with the daemon retargeting and updating the next PR of a non-native Stack.
 35. As the developer, I get a PR entry on a child whose parent closed unmerged, and the daemon leaves the child alone.
 
