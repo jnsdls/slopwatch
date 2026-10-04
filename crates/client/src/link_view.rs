@@ -1,13 +1,14 @@
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::{ActiveTheme, Theme};
+use gpui_kit::component::button::Button;
 use gpui_kit::*;
 use slopwatch_protocol::BUILD_ID;
 
 use crate::agent::{Agent, AgentStatus};
+use crate::components::ButtonLooks;
 use crate::link::LinkState;
+use crate::theme;
 
 /// The window's only view for now: whether the GUI reached the daemon, and
 /// a way to bring it back when it's down.
@@ -58,12 +59,12 @@ pub enum Tone {
 }
 
 impl Tone {
-    fn color(self, theme: &Theme) -> Hsla {
+    fn color(self) -> Rgba {
         match self {
-            Tone::Neutral => theme.muted_foreground,
-            Tone::Good => theme.success,
-            Tone::Warning => theme.warning,
-            Tone::Bad => theme.danger,
+            Tone::Neutral => theme::DIM,
+            Tone::Good => theme::PASS,
+            Tone::Warning => theme::INC,
+            Tone::Bad => theme::FAIL,
         }
     }
 }
@@ -149,7 +150,6 @@ pub fn describe(state: &LinkState) -> Description {
 
 impl Render for LinkView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let description = describe(&self.state);
         let mut buttons = div().flex().gap_2().pt_2();
         for recovery in description.recoveries {
@@ -159,7 +159,7 @@ impl Render for LinkView {
                     view.run(recovery);
                 }));
             if recovery == Recovery::Reregister {
-                button = button.primary();
+                button = button.accent();
             }
             buttons = buttons.child(button);
         }
@@ -173,17 +173,17 @@ impl Render for LinkView {
             .gap_2()
             .px_8()
             .text_center()
-            .bg(theme.background)
+            .bg(theme::BG)
             .child(
                 div()
                     .text_xl()
-                    .text_color(description.tone.color(theme))
+                    .text_color(description.tone.color())
                     .child(description.headline),
             )
             .child(
                 div()
                     .text_sm()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme::DIM)
                     .child(description.detail),
             )
             .child(buttons)

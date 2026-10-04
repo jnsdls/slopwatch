@@ -23,6 +23,11 @@ fn main() {
     std::thread::Builder::new()
         .name("daemon-link".to_owned())
         .spawn(move || {
+            #[cfg(debug_assertions)]
+            if slopwatch_client::demo::enabled() {
+                slopwatch_client::demo::run(&to_send, |event| events.unbounded_send(event).is_ok());
+                return;
+            }
             let agent = link_agent.as_deref();
             let controls = link::Controls {
                 commands: &to_send,
@@ -47,6 +52,7 @@ fn main() {
 
     app.run(move |cx| {
         gpui_kit::init(cx);
+        slopwatch_client::theme::install(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_window_closed(|cx, _| cx.quit()).detach();

@@ -7,21 +7,25 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
+use gpui_kit::component::Sizable;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme, Selectable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
-use slopwatch_core::WaiverCategory;
+use slopwatch_core::{GateState, WaiverCategory};
 use slopwatch_protocol::{
-    Cause, Command, Flavor, InboxEntry, LogLevel, LogSource, PrRef, PrStatus, PullRequest, Reply,
-    RepoName, ResponseBody, RunView, Scope, StackParent, StepStatus, StepView, TopicUpdate,
+    Answer, Cause, Command, Flavor, InboxEntry, LogLevel, LogSource, PrRef, PrStatus, PullRequest,
+    Reply, RepoName, ResponseBody, RunView, Scope, StackParent, StepStatus, StepView, TopicUpdate,
 };
 
 use crate::agent::Agent;
+use crate::components::{
+    self, Ask, ButtonLooks, ChipKind, ask_card, chip, dot, gate_pill, mono, run_pill, section,
+    segment, severity, strip, verdict_label, well,
+};
 use crate::dock;
 use crate::inbox::{
-    ANSWERS, InboxModel, actions, answer as answer_entry, badge, held_line, history_line,
+    ANSWERS, InboxModel, actions, answer as answer_entry, badge, held_line, history_line, kicker,
 };
 use crate::library_view::LibraryView;
 use crate::link::{LinkEvent, LinkState};
@@ -38,18 +42,25 @@ use crate::plugins_view::PluginsView;
 use crate::prs::{
     PrState, Prs, Row as PrRow, Source, Stack, poll_line, status_line, storage_line, toggle_watch,
 };
-use crate::run_graph_view::{run_graph, tone_color};
+use crate::run_graph_view::run_graph;
 use crate::run_pane::{
-    GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, commit_line, end_label,
-    finding_line, gate_tone, run_label, run_tone, step_line, step_tone, waiver_line,
+    GRAPH_MODE_LIST_WIDTH, Look, PANE_PADDING, RunMode, RunPane, WaiveTarget, commit_line,
+    end_label, run_look, split_at_gate, step_look, step_state, waiver_line,
 };
 use crate::secrets::missing_secret;
 use crate::secrets_view::SecretsView;
 use crate::settings_view::SettingsView;
 use crate::step_log::{self, LogViewer, Row};
+use crate::theme;
 
 /// How see-through a PR list row is when it doesn't open.
 const DIM: f32 = 0.55;
+/// The prototype's column widths: the sources pane, then the PR list or
+/// the Inbox. The PR pane takes the rest.
+const SOURCES_WIDTH: f32 = 210.;
+const LIST_WIDTH: f32 = 380.;
+/// The PR list row under the mouse, which shows its Unwatch button.
+const ROW_GROUP: &str = "pr-row";
 
 /// What the window's own commands go out for ([`Outbox`]).
 const ADD_REPO: &str = "add-repo";
@@ -75,7 +86,7 @@ fn waive_action(target: &WaiveTarget) -> String {
 /// A PR list row's left padding: a Stack's PRs step in one level per
 /// parent.
 fn row_indent(row: PrRow<'_>) -> Pixels {
-    px(16.0 + 20.0 * row.depth() as f32)
+    px(12.0 + 20.0 * row.depth() as f32)
 }
 
 /// What fills the window right of the sources pane.
@@ -444,43 +455,43 @@ impl MainView {
     }
 
     fn sources(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let entry = |id: SharedString, label: String, count: Option<usize>, selected: bool| {
+        let entry = |id: SharedString, label: String, count: Option<Div>, selected: bool| {
             div()
                 .id(id)
                 .flex()
+                .items_center()
                 .justify_between()
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .text_sm()
-                .when(selected, |this| this.bg(theme.list_active))
-                .hover(|this| this.bg(theme.list_hover))
-                .child(label)
-                .children(count.filter(|&n| n > 0).map(|n| {
-                    div()
-                        .text_color(theme.muted_foreground)
-                        .child(n.to_string())
-                }))
+                .gap_2()
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(selected, |this| this.bg(theme::CHOSEN))
+                .when(!selected, |this| this.hover(|this| this.bg(theme::HOVER)))
+                .child(div().truncate().child(label))
+                .children(count)
         };
+        let counted = |n: usize| (n > 0).then(|| components::count(n, false));
+        let inbox = self.inbox.count();
 
         let mut pane = div()
             .id("sources")
-            .w(px(240.))
+            .w(px(SOURCES_WIDTH))
             .h_full()
+            .flex_none()
             .flex()
             .flex_col()
-            .gap_1()
-            .p_2()
-            .bg(theme.muted)
+            .px(px(6.))
+            .py(px(10.))
+            .bg(theme::PANEL)
             .border_r_1()
-            .border_color(theme.border)
+            .border_color(theme::LINE)
             .overflow_y_scroll()
             .child(
                 entry(
                     "source-inbox".into(),
                     "Inbox".to_owned(),
-                    Some(self.inbox.count()),
+                    (inbox > 0).then(|| components::count(inbox, true)),
                     self.pane == Pane::Inbox,
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -504,7 +515,7 @@ impl MainView {
                 entry(
                     "source-running".into(),
                     "Running".to_owned(),
-                    Some(self.prs.count(&Source::Running)),
+                    counted(self.prs.count(&Source::Running)),
                     self.showing(&Source::Running),
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -516,7 +527,7 @@ impl MainView {
                 entry(
                     "source-ended".into(),
                     "Ended".to_owned(),
-                    None,
+                    counted(self.prs.count(&Source::Ended)),
                     self.showing(&Source::Ended),
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -541,7 +552,7 @@ impl MainView {
                 entry(
                     "source-secrets".into(),
                     "Secrets".to_owned(),
-                    Some(self.secrets.read(cx).unset()),
+                    counted(self.secrets.read(cx).unset()),
                     self.pane == Pane::Secrets,
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -554,7 +565,7 @@ impl MainView {
                 entry(
                     "source-plugins".into(),
                     "Plugins".to_owned(),
-                    Some(self.plugins.read(cx).waiting()),
+                    counted(self.plugins.read(cx).waiting()),
                     self.pane == Pane::Plugins,
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -576,10 +587,11 @@ impl MainView {
             )
             .child(
                 div()
-                    .px_3()
-                    .pt_3()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .px(px(10.))
+                    .pt(px(10.))
+                    .pb(px(4.))
+                    .text_size(theme::LABEL_SIZE)
+                    .text_color(theme::MUTED)
                     .child("REPOS"),
             );
 
@@ -590,7 +602,7 @@ impl MainView {
                 entry(
                     format!("source-{repo}").into(),
                     repo.to_string(),
-                    Some(self.prs.watched_in(repo)),
+                    counted(self.prs.watched_in(repo)),
                     selected,
                 )
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -603,10 +615,12 @@ impl MainView {
                 pane = pane.child(
                     entry(
                         format!("source-{repo}-pipeline").into(),
-                        "    Pipeline".to_owned(),
+                        "Pipeline".to_owned(),
                         None,
                         false,
                     )
+                    .pl(px(22.))
+                    .text_color(theme::DIM)
                     .on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| {
                             this.open_pipeline(&chosen, cx);
@@ -620,104 +634,129 @@ impl MainView {
         let warning = self.prs.storage().map(|warning| {
             div()
                 .mt_3()
-                .px_3()
+                .px(px(10.))
                 .text_xs()
-                .text_color(theme.warning)
+                .text_color(theme::INC)
                 .child(storage_line(warning))
         });
-        let pane = match &self.picker {
-            None => pane.child(
+        let pane = pane.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px(px(4.))
+                .pt_2()
+                .child(
+                    Button::new(ADD_REPO)
+                        .label("Add repo…")
+                        .small()
+                        .when(self.picker.is_some(), |button| button.accent())
+                        .pending(self.outbox.waiting(ADD_REPO))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
+                            this.outbox.press(ADD_REPO, Command::ListAvailableRepos);
+                        })),
+                )
+                .children(refusal(&self.outbox, ADD_REPO)),
+        );
+        pane.children(warning)
+    }
+
+    /// The repos the developer can add, on a card in the middle of the
+    /// window: the tour's first step.
+    fn repo_picker(&self, available: &[RepoName], cx: &mut Context<Self>) -> impl IntoElement {
+        let mut card = components::card()
+            .w(px(560.))
+            .p(px(16.))
+            .gap(px(4.))
+            .child(
                 div()
-                    .px_1()
-                    .pt_2()
-                    .child(
-                        Button::new(ADD_REPO)
-                            .label("Add repo…")
-                            .small()
-                            .ghost()
-                            .pending(self.outbox.waiting(ADD_REPO))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, _| {
-                                this.outbox.press(ADD_REPO, Command::ListAvailableRepos);
-                            })),
-                    )
-                    .children(refusal(&self.outbox, ADD_REPO, theme)),
-            ),
-            Some(available) => {
-                let mut picker = div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .mt_2()
-                    .p_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
-                    .child(
-                        div()
-                            .px_2()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child("Repos you can push to"),
-                    );
-                if available.is_empty() {
-                    picker = picker.child(div().px_2().text_sm().child("None left to add."));
-                }
-                for repo in available {
-                    let chosen = repo.clone();
-                    picker = picker.child(
-                        div()
-                            .id(SharedString::from(format!("add-{repo}")))
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_sm()
-                            .hover(|this| this.bg(theme.list_hover))
-                            .child(repo.to_string())
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.send(Command::AddRepo {
-                                    repo: chosen.clone(),
-                                });
-                                this.open_pipeline(&chosen, cx);
-                                this.onboarding = Some(chosen.clone());
-                                this.prs.source = Source::Repo(chosen.clone());
-                                this.picker = None;
-                                cx.notify();
-                            })),
-                    );
-                }
-                picker = picker.child(
+                    .text_size(theme::LABEL_SIZE)
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::ACCENT)
+                    .child("ADD A REPO"),
+            )
+            .child(
+                div()
+                    .pb(px(6.))
+                    .text_size(theme::HEADING_SIZE)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Which repo?"),
+            );
+        if available.is_empty() {
+            card = card.child(div().text_color(theme::DIM).child("None left to add."));
+        }
+        for repo in available {
+            let chosen = repo.clone();
+            card = card.child(
+                div()
+                    .id(SharedString::from(format!("add-{repo}")))
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(theme::LINE)
+                    .cursor_pointer()
+                    .hover(|this| this.text_color(theme::ACCENT))
+                    .child(mono(repo.to_string()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.send(Command::AddRepo {
+                            repo: chosen.clone(),
+                        });
+                        this.open_pipeline(&chosen, cx);
+                        this.onboarding = Some(chosen.clone());
+                        this.prs.source = Source::Repo(chosen.clone());
+                        this.picker = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        card = card
+            .child(div().pt(px(6.)).text_xs().text_color(theme::DIM).child(
+                "From gh: repos you can push to. The daemon makes its own blobless clone, \
+                 never your checkout.",
+            ))
+            .child(
+                div().pt(px(6.)).flex().child(
                     Button::new("close-picker")
                         .label("Cancel")
                         .small()
-                        .ghost()
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.picker = None;
                             cx.notify();
                         })),
-                );
-                pane.child(picker)
-            }
-        };
-        pane.children(warning)
+                ),
+            );
+        div()
+            .relative()
+            .flex_1()
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(components::dot_grid())
+            .child(card)
     }
 
-    fn pr_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let mut list = div()
-            .id("pr-list")
-            .map(|this| {
-                if self.run_pane.graph_shown() {
-                    this.flex_none().w(px(GRAPH_MODE_LIST_WIDTH))
-                } else {
-                    this.flex_1()
-                }
-            })
+    /// The PR list's or the Inbox's column: fixed, and narrower while the
+    /// PR pane draws a graph.
+    fn list_column(&self, id: &'static str) -> Stateful<Div> {
+        let width = if self.run_pane.graph_shown() {
+            GRAPH_MODE_LIST_WIDTH
+        } else {
+            LIST_WIDTH
+        };
+        div()
+            .id(id)
+            .w(px(width))
+            .flex_none()
             .h_full()
             .flex()
             .flex_col()
-            .overflow_y_scroll();
+            .border_r_1()
+            .border_color(theme::LINE)
+            .overflow_y_scroll()
+    }
 
+    fn pr_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut list = self.list_column("pr-list");
         let rows = self.prs.rows();
         if rows.is_empty() {
             let empty = if !self.prs.loaded() {
@@ -731,101 +770,107 @@ impl MainView {
             } else {
                 "No open PRs by you."
             };
-            list = list.child(
-                div()
-                    .p_6()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(empty),
-            );
+            list = list.child(div().p(px(14.)).text_color(theme::DIM).child(empty));
         }
         for row in rows {
             list = match row {
                 PrRow::Stack(stack) => list.child(self.stack_row(stack, cx)),
                 PrRow::Pr { pr, .. } => list.child(self.pr_row(pr, row, cx)),
                 PrRow::Parent { repo, parent, .. } => {
-                    list.child(self.unlisted_parent_row(repo, parent, row, cx))
+                    list.child(self.unlisted_parent_row(repo, parent, row))
                 }
             };
         }
         list
     }
 
+    /// A row of the PR list, with its left padding stepped in for a
+    /// Stack's PRs.
+    fn row(id: SharedString, row: PrRow<'_>) -> Stateful<Div> {
+        div()
+            .id(id)
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .pr(px(12.))
+            .pl(row_indent(row))
+            .py(px(9.))
+            .border_b_1()
+            .border_color(theme::LINE)
+    }
+
     /// A Stack's summary row. A click expands or collapses it.
     fn stack_row(&self, stack: Stack<'_>, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let tone = match stack.worst() {
-            Some(PrState::NeedsYou) => theme.warning,
-            Some(PrState::Failed) => theme.danger,
-            Some(PrState::Passed) => theme.success,
-            _ => theme.muted_foreground,
+            Some(PrState::NeedsYou) => theme::ASK,
+            Some(PrState::Failed) => theme::ESCALATION_TEXT,
+            Some(PrState::Passed) => theme::PASS,
+            _ => theme::DIM,
         };
         // The Gate of the PR that needs attention, and why it does.
-        let attention = stack.attention.map(|attention| {
-            let gate = attention.pr.runs.first().map(|run| run.gate);
+        let gate = stack
+            .attention
+            .and_then(|attention| attention.pr.runs.first())
+            .map(run_pill);
+        let attention = stack.attention.map(|attention| attention.line());
+        let (repo, root) = (stack.repo.clone(), stack.root);
+        Self::row(
+            SharedString::from(format!("stack-{}-{}", stack.repo, stack.root)),
+            PrRow::Stack(stack),
+        )
+        .cursor_pointer()
+        .hover(|this| this.bg(theme::ROW_HOVER))
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.prs.toggle(&repo, root);
+            cx.notify();
+        }))
+        .child(
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .text_xs()
-                .children(gate.map(|gate| {
+                .child(
                     div()
-                        .px_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(tone_color(theme, gate_tone(gate)))
-                        .text_color(tone_color(theme, gate_tone(gate)))
-                        .child(format!("Gate {gate}"))
-                }))
-                .child(div().truncate().child(attention.line()))
-        });
-        let (repo, root) = (stack.repo.clone(), stack.root);
-        div()
-            .id(SharedString::from(format!(
-                "stack-{}-{}",
-                stack.repo, stack.root
-            )))
-            .flex()
-            .items_center()
-            .gap_3()
-            .pr_4()
-            .pl(row_indent(PrRow::Stack(stack)))
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .hover(|this| this.bg(theme.list_hover))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.prs.toggle(&repo, root);
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(if stack.expanded { "▾" } else { "▸" }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .text_sm()
-                            .child(div().truncate().child(stack.title()))
-                            .child(
-                                div()
-                                    .text_color(theme.muted_foreground)
-                                    .child(stack.size_line()),
-                            ),
-                    )
-                    .child(div().text_xs().text_color(tone).child(stack.status_line())),
-            )
-            .children(attention)
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme::DIM)
+                        .child(if stack.expanded { "▾" } else { "▸" }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(stack.title()),
+                )
+                .children(gate),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme::DIM)
+                .child(stack.size_line()),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .text_xs()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(tone)
+                        .child(stack.status_line()),
+                )
+                .children(attention.map(|line| {
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(theme::DIM)
+                        .child(line)
+                })),
+        )
     }
 
     /// A Stack parent that isn't one of the developer's PRs: dim, and it
@@ -835,30 +880,24 @@ impl MainView {
         repo: &RepoName,
         parent: &StackParent,
         row: PrRow<'_>,
-        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.theme();
-        div()
-            .id(SharedString::from(format!(
-                "parent-{repo}-{}",
-                parent.number
-            )))
-            .flex()
-            .flex_col()
-            .gap_0p5()
-            .pr_4()
-            .pl(row_indent(row))
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .opacity(DIM)
-            .child(div().text_sm().truncate().child(parent.title.clone()))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{repo}#{} · not yours, not watched", parent.number)),
-            )
+        Self::row(
+            SharedString::from(format!("parent-{repo}-{}", parent.number)),
+            row,
+        )
+        .opacity(DIM)
+        .child(
+            div()
+                .truncate()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(parent.title.clone()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme::DIM)
+                .child(format!("{repo}#{} · not yours, not watched", parent.number)),
+        )
     }
 
     fn pr_row(
@@ -867,112 +906,121 @@ impl MainView {
         stacked: PrRow<'_>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let theme = cx.theme();
         let selectable = stacked.selectable();
-        let tone = match pr.status {
-            PrStatus::NotWatched => theme.muted_foreground,
-            PrStatus::Waiting => theme.warning,
-            PrStatus::Ready => theme.success,
+        let latest = pr.runs.first().filter(|_| pr.watched());
+        let (status, tone) = match self.prs.waiting_on_you(pr) {
+            Some(waiting) if waiting.human => (waiting.line(), theme::ASK),
+            Some(waiting) => (waiting.line(), theme::ESCALATION_TEXT),
+            None if pr.blocked.is_some() || pr.status == PrStatus::Waiting => {
+                (status_line(pr), theme::INC)
+            }
+            None => (status_line(pr), theme::DIM),
         };
         let watched = pr.watched();
         let (action, command) = toggle_watch(pr);
-        let refused = refusal(&self.outbox, &action, theme);
+        let waiting = self.outbox.waiting(&action);
+        let refused = refusal(&self.outbox, &action);
+        // A watched row offers Unwatch only under the mouse.
+        let quiet = watched && !waiting && refused.is_none();
         let toggle = Button::new(SharedString::from(action.clone()))
             .label(if watched { "Unwatch" } else { "Watch" })
-            .small()
-            .when(watched, |button| button.ghost())
-            .when(!watched, |button| button.primary())
-            .pending(self.outbox.waiting(&action))
+            .xsmall()
+            .when(!watched, |button| button.accent())
+            .when(quiet, |button| {
+                button
+                    .invisible()
+                    .group_hover(ROW_GROUP, |style| style.visible())
+            })
+            .pending(waiting)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
                 this.outbox.press(&action, command.clone());
             }));
 
         let selected = self.run_pane.selected() == Some(&(pr.repo.clone(), pr.number));
         let row = pr.clone();
-        div()
-            .id(SharedString::from(format!("pr-{}-{}", pr.repo, pr.number)))
-            .flex()
-            .items_center()
-            .gap_3()
-            .pr_4()
-            .pl(row_indent(stacked))
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .when(selected, |this| this.bg(theme.list_active))
-            .when(!selectable, |this| this.opacity(DIM))
-            .when(selectable, |this| {
-                this.hover(|this| this.bg(theme.list_hover))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        for command in this.run_pane.select_pr(&row) {
-                            this.send(command);
-                        }
-                        cx.notify();
-                    }))
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .overflow_hidden()
-                    .child(div().text_sm().truncate().child(pr.title.clone()))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .text_xs()
-                            .child(
-                                div()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("{}#{}", pr.repo, pr.number)),
-                            )
-                            .child(div().text_color(tone).child(status_line(pr))),
-                    )
-                    .children(refused),
-            )
-            .child(toggle)
+        Self::row(
+            SharedString::from(format!("pr-{}-{}", pr.repo, pr.number)),
+            stacked,
+        )
+        .group(ROW_GROUP)
+        .when(selected, |this| this.bg(theme::ROW_CHOSEN))
+        .when(!selectable, |this| this.opacity(DIM))
+        .when(selectable && !selected, |this| {
+            this.hover(|this| this.bg(theme::ROW_HOVER))
+        })
+        .when(selectable, |this| {
+            this.cursor_pointer()
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    for command in this.run_pane.select_pr(&row) {
+                        this.send(command);
+                    }
+                    cx.notify();
+                }))
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(pr.title.clone()),
+                )
+                .children(latest.map(run_pill)),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme::DIM)
+                        .child(format!("{}#{}", pr.repo, pr.number)),
+                )
+                .children(latest.map(|run| strip(&run.strip))),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(12.))
+                        .text_color(tone)
+                        .child(status),
+                )
+                .child(toggle),
+        )
+        .children(refused)
     }
 
     /// Every open entry, oldest first. Clicking one opens its first PR in
     /// the PR pane.
     fn inbox_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let mut list = div()
-            .id("inbox-list")
-            .map(|this| {
-                if self.run_pane.graph_shown() {
-                    this.flex_none().w(px(GRAPH_MODE_LIST_WIDTH))
-                } else {
-                    this.flex_1()
-                }
-            })
-            .h_full()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_4()
-            .overflow_y_scroll();
+        let mut list = self.list_column("inbox-list").gap_2().p(px(12.));
         if let Some(text) = notice(SystemCenter::new(cx).permission()) {
             list = list.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
+                components::card()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme::DIM)
                     .child(text)
                     .child(
                         div().child(
                             Button::new("notification-settings")
                                 .label("Open System Settings")
                                 .small()
-                                .ghost()
                                 .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
                                     cx.open_url(&settings_url(Flavor::CURRENT.bundle_id()));
                                 })),
@@ -981,12 +1029,7 @@ impl MainView {
             );
         }
         if self.inbox.entries().is_empty() {
-            list = list.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child("Nothing needs you."),
-            );
+            list = list.child(div().text_color(theme::DIM).child("Nothing needs you."));
         }
         for entry in self.inbox.entries() {
             let held = entry
@@ -999,10 +1042,10 @@ impl MainView {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(theme.muted_foreground)
+                        .text_color(theme::DIM)
                         .child(held_line(entry)),
                 )
-                .hover(|this| this.bg(theme.list_hover))
+                .cursor_pointer()
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     if let Some(pr) = &held {
                         this.prs.expand_to(&pr.repo, pr.number);
@@ -1017,7 +1060,10 @@ impl MainView {
         list
     }
 
-    /// An open entry: its title, reasons and the buttons it offers.
+    /// An open entry as the prototype's amber card for a Human Step, or red
+    /// for an Escalation: its kicker, title, reasons and the buttons it
+    /// offers. `with_answers` gives a Human Step its note field and
+    /// answers, which only the PR pane draws.
     fn entry_card(
         &self,
         entry: &InboxEntry,
@@ -1025,69 +1071,25 @@ impl MainView {
         with_answers: bool,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let theme = cx.theme().clone();
-        let mut buttons = div().flex().gap_1();
+        let human = matches!(entry.scope, Scope::Human { .. });
+        let mut buttons = div().flex().flex_wrap().gap(px(6.)).mt(px(4.));
+        let mut any_button = false;
         // What the entry's buttons sent, to show their refusals under it.
         let mut sent = Vec::new();
-        for (label, command) in actions(entry) {
-            let id = SharedString::from(format!("{prefix}-{label}-{}", entry.id));
-            let action = entry_action(&label, entry);
-            buttons = buttons.child(
-                Button::new(id)
-                    .label(label)
-                    .small()
-                    .ghost()
-                    .pending(self.outbox.waiting(&action))
-                    .on_click(cx.listener({
-                        let action = action.clone();
-                        move |this, _: &ClickEvent, _, _| {
-                            this.outbox.press(&action, command.clone());
-                        }
-                    })),
-            );
-            sent.push(action);
-        }
-        if matches!(
-            entry.scope,
-            Scope::Cause {
-                cause: Cause::DailyBudget
-            }
-        ) {
-            let id = SharedString::from(format!("{prefix}-budget-settings-{}", entry.id));
-            buttons = buttons.child(Button::new(id).label("Settings").small().ghost().on_click(
-                cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.show_settings(cx);
-                }),
-            ));
-        }
-        if let Some(name) = missing_secret(entry).map(str::to_owned) {
-            let id = SharedString::from(format!("{prefix}-set-secret-{}", entry.id));
-            buttons = buttons.child(
-                Button::new(id)
-                    .label("Set Secret")
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.pane = Pane::Secrets;
-                        this.secrets
-                            .update(cx, |view, cx| view.choose(&name, window, cx));
-                        this.secrets.read(cx).refresh();
-                        cx.notify();
-                    })),
-            );
-        }
-        // A Human Step is answered next to the note field, which only the
-        // PR pane draws.
-        if with_answers && matches!(entry.scope, Scope::Human { .. }) {
+        if with_answers && human {
             for (label, answer) in ANSWERS {
                 let id = SharedString::from(format!("{prefix}-{label}-{}", entry.id));
                 let action = entry_action(label, entry);
                 let entry = entry.clone();
+                any_button = true;
                 buttons = buttons.child(
                     Button::new(id)
                         .label(label)
                         .small()
-                        .ghost()
+                        .map(|button| match answer {
+                            Answer::Approve => button.approve(),
+                            Answer::Reject => button.reject(),
+                        })
                         .pending(self.outbox.waiting(&action))
                         .on_click(cx.listener({
                             let action = action.clone();
@@ -1105,75 +1107,103 @@ impl MainView {
                 sent.push(action);
             }
         }
-        if let Some(plugin) = unapproved_plugin(entry).map(str::to_owned) {
-            let id = SharedString::from(format!("{prefix}-review-plugin-{}", entry.id));
+        for (label, command) in actions(entry) {
+            let id = SharedString::from(format!("{prefix}-{label}-{}", entry.id));
+            let action = entry_action(&label, entry);
+            any_button = true;
             buttons = buttons.child(
                 Button::new(id)
-                    .label("Review Plugin")
+                    .label(label)
                     .small()
-                    .ghost()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.pane = Pane::Plugins;
-                        this.plugins
-                            .update(cx, |view, cx| view.choose(&plugin, window, cx));
-                        this.plugins.read(cx).refresh();
-                        cx.notify();
+                    .pending(self.outbox.waiting(&action))
+                    .on_click(cx.listener({
+                        let action = action.clone();
+                        move |this, _: &ClickEvent, _, _| {
+                            this.outbox.press(&action, command.clone());
+                        }
                     })),
             );
+            sent.push(action);
         }
-        let mut card = div()
+        if matches!(
+            entry.scope,
+            Scope::Cause {
+                cause: Cause::DailyBudget
+            }
+        ) {
+            let id = SharedString::from(format!("{prefix}-budget-settings-{}", entry.id));
+            any_button = true;
+            buttons = buttons.child(Button::new(id).label("Settings").small().on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.show_settings(cx);
+                }),
+            ));
+        }
+        if let Some(name) = missing_secret(entry).map(str::to_owned) {
+            let id = SharedString::from(format!("{prefix}-set-secret-{}", entry.id));
+            any_button = true;
+            buttons = buttons.child(Button::new(id).label("Set Secret").small().on_click(
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.pane = Pane::Secrets;
+                    this.secrets
+                        .update(cx, |view, cx| view.choose(&name, window, cx));
+                    this.secrets.read(cx).refresh();
+                    cx.notify();
+                }),
+            ));
+        }
+        if let Some(plugin) = unapproved_plugin(entry).map(str::to_owned) {
+            let id = SharedString::from(format!("{prefix}-review-plugin-{}", entry.id));
+            any_button = true;
+            buttons = buttons.child(Button::new(id).label("Review Plugin").small().on_click(
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.pane = Pane::Plugins;
+                    this.plugins
+                        .update(cx, |view, cx| view.choose(&plugin, window, cx));
+                    this.plugins.read(cx).refresh();
+                    cx.notify();
+                }),
+            ));
+        }
+        let ask = if human { Ask::Human } else { Ask::Escalation };
+        let mut card = ask_card(ask, &kicker(entry, now_millis() / 1000))
             .id(SharedString::from(format!("{prefix}-entry-{}", entry.id)))
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_2()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.warning)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(div().text_sm().child(entry.title.clone()))
-                    .child(buttons),
-            );
+            .child(div().child(entry.title.clone()));
         for reason in &entry.reasons {
+            card = card.child(div().text_xs().text_color(theme::DIM).child(reason.clone()));
+        }
+        // One field, drawn once, for whichever Human Step gets answered.
+        if with_answers && human {
             card = card.child(
                 div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("• {reason}")),
+                    .mt(px(4.))
+                    .child(Input::new(&self.answer_note).small()),
             );
         }
+        if any_button {
+            card = card.child(buttons);
+        }
         for action in &sent {
-            card = card.children(refusal(&self.outbox, action, &theme));
+            card = card.children(refusal(&self.outbox, action));
         }
         card
     }
 
-    /// The selected PR: its Run history chips, newest first, then the Run
-    /// shown as a Step list with the Gate as its last row, or as a graph.
+    /// The selected PR: its header and open entries, its Run history
+    /// chips, newest first, then the Run shown as a Step list with the Gate
+    /// as a row, or as a graph.
     fn pr_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let color = |tone| tone_color(&theme, tone);
         let mut pane = div()
             .id("pr-pane")
-            .map(|this| {
-                if self.run_pane.graph_shown() {
-                    this.flex_1().min_w_0()
-                } else {
-                    this.w(px(400.))
-                }
-            })
+            .flex_1()
+            .min_w_0()
             .h_full()
             .flex()
             .flex_col()
-            .gap_3()
-            .p(px(PANE_PADDING))
-            .border_l_1()
-            .border_color(theme.border)
+            .gap(px(10.))
+            .px(px(PANE_PADDING))
+            .pt(px(14.))
+            .pb(px(24.))
             .overflow_y_scroll();
         let Some(pr) = self
             .run_pane
@@ -1182,99 +1212,93 @@ impl MainView {
         else {
             return pane.child(
                 div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme::DIM)
                     .child("Select a PR to see its Runs."),
             );
         };
 
-        let mode = self.run_pane.mode();
+        let shown = pr
+            .runs
+            .iter()
+            .find(|run| Some(run.id) == self.run_pane.shown());
+        let url = pr.url.clone();
         pane = pane.child(
             div()
                 .flex()
-                .items_start()
-                .justify_between()
-                .gap_2()
+                .flex_col()
+                .gap(px(4.))
                 .child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .min_w_0()
-                        .child(div().text_sm().child(pr.title.clone()))
+                        .items_center()
+                        .gap(px(10.))
                         .child(
                             div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(format!("{}#{}", pr.repo, pr.number)),
-                        ),
+                                .min_w_0()
+                                .truncate()
+                                .text_size(theme::TITLE_SIZE)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(pr.title.clone()),
+                        )
+                        .children(shown.map(run_pill)),
                 )
                 .child(
-                    ButtonGroup::new("run-mode")
-                        .small()
-                        .outline()
-                        .children(RunMode::ALL.map(|each| {
-                            Button::new(SharedString::from(format!("run-mode-{}", each.label())))
-                                .label(each.label())
-                                .selected(mode == each)
-                        }))
-                        .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
-                            if let Some(&mode) = clicked.first().and_then(|&i| RunMode::ALL.get(i))
-                            {
-                                this.run_pane.set_mode(mode);
-                                cx.notify();
-                            }
-                        })),
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(theme::DIM)
+                        .child(format!("{}#{} ·", pr.repo, pr.number))
+                        .child(components::link("pr-link", "PR on GitHub ↗", url)),
                 ),
         );
         if let Some(blocked) = &pr.blocked {
             pane = pane.child(
                 div()
                     .text_xs()
-                    .text_color(theme.warning)
+                    .text_color(theme::INC)
                     .child(blocked.clone()),
             );
         }
+        // An open Human Step or Escalation, with its actions inline.
         let entries = self.inbox.for_pr(&pr.repo, pr.number);
-        for entry in &entries {
-            pane = pane.child(self.entry_card(entry, "pr", true, cx));
-        }
-        // One field, drawn once, for whichever Human Step gets answered.
-        if entries
+        let first_human = entries
             .iter()
-            .any(|entry| matches!(entry.scope, Scope::Human { .. }))
-        {
-            pane = pane.child(Input::new(&self.answer_note).small());
+            .position(|entry| matches!(entry.scope, Scope::Human { .. }));
+        for (index, entry) in entries.iter().enumerate() {
+            let answers = Some(index) == first_human;
+            pane = pane.child(self.entry_card(entry, "pr", answers, cx));
         }
         if pr.runs.is_empty() {
-            return pane.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child("No Runs yet."),
-            );
+            return pane.child(div().text_color(theme::DIM).child("No Runs yet."));
         }
 
-        let mut chips = div().flex().flex_wrap().gap_1();
+        let mut chips = div().flex().flex_wrap().gap(px(6.));
         for run in &pr.runs {
-            let shown = self.run_pane.shown() == Some(run.id);
+            let on = self.run_pane.shown() == Some(run.id);
             let (id, row) = (run.id, pr.clone());
             chips = chips.child(
                 div()
                     .id(SharedString::from(format!("run-chip-{id}")))
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .px(px(8.))
+                    .py(px(2.))
+                    .rounded(px(6.))
                     .border_1()
-                    .border_color(if shown {
-                        theme.foreground
-                    } else {
-                        theme.border
-                    })
-                    .text_xs()
-                    .text_color(color(run_tone(run)))
-                    .hover(|this| this.bg(theme.list_hover))
-                    .child(format!("#{id} {}", run_label(run)))
+                    .border_color(if on { theme::ACCENT } else { theme::LINE })
+                    .when(on, |this| this.bg(theme::ACCENT_BG))
+                    .when(!on, |this| this.hover(|this| this.border_color(theme::DIM)))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .child(dot(run_look(run)))
+                    .child(format!("Run {id}"))
+                    .child(div().text_color(theme::DIM).child(match run.end {
+                        Some(reason) => end_label(reason, run.waived),
+                        None => "live".to_owned(),
+                    }))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         for command in this.run_pane.select_run(id, &row) {
                             this.send(command);
@@ -1283,47 +1307,24 @@ impl MainView {
                     })),
             );
         }
-        pane = pane.child(chips);
+        pane = pane.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(section("Run history"))
+                .child(chips),
+        );
 
         let Some(view) = self.run_pane.view() else {
             return pane;
         };
-        let short = |sha: &str| sha.chars().take(7).collect::<String>();
-        pane = pane.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!(
-                            "Head {} · Pipeline from {} at {}",
-                            short(&view.head_sha),
-                            view.base,
-                            short(&view.base_sha)
-                        )),
-                )
-                .when_some(self.run_pane.cancel(), |this, cancel| {
-                    this.child(
-                        Button::new(CANCEL_RUN)
-                            .label("Cancel Run")
-                            .small()
-                            .ghost()
-                            .pending(self.outbox.waiting(CANCEL_RUN))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
-                                this.outbox.press(CANCEL_RUN, cancel.clone());
-                            })),
-                    )
-                }),
-        );
-        pane = pane.children(refusal(&self.outbox, CANCEL_RUN, &theme));
+        pane = pane.child(self.run_line(view, cx));
+        pane = pane.children(refusal(&self.outbox, CANCEL_RUN));
         if let Some(viewer) = self.run_pane.viewer() {
             return pane.child(self.log_viewer(viewer, view, cx));
         }
-        if mode == RunMode::Graph {
+        if self.run_pane.mode() == RunMode::Graph {
             let pane_view = cx.entity().downgrade();
             let on_select = Rc::new(move |step: &str, _: &mut Window, cx: &mut App| {
                 let _ = pane_view.update(cx, |this, cx| {
@@ -1333,138 +1334,170 @@ impl MainView {
                     cx.notify();
                 });
             });
-            pane = pane
-                .child(run_graph(
-                    view,
-                    self.run_pane.open_step(),
-                    &theme,
-                    on_select,
-                ))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("Solid: needs · dashed: read by the Gate · dashed box: advisory"),
-                );
+            pane = pane.child(run_graph(view, self.run_pane.open_step(), on_select));
             let open = self.run_pane.open_step().and_then(|id| view.step(id));
-            if let Some(step) = open {
-                pane = pane.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .border_1()
-                        .border_color(theme.border)
-                        .rounded_md()
-                        .child(self.step_row(step, view, cx)),
-                );
+            match open {
+                Some(step) => pane = pane.child(self.step_row(step, view, true, cx)),
+                None => {
+                    pane = pane.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::DIM)
+                            .child("Click a Step for its Outcome."),
+                    )
+                }
             }
             if self.run_pane.can_override() {
-                pane = pane.child(
-                    div().child(
-                        Button::new("override-gate")
-                            .label("Override Gate")
-                            .small()
-                            .ghost()
-                            .pending(self.outbox.waiting(&waive_action(&WaiveTarget::Gate)))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.run_pane.start_waiver(WaiveTarget::Gate);
-                                cx.notify();
-                            })),
-                    ),
-                );
+                pane = pane.child(div().flex().child(self.override_button(cx)));
             }
         } else {
             pane = pane.child(self.step_list(view, cx));
         }
-        pane = pane.children(refusal(
-            &self.outbox,
-            &waive_action(&WaiveTarget::Gate),
-            &theme,
-        ));
+        pane = pane.children(refusal(&self.outbox, &waive_action(&WaiveTarget::Gate)));
         if self.run_pane.waiver_form().is_some() {
             pane = pane.child(self.waiver_form(cx));
-        }
-        if let Some(cost) = view.cost() {
-            pane = pane.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("Run cost: {cost}")),
-            );
-        }
-        if let Some(end) = view.end {
-            pane = pane.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("Ended: {}", end_label(end, view.waived))),
-            );
         }
         if !view.inbox.is_empty() {
             let mut history = div()
                 .flex()
                 .flex_col()
-                .gap_0p5()
+                .gap(px(2.))
                 .text_xs()
-                .text_color(theme.muted_foreground)
-                .child("Inbox history");
+                .text_color(theme::DIM)
+                .child(section("Inbox history"));
             for entry in &view.inbox {
-                history = history.child(format!("• {}", history_line(entry)));
+                history = history.child(history_line(entry));
             }
             pane = pane.child(history);
         }
         pane
     }
 
-    /// The Run as a Step list, with the Gate as its last row.
-    fn step_list(&self, view: &RunView, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme().clone();
-        let color = |tone| tone_color(&theme, tone);
-        let mut steps = div()
+    /// One line about the shown Run: its number, head SHA, time, cost and
+    /// where its Pipeline came from, then the List/Graph toggle and Cancel
+    /// Run.
+    fn run_line(&self, view: &RunView, cx: &mut Context<Self>) -> impl IntoElement {
+        let short = |sha: &str| sha.chars().take(7).collect::<String>();
+        let shown = self.run_pane.shown().map_or(0, |run| run.0);
+        let mut facts = div()
+            .flex_1()
+            .min_w_0()
             .flex()
-            .flex_col()
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md();
-        for step in &view.steps {
-            steps = steps.child(self.step_row(step, view, cx));
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .child(format!("Run {shown} ·"))
+            .child(mono(short(&view.head_sha)).text_color(theme::TEXT));
+        if let Some(time) = self.run_pane.run_time(now_millis()) {
+            let so_far = if view.end.is_some() { "" } else { " so far" };
+            facts = facts.child(format!("· {time}{so_far}"));
         }
-        let gate = view.gate.unwrap_or(slopwatch_core::GateState::Pending);
+        if let Some(cost) = view.cost() {
+            facts = facts.child(format!("· {cost}"));
+        }
+        facts = facts
+            .child(format!("· Pipeline from {} at", view.base))
+            .child(mono(short(&view.base_sha)));
+        let mode = self.run_pane.mode();
+        let mut toggle = div().flex_none().flex();
+        for (index, each) in RunMode::ALL.into_iter().enumerate() {
+            toggle = toggle.child(
+                segment(
+                    SharedString::from(format!("run-mode-{}", each.label())),
+                    each.label(),
+                    mode == each,
+                    index == 0,
+                    index + 1 == RunMode::ALL.len(),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.run_pane.set_mode(each);
+                    cx.notify();
+                })),
+            );
+        }
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .text_color(theme::DIM)
+            .child(facts)
+            .child(toggle)
+            .when_some(self.run_pane.cancel(), |this, cancel| {
+                this.child(
+                    Button::new(CANCEL_RUN)
+                        .label("Cancel Run")
+                        .small()
+                        .pending(self.outbox.waiting(CANCEL_RUN))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
+                            this.outbox.press(CANCEL_RUN, cancel.clone());
+                        })),
+                )
+            })
+    }
+
+    fn override_button(&self, cx: &mut Context<Self>) -> Button {
+        Button::new("override-gate")
+            .label("Override Gate")
+            .small()
+            .pending(self.outbox.waiting(&waive_action(&WaiveTarget::Gate)))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.run_pane.start_waiver(WaiveTarget::Gate);
+                cx.notify();
+            }))
+    }
+
+    /// The Run as a Step list, with the Gate as a row between the Steps it
+    /// reads and the Steps that run after it.
+    fn step_list(&self, view: &RunView, cx: &mut Context<Self>) -> Div {
+        let (before, after) = split_at_gate(&view.steps);
+        let mut steps = div().flex().flex_col().gap(px(6.));
+        for step in before {
+            steps = steps.child(self.step_row(step, view, false, cx));
+        }
+        let gate = view.gate.unwrap_or(GateState::Pending);
+        let reads: Vec<&str> = view
+            .steps
+            .iter()
+            .filter(|step| step.info.gated)
+            .map(|step| step.info.id.as_str())
+            .collect();
         steps = steps.child(
             div()
                 .flex()
-                .justify_between()
-                .px_3()
-                .py_2()
-                .text_sm()
                 .items_center()
                 .gap_2()
-                .child(format!("Gate {}", view.gate_text))
+                .px(px(10.))
+                .py(px(7.))
+                .rounded(px(8.))
+                .border_2()
+                .border_color(theme::gate_line(gate))
+                .bg(theme::GATE_BG)
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .when(self.run_pane.can_override(), |this| {
-                            this.child(
-                                Button::new("override-gate")
-                                    .label("Override Gate")
-                                    .small()
-                                    .ghost()
-                                    .pending(self.outbox.waiting(&waive_action(&WaiveTarget::Gate)))
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        this.run_pane.start_waiver(WaiveTarget::Gate);
-                                        cx.notify();
-                                    })),
-                            )
-                        })
-                        .child(
-                            div()
-                                .text_color(color(gate_tone(gate)))
-                                .child(gate.to_string()),
-                        ),
-                ),
+                        .flex_none()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::GATE_TEXT)
+                        .child("GATE"),
+                )
+                .child(gate_pill(gate))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme::DIM)
+                        .child(reads.join(" · ")),
+                )
+                .when(self.run_pane.can_override(), |this| {
+                    this.child(self.override_button(cx))
+                }),
         );
+        for step in after {
+            steps = steps.child(self.step_row(step, view, false, cx));
+        }
         steps
     }
 
@@ -1472,190 +1505,364 @@ impl MainView {
     /// that send or drop it. On an ended Run, sending starts a new Run on
     /// the same SHA.
     fn waiver_form(&self, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
         let Some(form) = self.run_pane.waiver_form() else {
             return div();
         };
         let title = match &form.target {
-            WaiveTarget::Step(step) => format!("Waive `{step}` for this head SHA"),
+            WaiveTarget::Step(step) => format!("Waive {step} for this head SHA"),
             WaiveTarget::Gate => "Override the Gate: waive every failing term".to_owned(),
         };
-        let mut categories = div().flex().flex_wrap().gap_1();
+        let mut categories = div().flex().flex_wrap().gap(px(6.));
         for category in WaiverCategory::ALL {
             categories = categories.child(
                 Button::new(SharedString::from(format!("waiver-category-{category:?}")))
                     .label(category.to_string())
                     .small()
-                    .when(form.category == category, |button| button.primary())
+                    .when(form.category == category, |button| button.accent())
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.run_pane.pick_category(category);
                         cx.notify();
                     })),
             );
         }
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .border_1()
-            .border_color(theme.border)
-            .rounded_md()
-            .child(div().text_sm().child(title))
+        components::card()
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(title))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::DIM)
+                    .child("Counts as pass for this head SHA only. A push clears it."),
+            )
             .child(categories)
             .child(Input::new(&self.waiver_reason).small())
             .child(
                 div()
                     .flex()
-                    .gap_2()
-                    .child(
-                        Button::new("waiver-submit")
-                            .label("Waive")
-                            .small()
-                            .primary()
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.submit_waiver(window, cx);
-                            })),
-                    )
+                    .justify_end()
+                    .gap(px(8.))
                     .child(
                         Button::new("waiver-cancel")
                             .label("Cancel")
                             .small()
-                            .ghost()
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.run_pane.cancel_waiver();
                                 cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("waiver-submit")
+                            .label("Waive")
+                            .small()
+                            .accent()
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.submit_waiver(window, cx);
                             })),
                     ),
             )
     }
 
-    /// A Step's row with its Verdict and reason, its Findings, and its log
-    /// tail while open. The list shows one per Step, and the graph shows the open
-    /// Step's below the canvas.
-    fn step_row(&self, step: &StepView, view: &RunView, cx: &mut Context<Self>) -> Stateful<Div> {
-        let theme = cx.theme().clone();
-        let color = |tone| tone_color(&theme, tone);
-        let open = self.run_pane.open_step() == Some(step.info.id.as_str());
-        let toggled = step.info.id.clone();
-        let retry_action = format!("retry-{}", step.info.id);
-        let waive = waive_action(&WaiveTarget::Step(step.info.id.clone()));
-        let mut row = div()
-            .id(SharedString::from(format!("step-{}", step.info.id)))
+    /// A Step's row: its dot, name, chips, Verdict and time. Its evidence
+    /// shows below while it's open, and on a Step that failed, errored or
+    /// waits on the developer. `alone` when the graph shows the row under
+    /// the canvas, always open.
+    fn step_row(
+        &self,
+        step: &StepView,
+        view: &RunView,
+        alone: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let info = &step.info;
+        let look = step_look(step);
+        let open = alone || self.run_pane.open_step() == Some(info.id.as_str());
+        let shows = open || matches!(look, Look::Fail | Look::Error | Look::Asking);
+        let after_gate = split_at_gate(&view.steps)
+            .1
+            .iter()
+            .any(|each| each.info.id == info.id);
+        let advisory = !info.gated && !after_gate;
+        let findings = match &step.status {
+            StepStatus::Settled { outputs, .. } => outputs.findings.len(),
+            _ => 0,
+        };
+        let skip_reason = match &step.status {
+            StepStatus::Settled {
+                verdict: slopwatch_core::Verdict::Skipped,
+                reason: Some(reason),
+                ..
+            } => Some(reason.clone()),
+            _ => None,
+        };
+        let label = verdict_text(step, look);
+        let time = self.run_pane.step_time(&info.id, now_millis());
+        let toggled = info.id.clone();
+        let header = div()
+            .id(SharedString::from(format!("step-head-{}", info.id)))
             .flex()
-            .flex_col()
-            .gap_0p5()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .hover(|this| this.bg(theme.list_hover))
+            .items_center()
+            .gap_2()
+            .px(px(10.))
+            .py(px(7.))
+            .cursor_pointer()
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 for command in this.run_pane.toggle_step(&toggled) {
                     this.send(command);
                 }
                 cx.notify();
             }))
+            .child(dot(look))
             .child(
                 div()
-                    .flex()
-                    .justify_between()
-                    .gap_2()
-                    .text_sm()
-                    .child(if step.info.gated {
-                        step.info.id.clone()
-                    } else {
-                        format!("{} (advisory)", step.info.id)
-                    })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(step.info.plugin.clone()),
-                    ),
+                    .flex_shrink(1.)
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(info.id.clone()),
             )
+            .when(info.write, |this| {
+                this.child(chip(ChipKind::Write, "commit ends Run").flex_none())
+            })
+            .when(advisory, |this| {
+                this.child(chip(ChipKind::Advisory, "advisory").flex_none())
+            })
+            .when(findings > 0, |this| {
+                let text = match findings {
+                    1 => "1 finding".to_owned(),
+                    n => format!("{n} findings"),
+                };
+                this.child(chip(ChipKind::Plain, text).flex_none())
+            })
+            .child(div().flex_1())
+            .children(skip_reason.map(|reason| {
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme::DIM)
+                    .child(reason)
+            }))
+            .child(verdict_label(look, label))
             .child(
                 div()
+                    .flex_none()
+                    .w(px(52.))
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(color(step_tone(step)))
-                            .child(step_line(step)),
-                    )
-                    .when_some(self.run_pane.retry(&step.info.id), |this, retry| {
-                        this.child(
-                            Button::new(SharedString::from(retry_action.clone()))
-                                .label("Retry")
-                                .small()
-                                .ghost()
-                                .pending(self.outbox.waiting(&retry_action))
-                                .on_click(cx.listener({
-                                    let action = retry_action.clone();
-                                    move |this, _: &ClickEvent, _, _| {
-                                        this.outbox.press(&action, retry.clone());
-                                    }
-                                })),
-                        )
-                    })
-                    .when(self.run_pane.can_waive(&step.info.id), |this| {
-                        let target = WaiveTarget::Step(step.info.id.clone());
-                        this.child(
-                            Button::new(SharedString::from(waive.clone()))
-                                .label("Waive")
-                                .small()
-                                .ghost()
-                                .pending(self.outbox.waiting(&waive))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.run_pane.start_waiver(target.clone());
-                                    cx.notify();
-                                })),
-                        )
-                    }),
-            )
-            .children(waiver_line(step).map(|line| {
-                div()
+                    .justify_end()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(line)
-            }))
-            .children(commit_line(view, step).map(|line| {
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(line)
-            }))
-            .children(refusal(&self.outbox, &retry_action, &theme))
-            .children(refusal(&self.outbox, &waive, &theme));
-        if let slopwatch_protocol::StepStatus::Settled { outputs, .. } = &step.status {
-            for finding in &outputs.findings {
-                row = row.child(
+                    .text_color(theme::DIM)
+                    .children(time),
+            );
+        let row = div()
+            .id(SharedString::from(format!("step-{}", info.id)))
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme::LINE)
+            .when(advisory, |this| this.border_dashed())
+            .bg(theme::PANEL)
+            .child(header);
+        if !shows {
+            return row;
+        }
+        row.child(self.evidence(step, view, look, open, cx))
+    }
+
+    /// What an open Step row shows: its Outcome's facts, Waiver, Findings
+    /// and note, its log tail while it's the open Step, and the actions
+    /// that apply to it.
+    fn evidence(
+        &self,
+        step: &StepView,
+        view: &RunView,
+        look: Look,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let info = &step.info;
+        let kv = |key: &str, value: AnyElement| {
+            div()
+                .flex()
+                .gap(px(10.))
+                .text_size(px(12.))
+                .child(
                     div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(finding_line(finding)),
+                        .flex_none()
+                        .w(px(80.))
+                        .text_color(theme::DIM)
+                        .child(key.to_owned()),
+                )
+                .child(div().min_w_0().child(value))
+        };
+        let mut facts = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(kv("Plugin", mono(info.plugin.clone()).into_any_element()))
+            .child(kv(
+                "Verdict",
+                verdict_label(look, verdict_text(step, look)).into_any_element(),
+            ));
+        if let Some(time) = self.run_pane.step_time(&info.id, now_millis()) {
+            let so_far = if matches!(step.status, StepStatus::Running) {
+                " so far"
+            } else {
+                ""
+            };
+            facts = facts.child(kv("Time", format!("{time}{so_far}").into_any_element()));
+        }
+        if let Some(cost) = step.cost {
+            facts = facts.child(kv("Cost", cost.to_string().into_any_element()));
+        }
+        if let Some(progress) = step
+            .progress
+            .as_ref()
+            .filter(|_| matches!(step.status, StepStatus::Running))
+        {
+            facts = facts.child(kv("Progress", progress.clone().into_any_element()));
+        }
+        if !info.needs.is_empty() {
+            facts = facts.child(kv("Reads", info.needs.join(", ").into_any_element()));
+        }
+        let role = if info.gated {
+            "required".to_owned()
+        } else if info.needs.iter().any(|need| need == slopwatch_core::GATE) {
+            "runs after the Gate".to_owned()
+        } else {
+            "advisory".to_owned()
+        };
+        facts = facts.child(kv("Gate", role.into_any_element()));
+        if let Some(condition) = &info.condition {
+            facts = facts.child(kv("Condition", mono(condition.clone()).into_any_element()));
+        }
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .pl(px(27.))
+            .pr(px(12.))
+            .pt(px(6.))
+            .pb(px(10.))
+            .border_t_1()
+            .border_color(theme::LINE)
+            .child(facts);
+        if let Some(line) = waiver_line(step) {
+            body = body
+                .child(section("Waiver").mt(px(6.)))
+                .child(div().text_size(px(12.)).child(line));
+        }
+        if let Some(line) = commit_line(view, step) {
+            body = body.child(div().text_size(px(12.)).text_color(theme::DIM).child(line));
+        }
+        if let StepStatus::Settled {
+            outputs, reason, ..
+        } = &step.status
+        {
+            if !outputs.findings.is_empty() {
+                body = body.child(section("Findings").mt(px(6.)));
+            }
+            for finding in &outputs.findings {
+                let place = match (&finding.file, finding.line) {
+                    (Some(file), Some(line)) => Some(format!("{file}:{line}")),
+                    (Some(file), None) => Some(file.clone()),
+                    _ => None,
+                };
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap(px(6.))
+                        .py(px(2.))
+                        .text_size(px(12.))
+                        .child(severity(finding.severity))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex()
+                                .flex_wrap()
+                                .gap_x(px(6.))
+                                .child(finding.message.clone())
+                                .children(place.map(|place| mono(place).text_color(theme::DIM))),
+                        ),
+                );
+            }
+            let note = reason.as_ref().or(outputs.note.as_ref());
+            if let Some(note) = note {
+                let title = if reason.is_some() { "Reason" } else { "Note" };
+                body = body
+                    .child(section(title).mt(px(6.)))
+                    .child(div().text_size(px(12.)).child(note.clone()));
+            }
+            if let StepStatus::Settled {
+                reused_from: Some(run),
+                ..
+            } = step.status
+            {
+                body = body.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::DIM)
+                        .child(format!("Reused from Run {run}")),
                 );
             }
         }
         if open {
-            row = row.child(self.step_log_tail(step, view, cx));
+            body = body.child(self.step_log_tail(step, view, cx));
         }
-        row
+
+        let retry_action = format!("retry-{}", info.id);
+        let waive = waive_action(&WaiveTarget::Step(info.id.clone()));
+        let mut actions = div().flex().flex_wrap().gap(px(6.)).mt(px(6.));
+        let mut any = false;
+        if let Some(retry) = self.run_pane.retry(&info.id) {
+            any = true;
+            actions = actions.child(
+                Button::new(SharedString::from(retry_action.clone()))
+                    .label("Retry")
+                    .small()
+                    .pending(self.outbox.waiting(&retry_action))
+                    .on_click(cx.listener({
+                        let action = retry_action.clone();
+                        move |this, _: &ClickEvent, _, _| {
+                            this.outbox.press(&action, retry.clone());
+                        }
+                    })),
+            );
+        }
+        if self.run_pane.can_waive(&info.id) {
+            any = true;
+            let target = WaiveTarget::Step(info.id.clone());
+            actions = actions.child(
+                Button::new(SharedString::from(waive.clone()))
+                    .label("Waive…")
+                    .small()
+                    .pending(self.outbox.waiting(&waive))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.run_pane.start_waiver(target.clone());
+                        cx.notify();
+                    })),
+            );
+        }
+        if any {
+            body = body.child(actions);
+        }
+        body.children(refusal(&self.outbox, &retry_action))
+            .children(refusal(&self.outbox, &waive))
     }
 
-    /// The open Step row's last lines, with the way into its full log.
+    /// The open Step's last lines, with the way into its full log.
     fn step_log_tail(&self, step: &StepView, view: &RunView, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let mut tail = div().flex().flex_col().gap_1().pt_1();
+        let mut tail = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(section("Log tail").mt(px(6.)));
         if let Some(at) = view.pruned_at {
             return tail.child(
                 div()
                     .text_xs()
-                    .text_color(muted)
+                    .text_color(theme::DIM)
                     .child(format!("Log pruned on {}", step_log::date(at))),
             );
         }
@@ -1665,29 +1872,28 @@ impl MainView {
         } = step.status
         {
             return tail.child(
-                Button::new("reused-log")
-                    .label(format!("Full log from Run {run}"))
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        for command in this.run_pane.open_reused_log(run) {
-                            this.send(command);
-                        }
-                        cx.notify();
-                    })),
+                div().child(
+                    Button::new("reused-log")
+                        .label(format!("Full log from Run {run}"))
+                        .small()
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            for command in this.run_pane.open_reused_log(run) {
+                                this.send(command);
+                            }
+                            cx.notify();
+                        })),
+                ),
             );
         }
         if step.attempt == 0 {
-            return tail.child(div().text_xs().text_color(muted).child("Not started yet."));
+            return tail.child(
+                div()
+                    .text_xs()
+                    .text_color(theme::DIM)
+                    .child("Not started yet."),
+            );
         }
-        let mut lines = div()
-            .flex()
-            .flex_col()
-            .p_2()
-            .rounded_md()
-            .bg(theme.muted)
-            .font_family("Menlo")
-            .text_xs();
+        let mut lines = well().max_h(px(140.)).overflow_hidden();
         let mut any = false;
         for record in self.run_pane.tail() {
             any = true;
@@ -1699,21 +1905,24 @@ impl MainView {
             } else {
                 "The Step wrote nothing."
             };
-            lines = lines.child(div().text_color(muted).child(empty));
+            lines = lines.child(div().text_color(theme::DIM).child(empty));
         }
         tail = tail.child(lines);
-        let mut buttons = div().flex().flex_wrap().gap_1();
+        let mut buttons = div().flex().flex_wrap().gap(px(6.));
         for attempt in (1..=step.attempt).rev() {
             let label = if step.attempt == 1 {
-                "Full log".to_owned()
+                "Open full log".to_owned()
             } else {
                 format!("Full log, attempt {attempt}")
             };
             buttons = buttons.child(
-                Button::new(SharedString::from(format!("full-log-{attempt}")))
-                    .label(label)
-                    .small()
-                    .ghost()
+                div()
+                    .id(SharedString::from(format!("full-log-{attempt}")))
+                    .text_xs()
+                    .text_color(theme::LINK)
+                    .cursor_pointer()
+                    .hover(|this| this.underline())
+                    .child(label)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         for command in this.run_pane.open_log(attempt) {
                             this.send(command);
@@ -1728,8 +1937,6 @@ impl MainView {
     /// The full-log viewer: attempt tabs, search, the source and level
     /// filters, the Events toggle, then one page of the log.
     fn log_viewer(&self, viewer: &LogViewer, view: &RunView, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
         let attempts = view
             .step(&viewer.key.step)
             .map_or(viewer.key.attempt, |step| step.attempt.max(1));
@@ -1738,18 +1945,21 @@ impl MainView {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap_1()
+            .gap(px(6.))
             .child(
                 Button::new("close-log")
                     .label("← Steps")
                     .small()
-                    .ghost()
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.run_pane.close_log();
                         cx.notify();
                     })),
             )
-            .child(div().text_sm().child(viewer.key.step.clone()));
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(viewer.key.step.clone()),
+            );
         if attempts > 1 {
             for attempt in (1..=attempts).rev() {
                 let shown = attempt == viewer.key.attempt;
@@ -1757,8 +1967,7 @@ impl MainView {
                     Button::new(SharedString::from(format!("attempt-{attempt}")))
                         .label(format!("Attempt {attempt}"))
                         .small()
-                        .when(shown, |button| button.primary())
-                        .when(!shown, |button| button.ghost())
+                        .when(shown, |button| button.accent())
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             for command in this.run_pane.open_log(attempt) {
                                 this.send(command);
@@ -1772,12 +1981,11 @@ impl MainView {
         let toggle = |id: &'static str, label: &'static str, on: bool| {
             Button::new(id)
                 .label(label)
-                .small()
-                .when(on, |button| button.primary())
-                .when(!on, |button| button.ghost())
+                .xsmall()
+                .when(on, |button| button.accent())
         };
         let filter = &viewer.filter;
-        let mut filters = div().flex().flex_wrap().gap_1();
+        let mut filters = div().flex().flex_wrap().gap(px(4.));
         for (id, label, source) in [
             ("source-stderr", "stderr", LogSource::Stderr),
             ("source-log", "log", LogSource::Log),
@@ -1818,38 +2026,28 @@ impl MainView {
             )),
         );
         let copied = viewer.text(self.run_pane.events());
-        filters = filters.child(
-            Button::new("copy-log")
-                .label("Copy")
-                .small()
-                .ghost()
-                .on_click(move |_: &ClickEvent, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
-                }),
-        );
+        filters = filters.child(Button::new("copy-log").label("Copy").xsmall().on_click(
+            move |_: &ClickEvent, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copied.clone()));
+            },
+        ));
 
-        let mut lines = div()
-            .flex()
-            .flex_col()
-            .p_2()
-            .rounded_md()
-            .bg(theme.muted)
-            .font_family("Menlo")
-            .text_xs();
+        let mut lines = well();
         if viewer.has_older() {
             lines = lines.child(
-                Button::new("log-older")
-                    .label("Older")
-                    .small()
-                    .ghost()
-                    .pending(self.outbox.waiting(LOG))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.with_viewer(LogViewer::older);
-                        cx.notify();
-                    })),
+                div().pb_1().child(
+                    Button::new("log-older")
+                        .label("Older")
+                        .xsmall()
+                        .pending(self.outbox.waiting(LOG))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.with_viewer(LogViewer::older);
+                            cx.notify();
+                        })),
+                ),
             );
         }
-        let refused = refusal(&self.outbox, LOG, theme);
+        let refused = refusal(&self.outbox, LOG);
         let rows = viewer.rows(self.run_pane.events());
         if rows.is_empty() && refused.is_none() {
             let empty = if viewer.loading() {
@@ -1859,15 +2057,15 @@ impl MainView {
             } else {
                 "No lines match."
             };
-            lines = lines.child(div().text_color(muted).child(empty));
+            lines = lines.child(div().text_color(theme::DIM).child(empty));
         }
         lines = lines.children(refused);
         for row in &rows {
             let line = div().child(step_log::row_text(row));
             lines = lines.child(match row {
                 Row::Line(_) => line,
-                Row::Truncated(_) => line.text_color(theme.warning),
-                Row::Event { .. } => line.text_color(theme.info),
+                Row::Truncated(_) => line.text_color(theme::INC),
+                Row::Event { .. } => line.text_color(theme::RUN),
             });
         }
         if viewer.has_newer() {
@@ -1875,11 +2073,11 @@ impl MainView {
                 div()
                     .flex()
                     .gap_1()
+                    .pt_1()
                     .child(
                         Button::new("log-newer")
                             .label("Newer")
-                            .small()
-                            .ghost()
+                            .xsmall()
                             .pending(self.outbox.waiting(LOG))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.with_viewer(LogViewer::newer);
@@ -1889,8 +2087,7 @@ impl MainView {
                     .child(
                         Button::new("log-follow")
                             .label("Latest")
-                            .small()
-                            .ghost()
+                            .xsmall()
                             .pending(self.outbox.waiting(LOG))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.with_viewer(|viewer| Some(viewer.follow()));
@@ -1904,7 +2101,7 @@ impl MainView {
                 Some((StepStatus::Running, attempt)) if attempt == viewer.key.attempt
             )
         {
-            lines = lines.child(div().text_color(muted).child("Following live…"));
+            lines = lines.child(div().text_color(theme::DIM).child("Following live…"));
         }
 
         div()
@@ -1929,11 +2126,8 @@ impl MainView {
 
     /// The Pipeline editor, under a bar that leads back to the repo's PRs.
     fn pipeline_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let repo = self.pipeline.read(cx).repo().cloned();
-        let title = repo
-            .as_ref()
-            .map_or_else(String::new, |repo| format!("Pipeline · {repo}"));
+        let name = repo.as_ref().map_or_else(String::new, ToString::to_string);
         div()
             .flex_1()
             .h_full()
@@ -1944,40 +2138,47 @@ impl MainView {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
+                    .gap(px(10.))
+                    .px(px(14.))
+                    .py(px(8.))
+                    .bg(theme::PANEL)
                     .border_b_1()
-                    .border_color(theme.border)
+                    .border_color(theme::LINE)
                     .child(
                         Button::new("pipeline-back")
-                            .label("‹ PRs")
+                            .label("← PRs")
                             .small()
-                            .ghost()
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 let source = repo.clone().map_or(Source::All, Source::Repo);
                                 this.show_prs(source);
                                 cx.notify();
                             })),
                     )
-                    .child(div().text_sm().font_weight(FontWeight::BOLD).child(title)),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
+                            .child(div().text_color(theme::DIM).child("› Pipeline")),
+                    ),
             )
             .child(div().flex_1().min_h_0().flex().child(self.pipeline.clone()))
     }
 
-    fn footer(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let theme = cx.theme();
+    fn footer(&self) -> Option<impl IntoElement> {
         let (text, color) = match (&self.error, poll_line(self.prs.poll())) {
-            (Some(error), _) => (error.clone(), theme.danger),
-            (None, Some(poll)) => (poll, theme.muted_foreground),
+            (Some(error), _) => (error.clone(), theme::FAIL),
+            (None, Some(poll)) => (poll, theme::DIM),
             (None, None) => return None,
         };
         Some(
             div()
-                .px_4()
-                .py_1()
+                .px(px(14.))
+                .py(px(4.))
+                .bg(theme::PANEL)
                 .border_t_1()
-                .border_color(theme.border)
+                .border_color(theme::LINE)
                 .text_xs()
                 .text_color(color)
                 .child(text),
@@ -1985,27 +2186,45 @@ impl MainView {
     }
 }
 
+/// A Step's state in a word or two, as its row and evidence say it.
+fn verdict_text(step: &StepView, look: Look) -> String {
+    match look {
+        Look::Asking => "waiting on you".to_owned(),
+        _ => step_state(step),
+    }
+}
+
+/// Now, in milliseconds since the Unix epoch, for how long ago things
+/// happened.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as i64)
+}
+
 impl Render for MainView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !matches!(self.link, LinkState::Connected { .. }) {
-            return div().size_full().child(self.link_view.clone());
-        }
-        let theme = cx.theme();
-        let background = theme.background;
-        let foreground = theme.foreground;
-        div()
+        let root = div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(background)
-            .text_color(foreground)
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .overflow_hidden()
-                    .when(self.sources_shown(), |this| this.child(self.sources(cx)))
-                    .map(|this| match self.pane {
+            .bg(theme::BG)
+            .text_color(theme::TEXT)
+            .text_sm()
+            .line_height(relative(theme::LINE_HEIGHT));
+        if !matches!(self.link, LinkState::Connected { .. }) {
+            return root.child(self.link_view.clone());
+        }
+        root.child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .overflow_hidden()
+                .when(self.sources_shown(), |this| this.child(self.sources(cx)))
+                .map(|this| match (&self.picker, self.pane) {
+                    (Some(available), _) => this.child(self.repo_picker(available, cx)),
+                    (None, pane) => match pane {
                         Pane::Prs => this.child(self.pr_list(cx)).child(self.pr_pane(cx)),
                         Pane::Inbox => this.child(self.inbox_list(cx)).child(self.pr_pane(cx)),
                         Pane::Library => this.child(self.library.clone()),
@@ -2013,8 +2232,9 @@ impl Render for MainView {
                         Pane::Pipeline => this.child(self.pipeline_pane(cx)),
                         Pane::Plugins => this.child(self.plugins.clone()),
                         Pane::Settings => this.child(self.settings.clone()),
-                    }),
-            )
-            .children(self.footer(cx))
+                    },
+                }),
+        )
+        .children(self.footer())
     }
 }

@@ -13,10 +13,9 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::theme::Theme;
-use gpui_kit::component::{ActiveTheme, Disableable, Sizable};
+use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_core::STARTERS;
@@ -24,25 +23,32 @@ use slopwatch_core::{GATE, GateRole, Target};
 use slopwatch_protocol::pipeline::PipelineDraft;
 use slopwatch_protocol::{Command, GateTerm, PullRequest, RepoName, SecretValue};
 
+use crate::components::{
+    ButtonLooks, ChipKind, PillTone, chip, dot_grid, mono, pill, plain_dot, section, well,
+};
 use crate::onboarding::{Anchor, Stop, Tour, intersect, place_card, watch_line};
 use crate::outbox::Outbox;
 use crate::outbox_view::{Pending, refusal};
 use crate::pipeline_editor::{DropOn, PipelineEditor, Selection};
 use crate::prs::toggle_watch;
 use crate::run_graph::{
-    self, ALL_OF_HEIGHT, ANY_OF_HEADER, EdgeKind, GATE_BORDER, GATE_PADDING, GATE_TITLE_HEIGHT,
-    Layout, NodeId, Rect, Role, TERM_HEIGHT,
+    self, ALL_OF_HEIGHT, ANY_OF_HEADER, GATE_BORDER, GATE_PADDING, GATE_TITLE_HEIGHT, Layout,
+    NodeId, Rect, Role, TERM_HEIGHT,
 };
-use crate::run_graph_view::{Colors, chip, dot, paint_edge};
+use crate::run_graph_view::{edge_look, paint_edge};
+use crate::theme;
 
-const PALETTE_WIDTH: f32 = 220.;
-const INSPECTOR_WIDTH: f32 = 300.;
-const PORT: f32 = 14.;
+const PALETTE_WIDTH: f32 = 230.;
+const INSPECTOR_WIDTH: f32 = 330.;
+const PORT: f32 = 18.;
 /// The cards' width, and the coach card's height until it's measured.
 const CARD_WIDTH: f32 = 340.;
 const CARD_HEIGHT: f32 = 200.;
 /// Room the spotlight leaves around its anchor.
 const SPOT_PAD: f32 = 6.;
+/// The tour's shade over everything but its spotlight: the prototype's
+/// `#000b`.
+const TOUR_SHADE: f32 = 0.73;
 
 /// What the editor's buttons send for ([`Outbox`]). The toolbar and the
 /// tour share them, so either shows the other's wait.
@@ -70,16 +76,14 @@ struct WireDrag(String);
 struct Ghost(Option<SharedString>);
 
 impl Render for Ghost {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         match &self.0 {
             Some(label) => div()
                 .px_2()
                 .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.ring)
-                .bg(theme.background)
+                .rounded(px(6.))
+                .bg(theme::ACCENT)
+                .text_color(theme::BG)
                 .text_xs()
                 .child(label.clone()),
             None => div(),
@@ -269,10 +273,10 @@ impl PipelineEditorView {
     }
 
     /// The refusal of the last publish, merge or discard.
-    fn busy_refusal(&self, theme: &Theme) -> Option<Div> {
+    fn busy_refusal(&self) -> Option<Div> {
         [PUBLISH, MERGE, DISCARD]
             .into_iter()
-            .find_map(|action| refusal(&self.outbox, action, theme))
+            .find_map(|action| refusal(&self.outbox, action))
     }
 
     fn publish(&mut self, cx: &mut Context<Self>) {
@@ -353,7 +357,6 @@ impl PipelineEditorView {
 
     fn palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let starters = self.starters(cx);
-        let theme = cx.theme();
         let mut list = div()
             .id("palette")
             .w(px(PALETTE_WIDTH))
@@ -361,34 +364,19 @@ impl PipelineEditorView {
             .flex_none()
             .flex()
             .flex_col()
-            .gap_1()
-            .p_2()
+            .gap(px(6.))
+            .p(px(10.))
+            .bg(theme::PANEL)
             .border_r_1()
-            .border_color(theme.border)
+            .border_color(theme::LINE)
             .overflow_y_scroll()
             .child(starters)
-            .child(
-                div()
-                    .px_1()
-                    .pt_2()
-                    .pb_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("LIBRARY · drag onto the canvas, a Step or the Gate"),
-            );
+            .child(section("Library · drag onto the canvas, a Step or the Gate").mt(px(8.)));
         let mut plugins_shown = false;
         for item in self.editor.palette() {
             if !item.uses.starts_with("lib/") && !plugins_shown {
                 plugins_shown = true;
-                list = list.child(
-                    div()
-                        .px_1()
-                        .pt_2()
-                        .pb_1()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("PLUGINS"),
-                );
+                list = list.child(section("Plugins").mt(px(8.)));
             }
             let uses = item.uses.clone();
             let label = SharedString::from(uses.clone());
@@ -398,23 +386,13 @@ impl PipelineEditorView {
                 None => item.plugin.clone(),
             };
             list = list.child(
-                div()
-                    .id(SharedString::from(format!("palette-{uses}")))
-                    .flex()
-                    .flex_col()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
+                preset(SharedString::from(format!("palette-{uses}")))
                     .cursor_grab()
-                    .hover(|this| this.bg(theme.list_hover))
-                    .child(div().text_sm().font_family("Menlo").child(label.clone()))
+                    .child(mono(format!("+ {label}")).font_weight(FontWeight::SEMIBOLD))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme.muted_foreground)
+                            .text_color(theme::DIM)
                             .line_clamp(2)
                             .child(detail),
                     )
@@ -422,7 +400,7 @@ impl PipelineEditorView {
                         this.child(
                             div()
                                 .text_xs()
-                                .text_color(theme.warning)
+                                .text_color(theme::INC)
                                 .child(format!("Plugin `{}` isn't installed", item.plugin)),
                         )
                     })
@@ -438,41 +416,23 @@ impl PipelineEditorView {
     /// The Starters, each a whole Pipeline that replaces the draft's Steps
     /// and Gate when picked.
     fn starters(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let theme = cx.theme();
         let mut list = div()
             .id("starters")
             .relative()
             .flex()
             .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .px_1()
-                    .pb_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("START FROM · replaces the Steps and Gate"),
-            );
+            .gap(px(6.))
+            .child(section("Start from · replaces the Steps and Gate"));
         for starter in STARTERS {
             let key = starter.key;
             list = list.child(
-                div()
-                    .id(SharedString::from(format!("starter-{key}")))
-                    .flex()
-                    .flex_col()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
+                preset(SharedString::from(format!("starter-{key}")))
                     .cursor_pointer()
-                    .hover(|this| this.bg(theme.list_hover))
-                    .child(div().text_sm().child(starter.name))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(starter.name))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme.muted_foreground)
+                            .text_color(theme::DIM)
                             .line_clamp(2)
                             .child(starter.blurb),
                     )
@@ -487,8 +447,6 @@ impl PipelineEditorView {
     }
 
     fn canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let colors = Colors::new(&theme);
         let mut layout = self.editor.layout();
         if let Some((node, at)) = &self.moving {
             let placed = [(node_id(node), *at)].into_iter().collect();
@@ -504,7 +462,7 @@ impl PipelineEditorView {
             .size_full()
             .min_w(px(layout.width + 200.))
             .min_h(px(layout.height + 120.))
-            .child(self.edges(&layout, colors).absolute().size_full())
+            .child(self.edges(&layout).absolute().size_full())
             .on_drag_move::<NodeDrag>(cx.listener(
                 |this, event: &DragMoveEvent<NodeDrag>, _, cx| {
                     let at = event.event.position - event.bounds.origin - this.grab.get();
@@ -558,13 +516,7 @@ impl PipelineEditorView {
         for node in &layout.nodes {
             let element = match &node.id {
                 NodeId::Gate => self
-                    .gate_node(
-                        node.rect,
-                        selected == Some(Selection::Gate),
-                        &theme,
-                        colors,
-                        cx,
-                    )
+                    .gate_node(node.rect, selected == Some(Selection::Gate), cx)
                     .into_any_element(),
                 NodeId::Step(id) => {
                     let Some(step) = self.editor.draft().and_then(|draft| draft.step(id)) else {
@@ -572,7 +524,7 @@ impl PipelineEditorView {
                     };
                     let role = roles.get(id.as_str()).copied().unwrap_or(Role::Advisory);
                     let open = selected == Some(Selection::Step(id.clone()));
-                    self.step_node(step, role, open, node.rect, &theme, cx)
+                    self.step_node(step, role, open, node.rect, cx)
                         .into_any_element()
                 }
             };
@@ -586,13 +538,12 @@ impl PipelineEditorView {
             .child(
                 div()
                     .id("editor-canvas-scroll")
+                    .relative()
                     .flex_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.muted)
+                    .bg(theme::BG)
                     .overflow_scroll()
                     .track_scroll(&self.canvas_scroll)
+                    .child(dot_grid())
                     .child(inner),
             )
             .child(bounds_of(&self.viewport, &self.this))
@@ -600,7 +551,7 @@ impl PipelineEditorView {
 
     /// The edges, and the wire being drawn. Records where the canvas is, for
     /// drops that land on it.
-    fn edges(&self, layout: &Layout, colors: Colors) -> Canvas<()> {
+    fn edges(&self, layout: &Layout) -> Canvas<()> {
         let edges = layout.edges.clone();
         let wire = self.wire.as_ref().and_then(|(from, to)| {
             let start = layout.node(&node_id(from))?.rect;
@@ -623,21 +574,18 @@ impl PipelineEditorView {
                     redraw(&this, cx);
                 }
                 for edge in &edges {
-                    let (color, dashed) = match edge.kind {
-                        EdgeKind::Needs => (colors.edge, false),
-                        EdgeKind::GateReads => (colors.gate, true),
-                    };
+                    let (color, dashed) = edge_look(edge.kind);
                     paint_edge(window, bounds.origin, edge.start, edge.end, color, dashed);
                 }
                 if let Some((start, end)) = wire {
-                    paint_edge(window, bounds.origin, start, end, colors.gate, true);
+                    paint_edge(window, bounds.origin, start, end, theme::ACCENT, true);
                 }
             },
         )
     }
 
     /// A node's output port: drag it to wire the node to another.
-    fn port(&self, node: &str, theme: &Theme) -> impl IntoElement {
+    fn port(&self, node: &str) -> impl IntoElement {
         div()
             .id(SharedString::from(format!("port-{node}")))
             .absolute()
@@ -645,12 +593,20 @@ impl PipelineEditorView {
             .top_1_2()
             .mt(px(-PORT / 2.))
             .size(px(PORT))
+            .flex()
+            .items_center()
+            .justify_center()
             .rounded_full()
             .border_2()
-            .border_color(theme.ring)
-            .bg(theme.background)
+            .border_color(theme::ACCENT)
+            .bg(theme::PANEL2)
+            .text_color(theme::ACCENT)
+            .text_size(px(13.))
+            .line_height(px(13.))
+            .font_weight(FontWeight::BOLD)
             .cursor_crosshair()
-            .hover(|this| this.bg(theme.ring))
+            .hover(|this| this.bg(theme::ACCENT).text_color(theme::BG))
+            .child("+")
             .on_drag(WireDrag(node.to_owned()), |_, _, _, cx| {
                 cx.new(|_| Ghost(None))
             })
@@ -662,25 +618,20 @@ impl PipelineEditorView {
         role: Role,
         open: bool,
         rect: Rect,
-        theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let info = &step.info;
-        let badges = badges(step, theme, cx);
+        let badges = badges(step, cx);
         let id = info.id.clone();
-        let mut chips = div().flex().gap_1().overflow_hidden().text_xs();
+        let mut chips = div().flex().gap_1().overflow_hidden();
         if let Some(condition) = &info.condition {
-            chips = chips.child(chip(
-                format!("when {condition}"),
-                theme.muted_foreground,
-                theme,
-            ));
+            chips = chips.child(chip(ChipKind::Condition, condition.clone()));
         }
         if role == Role::Advisory {
-            chips = chips.child(chip("advisory", theme.muted_foreground, theme));
+            chips = chips.child(chip(ChipKind::Advisory, "advisory"));
         }
         if info.write {
-            chips = chips.child(chip("commit ends this Run", theme.warning, theme));
+            chips = chips.child(chip(ChipKind::Write, "commit ends this Run"));
         }
         let (select, wired, dropped) = (id.clone(), id.clone(), id.clone());
         div()
@@ -690,50 +641,66 @@ impl PipelineEditorView {
             .top(px(rect.y))
             .w(px(rect.width))
             .h(px(rect.height))
-            .rounded_lg()
-            .bg(theme.background)
-            .border_1()
-            .border_color(theme.border)
-            .when(role == Role::Advisory, |this| this.border_dashed())
-            .when(open, |this| this.border_2().border_color(theme.ring))
-            .hover(|this| this.bg(theme.list_hover))
-            .drag_over::<WireDrag>(|style, _, _, cx| style.border_2().border_color(cx.theme().ring))
-            .drag_over::<PaletteDrag>(|style, _, _, cx| {
-                style.border_2().border_color(cx.theme().ring)
+            .rounded(px(10.))
+            .when(role == Role::Advisory, |this| {
+                this.bg(theme::ADVISORY_BG).border_dashed()
             })
+            .when(role != Role::Advisory, |this| this.bg(theme::PANEL))
+            .border(px(1.5))
+            .border_color(
+                if step.missing_secrets.is_empty() && step.missing_plugin.is_none() {
+                    theme::LINE
+                } else {
+                    theme::FAIL_LINE
+                },
+            )
+            .when(open, |this| this.border_2().border_color(theme::ACCENT))
+            .drag_over::<WireDrag>(|style, _, _, _| style.border_2().border_color(theme::ACCENT))
+            .drag_over::<PaletteDrag>(|style, _, _, _| style.border_2().border_color(theme::ACCENT))
             .cursor_move()
             .child(
                 div()
                     .size_full()
                     .flex()
                     .flex_col()
-                    .gap_0p5()
-                    .px_2()
-                    .py_1p5()
+                    .gap(px(4.))
+                    .px(px(10.))
+                    .py(px(8.))
                     .overflow_hidden()
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_1p5()
-                            .child(dot(theme.muted_foreground))
-                            .child(div().flex_1().text_sm().truncate().child(id.clone())),
+                            .gap(px(6.))
+                            .child(plain_dot(theme::MUTED))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(id.clone()),
+                            ),
                     )
                     // What the Step lacks matters more than its Plugin's name.
                     .child(badges.unwrap_or_else(|| {
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(if info.write {
-                                format!("{} · terminal", info.plugin)
-                            } else {
-                                info.plugin.clone()
-                            })
+                        let uses = if step.uses == info.plugin {
+                            info.plugin.clone()
+                        } else {
+                            format!("{} · {}", step.uses, info.plugin)
+                        };
+                        mono(if info.write {
+                            format!("{uses} · terminal")
+                        } else {
+                            uses
+                        })
+                        .text_xs()
+                        .text_color(theme::DIM)
+                        .truncate()
                     }))
                     .child(chips),
             )
-            .when(!info.write, |this| this.child(self.port(&id, theme)))
+            .when(!info.write, |this| this.child(self.port(&id)))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.editor.select(Some(Selection::Step(select.clone())));
                 cx.notify();
@@ -762,8 +729,6 @@ impl PipelineEditorView {
         &self,
         rect: Rect,
         open: bool,
-        theme: &Theme,
-        colors: Colors,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let mut node = div()
@@ -776,36 +741,46 @@ impl PipelineEditorView {
             .flex()
             .flex_col()
             .p(px(GATE_PADDING))
-            .rounded_xl()
-            .bg(theme.background)
+            .rounded(px(14.))
+            .bg(theme::GATE_BG)
             .border(px(GATE_BORDER))
-            .border_color(colors.gate)
-            .when(open, |this| this.border_color(theme.ring))
-            .drag_over::<WireDrag>(|style, _, _, cx| style.border_color(cx.theme().ring))
-            .drag_over::<PaletteDrag>(|style, _, _, cx| style.border_color(cx.theme().ring))
+            .border_color(if open {
+                theme::ACCENT
+            } else {
+                theme::GATE_LINE
+            })
+            .drag_over::<WireDrag>(|style, _, _, _| style.border_color(theme::ACCENT))
+            .drag_over::<PaletteDrag>(|style, _, _, _| style.border_color(theme::ACCENT))
             .cursor_move()
             .child(
                 div()
                     .h(px(GATE_TITLE_HEIGHT))
                     .flex()
                     .items_center()
-                    .text_xs()
-                    .child(div().font_weight(FontWeight::BOLD).child("GATE")),
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::GATE_TEXT)
+                            .child("GATE"),
+                    )
+                    .child(pill(PillTone::Plain, "not running")),
             )
             .child(
                 div()
                     .h(px(ALL_OF_HEIGHT))
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_size(theme::LABEL_SIZE)
+                    .text_color(theme::DIM)
                     .child("ALL OF · drop a port here"),
             );
         for term in self.editor.gate_terms() {
-            node = node.child(gate_term(term, theme, colors, cx));
+            node = node.child(gate_term(term, cx));
         }
         if !self.editor.has_any_of() {
-            node = node.child(any_of_box(Vec::new(), theme, colors, cx));
+            node = node.child(any_of_box(Vec::new(), cx));
         }
-        node.child(self.port(GATE, theme))
+        node.child(self.port(GATE))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                 this.editor.select(Some(Selection::Gate));
                 cx.notify();
@@ -831,7 +806,6 @@ impl PipelineEditorView {
     }
 
     fn inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
         let pane = div()
             .id("inspector")
             .w(px(INSPECTOR_WIDTH))
@@ -839,24 +813,25 @@ impl PipelineEditorView {
             .flex_none()
             .flex()
             .flex_col()
-            .gap_3()
-            .p_3()
+            .gap(px(10.))
+            .px(px(14.))
+            .py(px(12.))
+            .bg(theme::PANEL)
             .border_l_1()
-            .border_color(theme.border)
-            .overflow_y_scroll()
-            .text_sm();
+            .border_color(theme::LINE)
+            .overflow_y_scroll();
         match self.editor.selected().cloned() {
             None => pane.child(
                 div()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme::DIM)
                     .child("Select a Step or the Gate to edit it."),
             ),
-            Some(Selection::Gate) => pane.child(self.gate_inspector(&theme, cx)),
-            Some(Selection::Step(id)) => pane.child(self.step_inspector(&id, &theme, cx)),
+            Some(Selection::Gate) => pane.child(self.gate_inspector(cx)),
+            Some(Selection::Step(id)) => pane.child(self.step_inspector(&id, cx)),
         }
     }
 
-    fn step_inspector(&self, id: &str, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+    fn step_inspector(&self, id: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(step) = self
             .editor
             .draft()
@@ -865,12 +840,7 @@ impl PipelineEditorView {
         else {
             return div();
         };
-        let label = |text: &'static str| {
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(text)
-        };
+        let label = |text: &'static str| div().text_xs().text_color(theme::DIM).child(text);
         let mut uses = div().flex().flex_wrap().gap_1();
         for item in self.editor.palette() {
             let (step_id, chosen) = (id.to_owned(), item.uses.clone());
@@ -879,8 +849,7 @@ impl PipelineEditorView {
                 Button::new(SharedString::from(action.clone()))
                     .label(item.uses.clone())
                     .xsmall()
-                    .outline()
-                    .when(item.uses == step.uses, |button| button.primary())
+                    .when(item.uses == step.uses, |button| button.accent())
                     .pending(self.outbox.waiting(&action))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let commands = this.editor.set_uses(&step_id, &chosen);
@@ -904,8 +873,7 @@ impl PipelineEditorView {
                 Button::new(SharedString::from(action.clone()))
                     .label(other.clone())
                     .xsmall()
-                    .outline()
-                    .when(step.info.needs.contains(&other), |button| button.primary())
+                    .when(step.info.needs.contains(&other), |button| button.accent())
                     .pending(self.outbox.waiting(&action))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let commands = this.editor.toggle_need(&step_id, &need);
@@ -916,32 +884,8 @@ impl PipelineEditorView {
         }
         let role = self.editor.gate_role(id);
         let gate = match self.editor.gate_role_locked(id) {
-            Some(reason) => div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(reason),
-            None => {
-                let step_id = id.to_owned();
-                div().child(
-                    ButtonGroup::new("gate-role")
-                        .xsmall()
-                        .outline()
-                        .children(ROLES.map(|(each, name)| {
-                            Button::new(SharedString::from(format!("role-{name}")))
-                                .label(name)
-                                .when(role == each, |button| button.primary())
-                                .pending(self.outbox.waiting(&format!("role-{name}")))
-                        }))
-                        .on_click(cx.listener(move |this, clicked: &Vec<usize>, _, cx| {
-                            if let Some(&(role, name)) = clicked.first().and_then(|&i| ROLES.get(i))
-                            {
-                                let commands = this.editor.set_gate_role(&step_id, role);
-                                this.edit(format!("role-{name}"), commands);
-                                cx.notify();
-                            }
-                        })),
-                )
-            }
+            Some(reason) => div().text_xs().text_color(theme::DIM).child(reason),
+            None => self.role_buttons("role", id, role, cx),
         };
         let removed = id.to_owned();
         div()
@@ -952,13 +896,14 @@ impl PipelineEditorView {
                 div()
                     .flex()
                     .flex_col()
+                    .gap(px(2.))
                     .child(
                         div()
-                            .text_base()
-                            .font_weight(FontWeight::BOLD)
+                            .text_size(theme::HEADING_SIZE)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .child(id.to_owned()),
                     )
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(
+                    .child(div().text_size(px(12.)).text_color(theme::DIM).child(
                         if step.info.write {
                             format!("Plugin {} · terminal", step.info.plugin)
                         } else {
@@ -982,7 +927,11 @@ impl PipelineEditorView {
                     .child(label(
                         "WITH · overrides the Library Step key by key, Enter applies",
                     ))
-                    .child(Input::new(&self.with_input).small().font_family("Menlo")),
+                    .child(
+                        Input::new(&self.with_input)
+                            .small()
+                            .font_family(theme::MONO),
+                    ),
             )
             .child(
                 div()
@@ -998,7 +947,11 @@ impl PipelineEditorView {
                     .flex_col()
                     .gap_1()
                     .child(label("CONDITION · Enter applies, empty for the default"))
-                    .child(Input::new(&self.when_input).small().font_family("Menlo")),
+                    .child(
+                        Input::new(&self.when_input)
+                            .small()
+                            .font_family(theme::MONO),
+                    ),
             )
             .child(
                 div()
@@ -1013,7 +966,7 @@ impl PipelineEditorView {
                     Button::new("remove-step")
                         .label("Remove Step")
                         .small()
-                        .danger()
+                        .reject()
                         .pending(self.outbox.waiting("remove-step"))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             let commands = this.editor.remove_step(&removed);
@@ -1024,55 +977,64 @@ impl PipelineEditorView {
             )
     }
 
-    fn gate_inspector(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut rows = div().flex().flex_col().gap_2();
+    /// The Gate roles a Step can take, as a row of buttons with the one it
+    /// has picked out. `prefix` keeps each row's actions apart.
+    fn role_buttons(&self, prefix: &str, id: &str, role: GateRole, cx: &mut Context<Self>) -> Div {
+        let mut row = div().flex().flex_wrap().gap(px(4.));
+        for (each, name) in ROLES {
+            let action = format!("{prefix}-{id}-{name}");
+            let step_id = id.to_owned();
+            row = row.child(
+                Button::new(SharedString::from(action.clone()))
+                    .label(name)
+                    .xsmall()
+                    .when(role == each, |button| button.accent())
+                    .pending(self.outbox.waiting(&action))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        let commands = this.editor.set_gate_role(&step_id, each);
+                        this.edit(action.clone(), commands);
+                        cx.notify();
+                    })),
+            );
+        }
+        row
+    }
+
+    fn gate_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut rows = div().flex().flex_col();
         for info in self.editor.infos() {
             let id = info.id.clone();
             let role = self.editor.gate_role(&id);
             let control = match self.editor.gate_role_locked(&id) {
                 Some(_) => div()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("after the Gate or terminal")
-                    .into_any_element(),
-                None => ButtonGroup::new(SharedString::from(format!("gate-role-{id}")))
-                    .xsmall()
-                    .outline()
-                    .children(ROLES.map(|(each, name)| {
-                        Button::new(SharedString::from(format!("gate-{id}-{name}")))
-                            .label(name)
-                            .when(role == each, |button| button.primary())
-                            .pending(self.outbox.waiting(&format!("gate-{id}-{name}")))
-                    }))
-                    .on_click(cx.listener(move |this, clicked: &Vec<usize>, _, cx| {
-                        if let Some(&(role, name)) = clicked.first().and_then(|&i| ROLES.get(i)) {
-                            let commands = this.editor.set_gate_role(&id, role);
-                            this.edit(format!("gate-{id}-{name}"), commands);
-                            cx.notify();
-                        }
-                    }))
-                    .into_any_element(),
+                    .text_color(theme::DIM)
+                    .child("after the Gate or terminal"),
+                None => self.role_buttons("gate", &id, role, cx),
             };
             rows = rows.child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .child(div().font_family("Menlo").text_xs().child(info.id))
+                    .gap(px(4.))
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(theme::LINE)
+                    .child(mono(info.id))
                     .child(control),
             );
         }
         div()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap(px(10.))
             .child(
                 div()
-                    .text_base()
-                    .font_weight(FontWeight::BOLD)
+                    .text_size(theme::HEADING_SIZE)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child("Gate"),
             )
-            .child(div().text_xs().text_color(theme.muted_foreground).child(
+            .child(div().text_size(px(12.)).text_color(theme::DIM).child(
                 "Shippable when every required term passes and one any-of term \
                          passes. Reads Verdicts only.",
             ))
@@ -1080,11 +1042,18 @@ impl PipelineEditorView {
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let mut footer = div().flex().flex_col().gap_1().text_xs();
-        let legend = "Solid: needs · dashed: read by the Gate · dashed box: advisory · drag nodes \
+        let mut footer = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px(px(14.))
+            .py(px(6.))
+            .border_t_1()
+            .border_color(theme::LINE)
+            .text_xs();
+        let legend = "solid: needs · dashed: read by the Gate · dashed box: advisory · drag nodes \
                       to arrange, ports to wire";
-        footer = footer.child(div().text_color(theme.muted_foreground).child(legend));
+        footer = footer.child(div().text_color(theme::DIM).child(legend));
         let notice = self.editor.notice().map(str::to_owned).or_else(|| {
             let action = self.last_edit.as_deref()?;
             self.outbox.error(action)
@@ -1092,13 +1061,13 @@ impl PipelineEditorView {
         if let Some(notice) = notice {
             footer = footer.child(
                 div()
-                    .text_color(theme.danger)
+                    .text_color(theme::FAIL)
                     .child(format!("Refused: {notice}")),
             );
         }
         if let Some(draft) = self.editor.draft() {
             for problem in &draft.problems {
-                footer = footer.child(div().text_color(theme.warning).child(problem.clone()));
+                footer = footer.child(div().text_color(theme::INC).child(problem.clone()));
             }
             if !draft.conflicts.is_empty() {
                 footer = footer.child(self.conflicts(draft, cx));
@@ -1110,7 +1079,6 @@ impl PipelineEditorView {
     /// The nodes that stopped the last publish, each as the draft and the
     /// branch write it, and the way out: starting over from the branch.
     fn conflicts(&self, draft: &PipelineDraft, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let branch = &draft.base.branch;
         let version = |title: String, text: Option<&String>| {
             let lines = match text {
@@ -1118,7 +1086,7 @@ impl PipelineEditorView {
                     .lines()
                     .map(|line| div().child(line.to_owned()))
                     .collect(),
-                None => vec![div().text_color(theme.muted_foreground).child("(removed)")],
+                None => vec![div().text_color(theme::DIM).child("(removed)")],
             };
             div()
                 .flex_1()
@@ -1126,29 +1094,23 @@ impl PipelineEditorView {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_color(theme.muted_foreground).child(title))
-                .child(
-                    div()
-                        .p_2()
-                        .rounded_md()
-                        .bg(theme.muted)
-                        .font_family("Menlo")
-                        .children(lines),
-                )
+                .child(div().text_color(theme::DIM).child(title))
+                .child(well().children(lines))
         };
         let mut panel = div()
             .flex()
             .flex_col()
             .gap_2()
-            .p_2()
-            .rounded_md()
+            .p(px(10.))
+            .rounded(px(8.))
             .border_1()
-            .border_color(theme.danger);
+            .border_color(theme::FAIL_LINE)
+            .bg(theme::ESCALATION_BG);
         for conflict in &draft.conflicts {
             panel = panel
                 .child(
                     div()
-                        .text_color(theme.danger)
+                        .text_color(theme::FAIL_TEXT)
                         .child(format!("{} changed on {branch} too", conflict.node)),
                 )
                 .child(
@@ -1164,7 +1126,6 @@ impl PipelineEditorView {
                 Button::new(DISCARD)
                     .label(format!("Start over from {branch}"))
                     .small()
-                    .outline()
                     .disabled(self.held(DISCARD))
                     .pending(self.outbox.waiting(DISCARD))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -1180,7 +1141,6 @@ impl PipelineEditorView {
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let status = match self.editor.draft() {
             None => "Loading the draft…".to_owned(),
             Some(draft) => {
@@ -1202,28 +1162,28 @@ impl PipelineEditorView {
             .flex()
             .items_center()
             .gap_2()
+            .px(px(14.))
+            .py(px(8.))
+            .border_b_1()
+            .border_color(theme::LINE)
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
+                    .truncate()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme::DIM)
                     .child(status),
             )
             .when_some(busy, |toolbar, busy| {
-                toolbar.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(busy),
-                )
+                toolbar.child(div().text_xs().text_color(theme::DIM).child(busy))
             })
-            .children(self.busy_refusal(theme))
+            .children(self.busy_refusal())
             .when(!self.tour.on(), |toolbar| {
                 toolbar.child(
                     Button::new("tour")
                         .label("?")
                         .small()
-                        .ghost()
                         .tooltip("Take the tour again")
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.start_tour(cx);
@@ -1234,7 +1194,6 @@ impl PipelineEditorView {
                 Button::new("tidy")
                     .label("Tidy")
                     .small()
-                    .ghost()
                     .disabled(!self.editor.arranged())
                     .pending(self.outbox.waiting("tidy"))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -1248,16 +1207,14 @@ impl PipelineEditorView {
                 toolbar
                     .child(
                         Button::new("pipeline-pr")
-                            .label(format!("PR #{}", pr.number))
+                            .label(format!("PR #{} ↗", pr.number))
                             .small()
-                            .ghost()
                             .on_click(move |_: &ClickEvent, _, cx| cx.open_url(&url)),
                     )
                     .child(
                         Button::new("merge-pipeline")
                             .label("Merge it now")
                             .small()
-                            .outline()
                             .disabled(self.held(MERGE))
                             .pending(self.outbox.waiting(MERGE))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -1269,7 +1226,7 @@ impl PipelineEditorView {
                 Button::new("publish-pipeline")
                     .label("Publish")
                     .small()
-                    .primary()
+                    .accent()
                     .disabled(!self.editor.can_publish() || self.held(PUBLISH))
                     .pending(self.outbox.waiting(PUBLISH))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -1331,8 +1288,6 @@ impl Render for PipelineEditorView {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .p_3()
                     .child(self.toolbar(cx))
                     .child(self.canvas(cx))
                     .child(self.footer(cx)),
@@ -1404,13 +1359,9 @@ impl PipelineEditorView {
                 .node(&NodeId::Step(id))
                 .and_then(|node| intersect(on_root(node.rect), viewport)),
         };
-        let theme = cx.theme().clone();
         let card = self.coach_card(place, count, &stop, &draft, cx);
         let Some(anchor) = anchor else {
-            return vec![
-                dim(room, None, &theme),
-                centered(room, card).into_any_element(),
-            ];
+            return vec![dim(room, None), centered(room, card).into_any_element()];
         };
         let keep_clear: Vec<run_graph::Rect> = layout
             .nodes
@@ -1421,7 +1372,7 @@ impl PipelineEditorView {
         let height = if measured > 0. { measured } else { CARD_HEIGHT };
         let at = place_card(anchor, (CARD_WIDTH, height), room, &keep_clear);
         vec![
-            dim(room, Some(anchor), &theme),
+            dim(room, Some(anchor)),
             card.absolute()
                 .left(px(at.x))
                 .top(px(at.y))
@@ -1463,7 +1414,6 @@ impl PipelineEditorView {
         draft: &PipelineDraft,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let theme = cx.theme().clone();
         let last = place + 1 == count;
         let mut card = div()
             .id("coach-card")
@@ -1473,30 +1423,29 @@ impl PipelineEditorView {
             .w(px(CARD_WIDTH))
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
-            .rounded_lg()
+            .gap(px(6.))
+            .p(px(14.))
+            .rounded(px(12.))
             .border_1()
-            .border_color(theme.ring)
-            .bg(theme.background)
+            .border_color(theme::ACCENT)
+            .bg(theme::PANEL)
             .shadow_lg()
-            .text_sm()
             .child(
                 div()
-                    .text_xs()
+                    .text_size(theme::LABEL_SIZE)
                     .font_weight(FontWeight::BOLD)
-                    .text_color(theme.ring)
-                    .child(format!("{} OF {count}", place + 1)),
+                    .text_color(theme::ACCENT)
+                    .child(format!("STEP {} OF {count}", place + 1)),
             )
             .child(
                 div()
-                    .text_base()
-                    .font_weight(FontWeight::BOLD)
+                    .text_size(theme::HEADING_SIZE)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child(stop.title()),
             )
             .child(
                 div()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme::DIM)
                     .child(stop.body(&draft.base.branch)),
             );
         match stop {
@@ -1504,12 +1453,13 @@ impl PipelineEditorView {
             Stop::Watch => card = card.child(self.watch_list(draft, cx)),
             _ => {}
         }
-        let mut footer = div().flex().items_center().gap_2().child(
+        let mut footer = div().flex().items_center().gap_2().mt(px(6.)).child(
             div()
                 .id("skip-tour")
                 .text_xs()
-                .text_color(theme.muted_foreground)
+                .text_color(theme::DIM)
                 .cursor_pointer()
+                .hover(|this| this.underline())
                 .child("Skip tour")
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.tour.skip();
@@ -1518,23 +1468,19 @@ impl PipelineEditorView {
         );
         footer = footer.child(div().flex_1());
         if place > 0 {
-            footer = footer.child(
-                Button::new("tour-back")
-                    .label("Back")
-                    .small()
-                    .ghost()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.tour.back();
-                        cx.notify();
-                    })),
-            );
+            footer = footer.child(Button::new("tour-back").label("Back").small().on_click(
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.tour.back();
+                    cx.notify();
+                }),
+            ));
         }
         if let Some(label) = stop.next_label(last, stop.done(draft)) {
             footer = footer.child(
                 Button::new("tour-next")
                     .label(label)
                     .small()
-                    .primary()
+                    .accent()
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                         if let Some(draft) = this.editor.draft().cloned() {
                             this.tour.next(&draft);
@@ -1548,7 +1494,6 @@ impl PipelineEditorView {
 
     /// Publish as a PR, then "Merge it now" (ADR 0007).
     fn publish_actions(&self, draft: &PipelineDraft, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
         let busy = self.busy();
         let row = div().flex().items_center().gap_2();
         match &draft.published {
@@ -1556,7 +1501,7 @@ impl PipelineEditorView {
                 Button::new("tour-publish")
                     .label("Publish as PR")
                     .small()
-                    .primary()
+                    .accent()
                     .disabled(!self.editor.can_publish() || self.held(PUBLISH))
                     .pending(self.outbox.waiting(PUBLISH))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -1567,7 +1512,7 @@ impl PipelineEditorView {
                 Button::new("tour-merge")
                     .label("Merge it now")
                     .small()
-                    .primary()
+                    .accent()
                     .disabled(self.held(MERGE))
                     .pending(self.outbox.waiting(MERGE))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -1575,62 +1520,52 @@ impl PipelineEditorView {
                     })),
             ),
         }
-        .children(busy.map(|busy| {
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(busy)
-        }))
-        .children(self.busy_refusal(theme))
+        .children(busy.map(|busy| div().text_xs().text_color(theme::DIM).child(busy)))
+        .children(self.busy_refusal())
     }
 
     /// The repo's open PRs, each with Watch or Unwatch.
     fn watch_list(&self, draft: &PipelineDraft, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        let mut list = div().flex().flex_col().gap_1();
+        let mut list = div().flex().flex_col();
         if self.prs.is_empty() {
             list = list.child(
                 div()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme::DIM)
                     .child("You have no open PRs here yet."),
             );
         }
         for pr in &self.prs {
             let (number, watched) = (pr.number, pr.watched());
             let (action, command) = toggle_watch(pr);
-            let refused = refusal(&self.outbox, &action, theme);
+            let refused = refusal(&self.outbox, &action);
             list = list.child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
+                    .py(px(6.))
+                    .border_b_1()
+                    .border_color(theme::LINE)
                     .text_xs()
                     .child(
                         Button::new(SharedString::from(format!("tour-watch-{number}")))
                             .label(if watched { "Unwatch" } else { "Watch" })
                             .xsmall()
-                            .outline()
-                            .when(watched, |button| button.primary())
+                            .when(!watched, |button| button.accent())
                             .pending(self.outbox.waiting(&action))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
                                 this.outbox.press(&action, command.clone());
                             })),
                     )
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("#{number}")),
-                    )
-                    .child(div().flex_1().truncate().child(pr.title.clone()))
-                    .children(
-                        watch_line(pr).map(|line| div().text_color(theme.warning).child(line)),
-                    )
+                    .child(div().text_color(theme::DIM).child(format!("#{number}")))
+                    .child(div().flex_1().min_w_0().truncate().child(pr.title.clone()))
+                    .children(watch_line(pr).map(|line| div().text_color(theme::INC).child(line)))
                     .children(refused),
             );
         }
         if draft.published.is_some() {
-            list = list.child(self.publish_actions(draft, cx));
+            list = list.child(self.publish_actions(draft, cx).mt(px(8.)));
         }
         list
     }
@@ -1638,7 +1573,6 @@ impl PipelineEditorView {
     /// Where the developer pastes a Secret a Step lacks. The value goes to
     /// the daemon and never shows again.
     fn paste_dialog(&self, secret: &str, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
         let room = self.room();
         let card = div()
             .id("paste-secret")
@@ -1646,25 +1580,19 @@ impl PipelineEditorView {
             .w(px(CARD_WIDTH))
             .flex()
             .flex_col()
-            .gap_2()
-            .p_3()
-            .rounded_lg()
+            .gap(px(10.))
+            .p(px(16.))
+            .rounded(px(10.))
             .border_1()
-            .border_color(theme.danger)
-            .bg(theme.background)
+            .border_color(theme::DIM)
+            .bg(theme::PANEL)
             .shadow_lg()
-            .text_sm()
-            .child(
-                div()
-                    .font_weight(FontWeight::BOLD)
-                    .font_family("Menlo")
-                    .child(secret.to_owned()),
-            )
-            .child(div().text_color(theme.muted_foreground).child(
+            .child(mono(secret.to_owned()).font_weight(FontWeight::BOLD))
+            .child(div().text_xs().text_color(theme::DIM).child(
                 "The daemon keeps it in the Keychain and never shows it back. Every Step that needs it gets it.",
             ))
             .child(Input::new(&self.secret_input).small())
-            .children(refusal(&self.outbox, PASTE, &theme))
+            .children(refusal(&self.outbox, PASTE))
             .child(
                 div()
                     .flex()
@@ -1674,7 +1602,6 @@ impl PipelineEditorView {
                         Button::new("paste-cancel")
                             .label("Cancel")
                             .small()
-                            .ghost()
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.pasting = None;
                                 cx.notify();
@@ -1684,7 +1611,7 @@ impl PipelineEditorView {
                         Button::new(PASTE)
                             .label("Set Secret")
                             .small()
-                            .primary()
+                            .accent()
                             .pending(self.outbox.waiting(PASTE))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.set_secret(cx);
@@ -1694,7 +1621,7 @@ impl PipelineEditorView {
         div()
             .absolute()
             .size_full()
-            .child(dim(room, None, &theme))
+            .child(dim(room, None))
             .child(centered(room, card))
     }
 }
@@ -1732,8 +1659,11 @@ fn redraw(this: &WeakEntity<PipelineEditorView>, cx: &mut App) {
 
 /// Dims `room` except a spotlight around `spot`, if any. It takes no
 /// clicks, so the spotlit element stays usable.
-fn dim(room: run_graph::Rect, spot: Option<run_graph::Rect>, theme: &Theme) -> AnyElement {
-    let shade = gpui_kit::black().opacity(0.3);
+fn dim(room: run_graph::Rect, spot: Option<run_graph::Rect>) -> AnyElement {
+    let shade = Rgba {
+        a: TOUR_SHADE,
+        ..theme::WELL
+    };
     let panel = |x: f32, y: f32, width: f32, height: f32| {
         div()
             .absolute()
@@ -1765,9 +1695,9 @@ fn dim(room: run_graph::Rect, spot: Option<run_graph::Rect>, theme: &Theme) -> A
                 .top(px(top))
                 .w(px(right - left))
                 .h(px(bottom - top))
-                .rounded_lg()
+                .rounded(px(12.))
                 .border_2()
-                .border_color(theme.ring),
+                .border_color(theme::ACCENT),
         )
         .into_any_element()
 }
@@ -1790,13 +1720,12 @@ fn centered(room: run_graph::Rect, card: impl IntoElement) -> Div {
 /// opens the paste dialog, and one for a Plugin that isn't installed.
 fn badges(
     step: &slopwatch_protocol::pipeline::DraftStep,
-    theme: &Theme,
     cx: &mut Context<PipelineEditorView>,
 ) -> Option<Div> {
     if step.missing_secrets.is_empty() && step.missing_plugin.is_none() {
         return None;
     }
-    let mut row = div().flex().gap_1().overflow_hidden().text_xs();
+    let mut row = div().flex().gap_1().overflow_hidden();
     for secret in &step.missing_secrets {
         let name = secret.clone();
         row = row.child(
@@ -1805,12 +1734,9 @@ fn badges(
                     "badge-{}-{secret}",
                     step.info.id
                 )))
-                .px_1()
-                .rounded_sm()
-                .bg(theme.danger)
-                .text_color(theme.danger_foreground)
+                .min_w_0()
                 .cursor_pointer()
-                .child(format!("set {secret}"))
+                .child(chip(ChipKind::Bad, format!("set {secret}")))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     cx.stop_propagation();
                     this.paste(name.clone(), window, cx);
@@ -1818,15 +1744,7 @@ fn badges(
         );
     }
     if let Some(plugin) = &step.missing_plugin {
-        row = row.child(
-            div()
-                .px_1()
-                .rounded_sm()
-                .bg(theme.danger)
-                .text_color(theme.danger_foreground)
-                .truncate()
-                .child(format!("{plugin} isn't installed")),
-        );
+        row = row.child(chip(ChipKind::Bad, format!("{plugin} isn't installed")));
     }
     Some(row)
 }
@@ -1839,12 +1757,7 @@ fn node_id(node: &str) -> NodeId {
     }
 }
 
-fn gate_term(
-    term: &GateTerm,
-    theme: &Theme,
-    colors: Colors,
-    cx: &mut Context<PipelineEditorView>,
-) -> AnyElement {
+fn gate_term(term: &GateTerm, cx: &mut Context<PipelineEditorView>) -> AnyElement {
     match term {
         GateTerm::Step {
             id,
@@ -1853,27 +1766,20 @@ fn gate_term(
             .h(px(TERM_HEIGHT))
             .flex()
             .items_center()
-            .gap_1p5()
-            .text_xs()
-            .child(dot(colors.gate))
-            .child(div().truncate().child(id.clone()))
+            .gap(px(6.))
+            .text_size(px(12.))
+            .child(plain_dot(theme::MUTED))
+            .child(div().min_w_0().truncate().child(id.clone()))
             .when(*accepts_skipped, |this| {
-                this.child(
-                    div()
-                        .flex_none()
-                        .text_color(theme.muted_foreground)
-                        .child("pass · skipped"),
-                )
+                this.child(chip(ChipKind::Required, "skip ok").flex_none())
             })
             .into_any_element(),
-        GateTerm::AnyOf { terms } => {
-            any_of_box(terms.clone(), theme, colors, cx).into_any_element()
-        }
+        GateTerm::AnyOf { terms } => any_of_box(terms.clone(), cx).into_any_element(),
         GateTerm::Other { text } => div()
             .h(px(TERM_HEIGHT))
             .flex()
             .items_center()
-            .text_xs()
+            .text_size(px(12.))
             .truncate()
             .child(text.clone())
             .into_any_element(),
@@ -1884,8 +1790,6 @@ fn gate_term(
 /// Without terms it's the empty box that starts one.
 fn any_of_box(
     terms: Vec<GateTerm>,
-    theme: &Theme,
-    colors: Colors,
     cx: &mut Context<PipelineEditorView>,
 ) -> impl IntoElement + use<> {
     let empty = terms.is_empty();
@@ -1893,18 +1797,27 @@ fn any_of_box(
         .id(if empty { "any-of-empty" } else { "any-of" })
         .flex()
         .flex_col()
-        .pl_2()
-        .border_l_2()
-        .border_color(colors.gate)
-        .when(empty, |this| this.border_dashed())
-        .drag_over::<WireDrag>(|style, _, _, cx| style.bg(cx.theme().list_hover))
+        .pl(px(8.))
+        .map(|this| {
+            if empty {
+                this.mt(px(4.))
+                    .pr(px(8.))
+                    .border_1()
+                    .border_dashed()
+                    .rounded(px(6.))
+            } else {
+                this.border_l_2()
+            }
+        })
+        .border_color(theme::GATE_LINE)
+        .drag_over::<WireDrag>(|style, _, _, _| style.bg(theme::ACCENT_BG))
         .child(
             div()
                 .h(px(ANY_OF_HEADER))
                 .flex()
                 .items_center()
-                .text_xs()
-                .text_color(theme.muted_foreground)
+                .text_size(theme::LABEL_SIZE)
+                .text_color(theme::DIM)
                 .child(if empty {
                     "ANY OF · drop here"
                 } else {
@@ -1918,7 +1831,24 @@ fn any_of_box(
             cx.notify();
         }));
     for term in &terms {
-        group = group.child(gate_term(term, theme, colors, cx));
+        group = group.child(gate_term(term, cx));
     }
     group
+}
+
+/// A card in the palette, a Starter or a Library Step: the prototype's
+/// `.preset`.
+fn preset(id: SharedString) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .gap(px(2.))
+        .px(px(9.))
+        .py(px(7.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme::LINE)
+        .bg(theme::PANEL)
+        .hover(|this| this.border_color(theme::DIM))
 }

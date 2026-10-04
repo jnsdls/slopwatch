@@ -117,6 +117,27 @@ pub fn answer(entry: &InboxEntry, answer: Answer, note: &str) -> Option<Command>
     })
 }
 
+/// The line over an open entry's card: what kind it is, the Step a Human
+/// Step entry is about, and how long ago it opened, as of `now` in
+/// seconds since the Unix epoch.
+pub fn kicker(entry: &InboxEntry, now: i64) -> String {
+    let ago = ago(now - entry.raised_at);
+    match &entry.scope {
+        Scope::Human { step, .. } => format!("Human Step · {step} · {ago}"),
+        _ => format!("Escalation · {ago}"),
+    }
+}
+
+/// How long `seconds` is, as "just now", "11m ago", "2h ago" or "3d ago".
+pub fn ago(seconds: i64) -> String {
+    match seconds.max(0) {
+        0..60 => "just now".to_owned(),
+        seconds @ 60..3600 => format!("{}m ago", seconds / 60),
+        seconds @ 3600..86400 => format!("{}h ago", seconds / 3600),
+        seconds => format!("{}d ago", seconds / 86400),
+    }
+}
+
 /// The PRs an entry holds back, as one line.
 pub fn held_line(entry: &InboxEntry) -> String {
     let prs: Vec<String> = entry.prs.iter().map(ToString::to_string).collect();
@@ -321,6 +342,24 @@ mod tests {
             answer(&entry(2, Scope::Pr, &[1]), Answer::Approve, ""),
             None
         );
+    }
+
+    #[test]
+    fn a_card_says_what_kind_of_entry_it_is_and_how_old() {
+        let human = Scope::Human {
+            run: RunId(3),
+            step: "ship-it".into(),
+        };
+        assert_eq!(
+            kicker(&entry(1, human, &[7]), 660),
+            "Human Step · ship-it · 11m ago"
+        );
+        assert_eq!(
+            kicker(&entry(2, Scope::Pr, &[7]), 30),
+            "Escalation · just now"
+        );
+        assert_eq!(ago(7_200), "2h ago");
+        assert_eq!(ago(3 * 86_400), "3d ago");
     }
 
     #[test]

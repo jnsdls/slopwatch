@@ -2,16 +2,18 @@
 //! which Plugins it's granted to, with a masked field to set or rotate one.
 //! The daemon never sends a value back, so the list can't show one.
 
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::Sizable;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Command, SecretInfo};
 
+use crate::components::{ButtonLooks, ChipKind, chip, list_row, section};
 use crate::outbox::Outbox;
 use crate::outbox_view::{Pending, loading, refusal};
 use crate::secrets::{SecretsList, granted_line, needed, state_line};
+use crate::theme;
 
 /// What the view's commands go out for ([`Outbox`]).
 const LIST: &str = "secrets-list";
@@ -107,20 +109,19 @@ impl SecretsView {
     }
 
     fn rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs() as i64);
         let chosen = self.list.chosen().map(str::to_owned);
-        let mut rows = div().flex().flex_col().gap_1();
+        let mut rows = div().flex().flex_col().gap(px(6.));
         if !self.list.loaded() {
-            return rows.child(loading(&self.outbox, LIST, "the Secrets", theme));
+            return rows.child(loading(&self.outbox, LIST, "the Secrets"));
         }
         if self.list.secrets().is_empty() {
             rows = rows.child(
                 div()
                     .text_sm()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme::DIM)
                     .child("No Secrets yet. Plugins that need one list it here."),
             );
         }
@@ -131,46 +132,33 @@ impl SecretsView {
             let missing = needed(secret);
             let delete = name.clone();
             rows = rows.child(
-                div()
-                    .id(SharedString::from(format!("secret-{name}")))
-                    .flex()
+                list_row(SharedString::from(format!("secret-{name}")), selected)
                     .items_center()
                     .gap_3()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .when(selected, |this| this.bg(theme.list_active))
-                    .hover(|this| this.bg(theme.list_hover))
                     .child(
                         div()
                             .flex_1()
                             .flex()
                             .flex_col()
-                            .child(div().text_sm().font_family("Menlo").child(name.clone()))
+                            .child(div().text_sm().font_family(theme::MONO).child(name.clone()))
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(theme.muted_foreground)
+                                    .text_color(theme::DIM)
                                     .child(granted_line(secret)),
                             )
-                            .children(refusal(&self.outbox, &delete_action(&name), theme)),
+                            .children(refusal(&self.outbox, &delete_action(&name))),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(if missing {
-                                theme.danger
-                            } else {
-                                theme.muted_foreground
-                            })
-                            .child(state),
-                    )
+                    .child(if missing {
+                        chip(ChipKind::Bad, state).flex_none()
+                    } else {
+                        div().text_xs().text_color(theme::DIM).child(state)
+                    })
                     .when(secret.is_set(), |this| {
                         this.child(
                             Button::new(SharedString::from(delete_action(&name)))
                                 .label("Delete")
                                 .small()
-                                .ghost()
                                 .pending(self.outbox.waiting(&delete_action(&name)))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
                                     this.delete(&delete);
@@ -186,7 +174,6 @@ impl SecretsView {
     }
 
     fn form(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let target = match self.list.chosen() {
             Some(name) => format!("Set or rotate `{name}`, or type another name"),
             None => "Pick a Secret above, or type a name".to_owned(),
@@ -197,13 +184,8 @@ impl SecretsView {
             .gap_2()
             .pt_3()
             .border_t_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(target),
-            )
+            .border_color(theme::LINE)
+            .child(div().text_xs().text_color(theme::DIM).child(target))
             .child(
                 div()
                     .flex()
@@ -214,15 +196,15 @@ impl SecretsView {
                         Button::new(SET)
                             .label("Set")
                             .small()
-                            .primary()
+                            .accent()
                             .pending(self.outbox.waiting(SET))
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.set(window, cx);
                             })),
                     ),
             )
-            .children(refusal(&self.outbox, SET, theme))
-            .child(div().text_xs().text_color(theme.muted_foreground).child(
+            .children(refusal(&self.outbox, SET))
+            .child(div().text_xs().text_color(theme::DIM).child(
                 "The value goes to the Keychain and is never shown again. Steps \
                          started from now on get it; running ones keep the old one.",
             ))
@@ -231,7 +213,6 @@ impl SecretsView {
 
 impl Render for SecretsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         div()
             .id("secrets")
             .flex_1()
@@ -241,12 +222,7 @@ impl Render for SecretsView {
             .gap_3()
             .p_4()
             .overflow_y_scroll()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("SECRETS"),
-            )
+            .child(section("Secrets"))
             .child(self.rows(cx))
             .child(self.form(cx))
     }
