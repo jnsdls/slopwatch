@@ -19,7 +19,7 @@ use slopwatch_daemon::{Daemon, Library, Retention, Runs, RunsConfig, Watching};
 use slopwatch_protocol::step::{Check, CheckState, Checks, ChecksState};
 use slopwatch_protocol::{
     ClientFrame, ClientHello, Command, ErrorCode, PullRequest, Reply, RepoName, ResponseBody,
-    RunEvent, RunId, RunView, ServerFrame, StepStatus, Topic, TopicUpdate, WatchedPrs,
+    RunEvent, RunId, RunView, ServerFrame, StepStatus, StripMark, Topic, TopicUpdate, WatchedPrs,
     WatchedPrsUpdate,
 };
 
@@ -252,6 +252,11 @@ async fn a_ci_only_pipeline_runs_ci_and_the_gate_follows_a_pass() {
     );
     assert_eq!(*client.ci(run), StepStatus::Running);
     assert_eq!(client.run(run).gate, Some(GateState::Pending));
+    client
+        .until("the row's strip to show CI running", |c| {
+            c.pr().runs[0].strip == [StripMark::Running, StripMark::Gate]
+        })
+        .await;
 
     harness.github.set_checks(
         &repo(),
@@ -284,6 +289,10 @@ async fn a_ci_only_pipeline_runs_ci_and_the_gate_follows_a_pass() {
             c.pr().runs[0].end == Some(EndReason::Shippable)
         })
         .await;
+    assert_eq!(
+        client.pr().runs[0].strip,
+        [StripMark::Settled(Verdict::Pass), StripMark::Gate]
+    );
 
     // An ended Run on the same head doesn't start again.
     client.refresh().await;

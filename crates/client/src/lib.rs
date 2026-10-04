@@ -1,6 +1,9 @@
 //! The slopwatch GUI.
 
 pub mod agent;
+pub mod components;
+#[cfg(debug_assertions)]
+pub mod demo;
 pub mod dock;
 pub mod inbox;
 pub mod library;
@@ -25,3 +28,4 @@ pub mod secrets_view;
 pub mod settings;
 pub mod settings_view;
 pub mod step_log;
+pub mod theme;

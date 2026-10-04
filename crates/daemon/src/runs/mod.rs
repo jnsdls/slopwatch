@@ -71,7 +71,7 @@ use slopwatch_protocol::{
     AGENT_PLUGINS, Actor, Answer, BudgetHit, BudgetKind, Cause, Cents, Cli, CliListing,
     CliSettings, Closing, DaemonSettings, EntryId, GateTerm, LogFilter, LogKey, LogPage, LogRecord,
     PluginListing, PluginSettings, PrRef, RepoName, RunEvent, RunId, SecretInfo, SecretValue,
-    StepInfo, StepLogPage, Waiver,
+    StepInfo, StepLogPage, StripMark, Waiver,
 };
 use tokio::sync::mpsc;
 
@@ -2095,8 +2095,9 @@ impl Engine {
             let id = run.id;
             self.store.set_gate(id, gate)?;
             self.journal.append(id, RunEvent::Gate { state: gate })?;
-            self.publish(&key.0, key.1)?;
         }
+        // The row's Step strip shows what settled, and the Gate.
+        self.publish(&key.0, key.1)?;
 
         let run = &self.active[key];
         let settled = run
@@ -2552,7 +2553,7 @@ impl Engine {
                 attempt,
             },
         )?;
-        Ok(())
+        self.publish(&key.0, key.1)
     }
 
     /// Settles the Step with an earlier same-SHA Run's Outcome under the
@@ -2871,7 +2872,8 @@ impl Engine {
         running.question = Question::Asked;
         let id = run.id;
         self.store.clear_restarts(id, step)?;
-        self.inbox.ask(id, pr_ref(&key.0, key.1), step, prompt)
+        self.inbox.ask(id, pr_ref(&key.0, key.1), step, prompt)?;
+        self.publish(&key.0, key.1)
     }
 
     /// The developer answers the Human Step `step` in Run `id`. The Step
@@ -3403,10 +3405,15 @@ impl Engine {
         )
     }
 
-    /// Shows the PR's latest Runs and what blocks it on its row.
+    /// Shows the PR's latest Runs, the newest with its Step strip, and
+    /// what blocks it on its row.
     fn publish(&self, repo: &RepoName, number: u64) -> Result<(), StoreError> {
+        let mut runs = self.store.run_summaries(repo, number, HISTORY_ON_ROW)?;
+        if let Some(newest) = runs.first_mut() {
+            newest.strip = self.strip(&(repo.clone(), number), newest.id)?;
+        }
         let info = RunInfo {
-            runs: self.store.run_summaries(repo, number, HISTORY_ON_ROW)?,
+            runs,
             blocked: self
                 .blocked
                 .get(&(repo.clone(), number))
@@ -3416,6 +3423,84 @@ impl Engine {
         };
         self.watching.set_run_info(repo, number, info);
         Ok(())
+    }
+}
+
+impl Engine {
+    /// Run `id`'s Step strip: from memory while it's going, else from the
+    /// store. A Run whose Pipeline no longer loads has none.
+    fn strip(&self, key: &PrKey, id: RunId) -> Result<Vec<StripMark>, StoreError> {
+        if let Some(run) = self.active.get(key).filter(|run| run.id == id) {
+            return Ok(strip(&run.pipeline, |step| {
+                let asking = run
+                    .running
+                    .get(&step.id)
+                    .is_some_and(|running| running.question == Question::Asked);
+                let state = run.state.steps.get(&step.id).copied().unwrap_or_default();
+                mark(state, run.state.waived.contains(&step.id), asking)
+            }));
+        }
+        let Some(stored) = self.store.run(id)? else {
+            return Ok(Vec::new());
+        };
+        let Ok(pipeline) = load(&stored.pipeline, &*self.plugins) else {
+            return Ok(Vec::new());
+        };
+        let waived = self
+            .store
+            .waived_steps(&stored.repo, stored.number, &stored.head_sha)?;
+        let states: HashMap<&str, StepState> = stored
+            .steps
+            .iter()
+            .map(|row| {
+                let state = match &row.state {
+                    StepRowState::Settled { verdict, .. } => StepState::Settled(*verdict),
+                    StepRowState::Running { .. } => StepState::Running,
+                    StepRowState::Pending | StepRowState::Interrupted { .. } => StepState::Pending,
+                };
+                (row.step.as_str(), state)
+            })
+            .collect();
+        Ok(strip(&pipeline, |step| {
+            let state = states.get(step.id.as_str()).copied().unwrap_or_default();
+            mark(state, waived.contains(&step.id), false)
+        }))
+    }
+}
+
+/// A Run's Step strip: its Steps in Pipeline order, each marked by `mark`,
+/// with the Gate between the Steps it doesn't come after and the Steps it
+/// does, such as Merge and Fix.
+fn strip(pipeline: &Pipeline, mut mark: impl FnMut(&Step) -> StripMark) -> Vec<StripMark> {
+    let mut after_gate = HashSet::new();
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    for step in pipeline.ordered_steps() {
+        let downstream = step
+            .needs
+            .iter()
+            .any(|need| need == GATE || after_gate.contains(need.as_str()));
+        if downstream {
+            after_gate.insert(step.id.as_str());
+            after.push(mark(step));
+        } else {
+            before.push(mark(step));
+        }
+    }
+    before.push(StripMark::Gate);
+    before.extend(after);
+    before
+}
+
+/// One Step's mark on the strip. A Waiver shows only on a Verdict it
+/// counts as pass.
+fn mark(state: StepState, waived: bool, asking: bool) -> StripMark {
+    match state {
+        StepState::Settled(Verdict::Pass) => StripMark::Settled(Verdict::Pass),
+        StepState::Settled(_) if waived => StripMark::Waived,
+        StepState::Settled(verdict) => StripMark::Settled(verdict),
+        StepState::Running if asking => StripMark::Asking,
+        StepState::Running => StripMark::Running,
+        StepState::Pending => StripMark::Pending,
     }
 }
 
@@ -3978,6 +4063,53 @@ gate: [review, lint]
             dependents(&pipeline, "notes").is_empty(),
             "the Gate doesn't read notes"
         );
+    }
+
+    #[test]
+    fn the_strip_puts_the_gate_before_the_steps_that_run_after_it() {
+        let pipeline = pipeline(
+            "version: 1
+steps:
+  ci: { uses: ci }
+  review: { uses: claude, needs: [ci] }
+  fix: { uses: fix, needs: [gate] }
+  merge: { uses: merge, needs: [gate] }
+  notes: { uses: jev, needs: [merge] }
+  lint: { uses: ci }
+gate: [review, lint]
+",
+        );
+        let states = HashMap::from([
+            ("ci", StepState::Settled(Verdict::Pass)),
+            ("review", StepState::Settled(Verdict::Fail)),
+            ("lint", StepState::Running),
+        ]);
+        let marks = strip(&pipeline, |step| {
+            let state = states.get(step.id.as_str()).copied().unwrap_or_default();
+            mark(state, step.id == "review", false)
+        });
+
+        let gate = marks.iter().position(|mark| *mark == StripMark::Gate);
+        assert_eq!(gate, Some(3), "ci, review and lint come before the Gate");
+        assert_eq!(marks.len(), 7);
+        assert!(
+            marks.contains(&StripMark::Waived),
+            "review's fail is waived"
+        );
+        assert!(marks[..3].contains(&StripMark::Settled(Verdict::Pass)));
+        assert!(marks[..3].contains(&StripMark::Running));
+        assert!(
+            marks[4..].iter().all(|mark| *mark == StripMark::Pending),
+            "fix, merge and notes, which needs merge, come after it"
+        );
+    }
+
+    #[test]
+    fn a_waiver_marks_only_a_verdict_it_counts_as_pass() {
+        let pass = StepState::Settled(Verdict::Pass);
+        assert_eq!(mark(pass, true, false), StripMark::Settled(Verdict::Pass));
+        assert_eq!(mark(StepState::Running, false, true), StripMark::Asking);
+        assert_eq!(mark(StepState::Running, true, false), StripMark::Running);
     }
 
     #[test]

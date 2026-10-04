@@ -306,7 +306,18 @@ async fn a_manifest_that_asks_for_more_pauses_the_plugin_until_approved_again() 
         client.reason(third, "lint").as_deref(),
         Some("error(secret missing): `LINT_KEY` isn't set")
     );
-    assert_eq!(client.inbox.count(), 1);
+    // The Inbox is its own topic, so its entry may land after the Run's end.
+    client
+        .until("the missing Secret's entry", |c| {
+            c.inbox.count() == 1
+                && matches!(
+                    &c.inbox.entries[0].scope,
+                    Scope::Cause {
+                        cause: Cause::MissingSecret { .. }
+                    }
+                )
+        })
+        .await;
     assert_eq!(
         client.inbox.entries[0].scope,
         Scope::Cause {

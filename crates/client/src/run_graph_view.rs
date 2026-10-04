@@ -4,138 +4,86 @@
 
 use std::rc::Rc;
 
-use gpui_kit::component::theme::Theme;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_core::{GateState, Verdict};
 use slopwatch_protocol::{GateTerm, RunView, StepStatus, StepView};
 
+use crate::components::{ChipKind, chip, dot, dot_grid, gate_pill, verdict_label};
 use crate::run_graph::{
     self, ALL_OF_HEIGHT, ANY_OF_HEADER, EdgeKind, GATE_BORDER, GATE_PADDING, GATE_TITLE_HEIGHT,
     Layout, NodeId, Rect, Role, TERM_HEIGHT,
 };
-use crate::run_pane::{GRAPH_BORDER, Tone, gate_tone, step_state, step_tone};
-
-/// The color a [`Tone`] reads in.
-pub fn tone_color(theme: &Theme, tone: Tone) -> Hsla {
-    match tone {
-        Tone::Good => theme.success,
-        Tone::Bad => theme.danger,
-        Tone::Neutral => theme.muted_foreground,
-    }
-}
+use crate::run_pane::{GRAPH_BORDER, Look, step_look, step_state};
+use crate::theme;
 
 /// What a click on a Step's node does.
 pub type OnSelect = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
 /// The Run's graph. `open` is the Step whose evidence shows below it.
-pub fn run_graph(
-    view: &RunView,
-    open: Option<&str>,
-    theme: &Theme,
-    on_select: OnSelect,
-) -> impl IntoElement {
+pub fn run_graph(view: &RunView, open: Option<&str>, on_select: OnSelect) -> impl IntoElement {
     let infos: Vec<_> = view.steps.iter().map(|step| step.info.clone()).collect();
     let terms = run_graph::gate_terms(view);
     let layout = run_graph::layout(&infos, &terms);
     let roles = run_graph::roles(&infos);
-    let colors = Colors::new(theme);
 
     let mut inner = div()
         .relative()
         .flex_none()
         .w(px(layout.width))
         .h(px(layout.height))
-        .child(edges(&layout, colors).absolute().size_full());
+        .child(edges(&layout).absolute().size_full());
     for node in &layout.nodes {
         let element = match &node.id {
-            NodeId::Gate => gate_node(view, &terms, node.rect, theme, colors).into_any_element(),
+            NodeId::Gate => gate_node(view, &terms, node.rect).into_any_element(),
             NodeId::Step(id) => {
                 let Some(step) = view.step(id) else {
                     continue;
                 };
                 let (on_select, picked) = (Rc::clone(&on_select), id.clone());
-                step_node(
-                    step,
-                    roles[id.as_str()],
-                    open == Some(id),
-                    node.rect,
-                    theme,
-                    colors,
-                )
-                .on_click(move |_, window, cx| on_select(&picked, window, cx))
-                .into_any_element()
+                step_node(step, roles[id.as_str()], open == Some(id), node.rect)
+                    .on_click(move |_, window, cx| on_select(&picked, window, cx))
+                    .into_any_element()
             }
         };
         inner = inner.child(element);
     }
     div()
         .id("run-graph")
+        .relative()
         .w_full()
         .flex_none()
-        .rounded_md()
+        .rounded(px(8.))
         .border(px(GRAPH_BORDER))
-        .border_color(theme.border)
-        .bg(theme.muted)
+        .border_color(theme::LINE)
+        .bg(theme::BG)
         .overflow_x_scroll()
+        .child(dot_grid())
         .child(inner)
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct Colors {
-    good: Hsla,
-    bad: Hsla,
-    neutral: Hsla,
-    running: Hsla,
-    pub(crate) edge: Hsla,
-    /// The Gate's edges and its any-of groups.
-    pub(crate) gate: Hsla,
-}
-
-impl Colors {
-    pub(crate) fn new(theme: &Theme) -> Self {
-        Colors {
-            good: tone_color(theme, Tone::Good),
-            bad: tone_color(theme, Tone::Bad),
-            neutral: tone_color(theme, Tone::Neutral),
-            running: theme.info,
-            edge: theme.muted_foreground.opacity(0.7),
-            gate: hsla(250. / 360., 0.5, 0.62, 1.),
-        }
-    }
-
-    fn tone(&self, tone: Tone) -> Hsla {
-        match tone {
-            Tone::Good => self.good,
-            Tone::Bad => self.bad,
-            Tone::Neutral => self.neutral,
-        }
-    }
-
-    fn step(&self, step: &StepView) -> Hsla {
-        match step.status {
-            StepStatus::Running => self.running,
-            _ => self.tone(step_tone(step)),
-        }
-    }
 }
 
 /// Every edge as a curve from the right of one node to the left of the
 /// next, with an arrowhead. Edges the Gate reads are dashed.
-fn edges(layout: &Layout, colors: Colors) -> Canvas<()> {
+fn edges(layout: &Layout) -> Canvas<()> {
     let edges = layout.edges.clone();
     canvas(
         |_, _, _| (),
         move |bounds, (), window, _| {
             for edge in &edges {
-                let (color, dashed) = match edge.kind {
-                    EdgeKind::Needs => (colors.edge, false),
-                    EdgeKind::GateReads => (colors.gate, true),
-                };
+                let (color, dashed) = edge_look(edge.kind);
                 paint_edge(window, bounds.origin, edge.start, edge.end, color, dashed);
             }
         },
     )
+}
+
+/// An edge's colour, and whether it's dashed: solid for `needs`, dashed
+/// violet for what the Gate reads.
+pub(crate) fn edge_look(kind: EdgeKind) -> (Rgba, bool) {
+    match kind {
+        EdgeKind::Needs => (theme::EDGE, false),
+        EdgeKind::GateReads => (theme::GATE_LINE, true),
+    }
 }
 
 /// Paints one edge as a curve from `start` to an arrowhead at `end`, both
@@ -145,7 +93,7 @@ pub(crate) fn paint_edge(
     origin: gpui_kit::Point<Pixels>,
     start: run_graph::Point,
     end: run_graph::Point,
-    color: Hsla,
+    color: Rgba,
     dashed: bool,
 ) {
     let at = |x: f32, y: f32| origin + point(px(x), px(y));
@@ -155,7 +103,7 @@ pub(crate) fn paint_edge(
     let pull = ((base - start.x).abs() / 2.).max(16.);
     let mut line = PathBuilder::stroke(px(1.5));
     if dashed {
-        line = line.dash_array(&[px(4.), px(3.)]);
+        line = line.dash_array(&[px(5.), px(4.)]);
     }
     line.move_to(at(start.x, start.y));
     line.cubic_bezier_to(
@@ -176,56 +124,35 @@ pub(crate) fn paint_edge(
     }
 }
 
-pub(crate) fn dot(color: Hsla) -> Div {
-    div().flex_none().size(px(8.)).rounded_full().bg(color)
-}
-
-pub(crate) fn chip(text: impl Into<SharedString>, color: Hsla, theme: &Theme) -> Div {
-    // Chips shrink and truncate, so a long Condition leaves room for the
-    // chips after it.
-    div()
-        .flex_shrink(1.)
-        .min_w_0()
-        .px_1()
-        .rounded_sm()
-        .border_1()
-        .border_color(theme.border)
-        .text_color(color)
-        .truncate()
-        .child(text.into())
-}
-
-fn step_node(
-    step: &StepView,
-    role: Role,
-    open: bool,
-    rect: Rect,
-    theme: &Theme,
-    colors: Colors,
-) -> Stateful<Div> {
+fn step_node(step: &StepView, role: Role, open: bool, rect: Rect) -> Stateful<Div> {
     let info = &step.info;
-    let color = colors.step(step);
-    let faded = matches!(
-        step.status,
-        StepStatus::Pending
-            | StepStatus::Settled {
-                verdict: Verdict::Skipped | Verdict::Cancelled,
-                ..
-            }
-    );
-    let mut chips = div().flex().gap_1().overflow_hidden().text_xs();
+    let look = step_look(step);
+    let mut chips = div().flex().gap_1().overflow_hidden();
     if let Some(condition) = &info.condition {
-        chips = chips.child(chip(
-            format!("when {condition}"),
-            theme.muted_foreground,
-            theme,
-        ));
-    }
-    if role == Role::Advisory {
-        chips = chips.child(chip("advisory", theme.muted_foreground, theme));
+        chips = chips.child(chip(ChipKind::Condition, condition.clone()));
     }
     if info.write {
-        chips = chips.child(chip("commit ends this Run", theme.warning, theme));
+        chips = chips.child(chip(ChipKind::Write, "commit ends Run"));
+    }
+    let findings = match &step.status {
+        StepStatus::Settled { outputs, .. } => outputs.findings.len(),
+        _ => 0,
+    };
+    let mut detail = div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .text_xs()
+        .overflow_hidden()
+        .child(verdict_label(look, step_state(step)));
+    if findings > 0 {
+        detail = detail.child(div().text_color(theme::DIM).child(match findings {
+            1 => "· 1 finding".to_owned(),
+            n => format!("· {n} findings"),
+        }));
+    }
+    if let Some(cost) = step.cost {
+        detail = detail.child(div().text_color(theme::DIM).child(format!("· {cost}")));
     }
 
     div()
@@ -237,53 +164,43 @@ fn step_node(
         .h(px(rect.height))
         .flex()
         .flex_col()
-        .gap_0p5()
-        .px_2()
-        .py_1p5()
-        .rounded_lg()
-        .bg(theme.background)
-        .border_1()
-        .border_color(if faded { theme.border } else { color })
+        .gap(px(3.))
+        .px(px(10.))
+        .py(px(7.))
+        .rounded(px(10.))
+        .bg(if role == Role::Advisory {
+            theme::ADVISORY_BG
+        } else {
+            theme::PANEL
+        })
+        .border(px(1.5))
+        .border_color(theme::node_line(look))
         .when(role == Role::Advisory, |this| this.border_dashed())
-        .when(open, |this| this.border_2().border_color(theme.ring))
-        .when(faded, |this| this.text_color(theme.muted_foreground))
-        .hover(|this| this.bg(theme.list_hover))
+        .when(theme::faded(look), |this| this.opacity(0.6))
+        .when(open, |this| this.border_2().border_color(theme::ACCENT))
+        .cursor_pointer()
         .overflow_hidden()
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap_1p5()
-                .child(dot(color))
-                .child(div().flex_1().text_sm().truncate().child(info.id.clone()))
+                .gap(px(6.))
+                .child(dot(look))
                 .child(
                     div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(color)
-                        .child(step_state(step)),
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(info.id.clone()),
                 ),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .truncate()
-                .child(if info.write {
-                    format!("{} · terminal", info.plugin)
-                } else {
-                    info.plugin.clone()
-                }),
-        )
+        .child(detail)
         .child(chips)
 }
 
-fn gate_node(view: &RunView, terms: &[GateTerm], rect: Rect, theme: &Theme, colors: Colors) -> Div {
+fn gate_node(view: &RunView, terms: &[GateTerm], rect: Rect) -> Div {
     let state = view.gate.unwrap_or(GateState::Pending);
-    let color = match state {
-        GateState::Pending => theme.warning,
-        _ => colors.tone(gate_tone(state)),
-    };
     let mut node = div()
         .absolute()
         .left(px(rect.x))
@@ -293,10 +210,10 @@ fn gate_node(view: &RunView, terms: &[GateTerm], rect: Rect, theme: &Theme, colo
         .flex()
         .flex_col()
         .p(px(GATE_PADDING))
-        .rounded_xl()
-        .bg(theme.background)
+        .rounded(px(14.))
+        .bg(theme::GATE_BG)
         .border(px(GATE_BORDER))
-        .border_color(color)
+        .border_color(theme::gate_line(state))
         .overflow_hidden()
         .child(
             div()
@@ -304,38 +221,35 @@ fn gate_node(view: &RunView, terms: &[GateTerm], rect: Rect, theme: &Theme, colo
                 .flex()
                 .items_center()
                 .justify_between()
-                .text_xs()
-                .child(div().font_weight(FontWeight::BOLD).child("GATE"))
                 .child(
                     div()
-                        .px_1p5()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(color)
-                        .text_color(color)
-                        .child(state.to_string()),
-                ),
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::GATE_TEXT)
+                        .child("GATE"),
+                )
+                .child(gate_pill(state)),
         )
         .child(
             div()
                 .h(px(ALL_OF_HEIGHT))
-                .text_xs()
-                .text_color(theme.muted_foreground)
+                .text_size(theme::LABEL_SIZE)
+                .text_color(theme::DIM)
                 .child("ALL OF"),
         );
     for term in terms {
-        node = node.child(gate_term(view, term, theme, colors));
+        node = node.child(gate_term(view, term));
     }
     node
 }
 
-fn gate_term(view: &RunView, term: &GateTerm, theme: &Theme, colors: Colors) -> Div {
+fn gate_term(view: &RunView, term: &GateTerm) -> Div {
     match term {
         GateTerm::Step {
             id,
             accepts_skipped,
         } => {
-            let color = view.step(id).map_or(colors.neutral, |step| {
+            let look = view.step(id).map_or(Look::Waiting, |step| {
                 let skipped = matches!(
                     step.status,
                     StepStatus::Settled {
@@ -343,48 +257,43 @@ fn gate_term(view: &RunView, term: &GateTerm, theme: &Theme, colors: Colors) -> 
                         ..
                     }
                 );
-                // A Waiver counts as pass in the Gate.
-                if (skipped && *accepts_skipped) || step.waiver.is_some() {
-                    colors.good
+                // A skip the term accepts counts as pass.
+                if skipped && *accepts_skipped {
+                    Look::Pass
                 } else {
-                    colors.step(step)
+                    step_look(step)
                 }
             });
             div()
                 .h(px(TERM_HEIGHT))
                 .flex()
                 .items_center()
-                .gap_1p5()
-                .text_xs()
-                .child(dot(color))
-                .child(div().truncate().child(id.clone()))
+                .gap(px(6.))
+                .text_size(px(12.))
+                .child(dot(look))
+                .child(div().min_w_0().truncate().child(id.clone()))
                 .when(*accepts_skipped, |this| {
-                    this.child(
-                        div()
-                            .flex_none()
-                            .text_color(theme.muted_foreground)
-                            .child("pass · skipped"),
-                    )
+                    this.child(chip(ChipKind::Required, "skip ok").flex_none())
                 })
         }
         GateTerm::AnyOf { terms } => {
             let mut group = div()
                 .flex()
                 .flex_col()
-                .pl_2()
+                .pl(px(8.))
                 .border_l_2()
-                .border_color(colors.gate)
+                .border_color(theme::GATE_LINE)
                 .child(
                     div()
                         .h(px(ANY_OF_HEADER))
                         .flex()
                         .items_center()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
+                        .text_size(theme::LABEL_SIZE)
+                        .text_color(theme::DIM)
                         .child("ANY OF"),
                 );
             for term in terms {
-                group = group.child(gate_term(view, term, theme, colors));
+                group = group.child(gate_term(view, term));
             }
             group
         }
@@ -392,7 +301,7 @@ fn gate_term(view: &RunView, term: &GateTerm, theme: &Theme, colors: Colors) -> 
             .h(px(TERM_HEIGHT))
             .flex()
             .items_center()
-            .text_xs()
+            .text_size(px(12.))
             .truncate()
             .child(text.clone()),
     }

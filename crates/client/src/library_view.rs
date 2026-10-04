@@ -3,16 +3,18 @@
 //! refuses text that wouldn't load, and the next Run of every Pipeline that
 //! uses the Step reads what was saved.
 
-use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_kit::component::{ActiveTheme, Disableable, Sizable};
+use gpui_kit::component::{Disableable, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Command, LibraryStep};
 
+use crate::components::{ButtonLooks, list_row, section};
 use crate::library::{LibraryEditor, NEW_STEP_TEXT};
 use crate::outbox::Outbox;
 use crate::outbox_view::{Pending, loading, refusal};
+use crate::theme;
 
 /// What the view's commands go out for ([`Outbox`]).
 const LIST: &str = "library-list";
@@ -146,7 +148,6 @@ impl LibraryView {
     }
 
     fn step_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let open = self.library.open_step().map(|step| step.name.clone());
         let mut list = div()
             .id("library-steps")
@@ -157,22 +158,15 @@ impl LibraryView {
             .gap_1()
             .p_2()
             .border_r_1()
-            .border_color(theme.border)
+            .border_color(theme::LINE)
             .overflow_y_scroll()
-            .child(
-                div()
-                    .px_2()
-                    .pb_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("LIBRARY STEPS"),
-            );
+            .child(section("Library steps"));
         if self.library.loaded() && self.library.steps().is_empty() {
             list = list.child(
                 div()
                     .px_2()
                     .text_sm()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme::DIM)
                     .child("No Library Steps yet."),
             );
         }
@@ -180,19 +174,11 @@ impl LibraryView {
             let name = step.name.clone();
             let selected = open.as_deref() == Some(name.as_str());
             list = list.child(
-                div()
-                    .id(SharedString::from(format!("library-{name}")))
-                    .flex()
+                list_row(SharedString::from(format!("library-{name}")), selected)
                     .justify_between()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .text_sm()
-                    .when(selected, |this| this.bg(theme.list_active))
-                    .hover(|this| this.bg(theme.list_hover))
                     .child(format!("lib/{name}"))
                     .when(step.problem.is_some(), |this| {
-                        this.child(div().text_color(theme.danger).child("invalid"))
+                        this.child(div().text_color(theme::FAIL).child("invalid"))
                     })
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.open(&name, cx);
@@ -209,26 +195,24 @@ impl LibraryView {
                     Button::new(NEW)
                         .label("New")
                         .small()
-                        .ghost()
                         .pending(self.outbox.waiting(NEW))
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.create(window, cx);
                         })),
                 ),
         )
-        .children(refusal(&self.outbox, NEW, theme))
+        .children(refusal(&self.outbox, NEW))
     }
 
     fn editor_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
         let Some(step) = self.library.open_step() else {
             let pane = div().flex_1().p_6();
             if !self.library.loaded() {
-                return pane.child(loading(&self.outbox, LIST, "the Library", theme));
+                return pane.child(loading(&self.outbox, LIST, "the Library"));
             }
             return pane
                 .text_sm()
-                .text_color(theme.muted_foreground)
+                .text_color(theme::DIM)
                 .child("Pick a Library Step, or create one.");
         };
         let unsaved = self.library.unsaved(&self.editor_text(cx));
@@ -245,7 +229,7 @@ impl LibraryView {
                         this.child(
                             div()
                                 .text_xs()
-                                .text_color(theme.muted_foreground)
+                                .text_color(theme::DIM)
                                 .child("Unsaved changes"),
                         )
                     }),
@@ -254,7 +238,6 @@ impl LibraryView {
                 Button::new("library-revert")
                     .label("Revert")
                     .small()
-                    .ghost()
                     .disabled(!unsaved)
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.revert(cx))),
             )
@@ -262,7 +245,6 @@ impl LibraryView {
                 Button::new(DELETE)
                     .label("Delete")
                     .small()
-                    .ghost()
                     .pending(self.outbox.waiting(DELETE))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, _| this.delete())),
             )
@@ -270,7 +252,7 @@ impl LibraryView {
                 Button::new(SAVE)
                     .label("Save")
                     .small()
-                    .primary()
+                    .accent()
                     .disabled(!unsaved)
                     .pending(self.outbox.waiting(SAVE))
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save(cx))),
@@ -283,20 +265,24 @@ impl LibraryView {
             .gap_2()
             .p_3()
             .child(header)
-            .children(refusal(&self.outbox, SAVE, theme))
-            .children(refusal(&self.outbox, DELETE, theme))
+            .children(refusal(&self.outbox, SAVE))
+            .children(refusal(&self.outbox, DELETE))
             .children(step.problem.as_ref().map(|problem| {
-                div().text_xs().text_color(theme.danger).child(format!(
+                div().text_xs().text_color(theme::FAIL).child(format!(
                     "Pipelines that use this Step won't load: {problem}"
                 ))
             }))
             .child(
                 div()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme::DIM)
                     .child("Pipelines override these keys per repo with `with:`."),
             )
-            .child(Textarea::new(&self.editor).flex_1().font_family("Menlo"))
+            .child(
+                Textarea::new(&self.editor)
+                    .flex_1()
+                    .font_family(theme::MONO),
+            )
     }
 }
 

@@ -12,10 +12,9 @@
 //! reason is typed into the view's input and comes in on submit.
 
 use slopwatch_core::{EndReason, GateState, Verdict, WaiverCategory};
-use slopwatch_protocol::step::Finding;
 use slopwatch_protocol::{
-    Command, LogKey, LogRecord, PullRequest, RepoName, RunId, RunSummary, RunView, StepLogPage,
-    StepStatus, StepView, Topic, TopicUpdate,
+    Command, LogKey, LogRecord, PullRequest, RepoName, RunEvent, RunId, RunSummary, RunView,
+    StepLogPage, StepStatus, StepView, StripMark, Topic, TopicUpdate,
 };
 
 use crate::step_log::{LogTail, LogViewer, TimedEvent};
@@ -59,7 +58,7 @@ pub enum WaiveTarget {
 /// this, leaving the rest of the window to the PR pane.
 pub const GRAPH_MODE_LIST_WIDTH: f32 = 300.;
 /// The PR pane's padding on each side.
-pub const PANE_PADDING: f32 = 16.;
+pub const PANE_PADDING: f32 = 18.;
 /// The graph's border, on each side.
 pub const GRAPH_BORDER: f32 = 1.;
 
@@ -325,6 +324,40 @@ impl RunPane {
         &self.events
     }
 
+    /// How long Step `step`'s latest attempt took, or has taken by `now`
+    /// while it runs, in milliseconds since the Unix epoch. `None` for a
+    /// Step that hasn't started, and for events from before timestamps.
+    pub fn step_time(&self, step: &str, now: i64) -> Option<String> {
+        let mut started = None;
+        let mut settled = None;
+        for timed in &self.events {
+            match &timed.event {
+                RunEvent::StepStarted { step: id, .. } if id == step => {
+                    started = Some(timed.ts);
+                    settled = None;
+                }
+                RunEvent::StepSettled { step: id, .. } if id == step => settled = Some(timed.ts),
+                _ => {}
+            }
+        }
+        let start = started.filter(|&ts| ts > 0)?;
+        Some(duration(settled.unwrap_or(now) - start))
+    }
+
+    /// How long the shown Run took, or has taken by `now` while it goes.
+    pub fn run_time(&self, now: i64) -> Option<String> {
+        let start = self
+            .events
+            .first()
+            .map(|timed| timed.ts)
+            .filter(|&ts| ts > 0)?;
+        let end = self.events.iter().find_map(|timed| match timed.event {
+            RunEvent::Ended { .. } => Some(timed.ts),
+            _ => None,
+        });
+        Some(duration(end.unwrap_or(now) - start))
+    }
+
     /// Opens a Step row to show its log tail, or closes the open one.
     pub fn toggle_step(&mut self, step: &str) -> Vec<Command> {
         let mut commands = self.close_step();
@@ -488,68 +521,58 @@ pub fn commit_line(view: &RunView, step: &StepView) -> Option<String> {
     })
 }
 
-/// Whether a Run reads as good, bad or neither.
+/// How a Step, a strip mark or a Run looks: the prototype's `st-*`
+/// states, which [`crate::theme`] gives their colours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tone {
-    Good,
-    Bad,
-    Neutral,
+pub enum Look {
+    Pass,
+    Fail,
+    Inconclusive,
+    /// The Step errored, or never reported.
+    Error,
+    Running,
+    /// A Human Step waiting on the developer.
+    Asking,
+    /// A Waiver counts the Verdict as pass.
+    Waived,
+    Skipped,
+    Cancelled,
+    /// Not started yet.
+    Waiting,
 }
 
-pub fn run_tone(run: &RunSummary) -> Tone {
-    match (run.end, run.gate) {
-        (Some(EndReason::Shippable | EndReason::Merged), _) => Tone::Good,
-        (Some(EndReason::NotShippable | EndReason::OverBudget), _) => Tone::Bad,
-        (Some(_), _) => Tone::Neutral,
-        (None, GateState::Pass) => Tone::Good,
-        (None, GateState::Fail) => Tone::Bad,
-        (None, GateState::Pending) => Tone::Neutral,
-    }
-}
-
-/// A Step's status as its row in the Step list says it, with what it cost
-/// once it reported usage.
-pub fn step_line(step: &StepView) -> String {
-    let line = status_line(step);
-    match step.cost {
-        Some(cost) => format!("{line} · {cost}"),
-        None => line,
-    }
-}
-
-fn status_line(step: &StepView) -> String {
-    match &step.status {
-        StepStatus::Pending => "pending".to_owned(),
-        StepStatus::Running => match &step.progress {
-            Some(progress) => format!("running: {progress}"),
-            None => "running".to_owned(),
-        },
-        StepStatus::Settled {
-            verdict,
-            reason,
-            outputs,
-            reused_from,
-        } => {
-            let detail = reason.as_ref().or(outputs.note.as_ref());
-            let line = match detail {
-                Some(detail) => format!("{verdict}: {detail}"),
-                None => verdict.to_string(),
-            };
-            match reused_from {
-                Some(run) => format!("{line} (reused from Run {run})"),
-                None => line,
-            }
+impl Look {
+    pub fn of_verdict(verdict: Verdict) -> Look {
+        match verdict {
+            Verdict::Pass => Look::Pass,
+            Verdict::Fail => Look::Fail,
+            Verdict::Inconclusive => Look::Inconclusive,
+            Verdict::Error | Verdict::Missing => Look::Error,
+            Verdict::Skipped => Look::Skipped,
+            Verdict::Cancelled => Look::Cancelled,
         }
     }
+
+    /// A strip mark's look. The Gate's mark is a tick, not a dot.
+    pub fn of_mark(mark: StripMark) -> Option<Look> {
+        Some(match mark {
+            StripMark::Pending => Look::Waiting,
+            StripMark::Running => Look::Running,
+            StripMark::Asking => Look::Asking,
+            StripMark::Settled(verdict) => Look::of_verdict(verdict),
+            StripMark::Waived => Look::Waived,
+            StripMark::Gate => return None,
+        })
+    }
 }
 
-/// One Finding under its Step row: severity, then where, then what.
-pub fn finding_line(finding: &Finding) -> String {
-    let severity = finding.severity;
-    match (&finding.file, finding.line) {
-        (Some(file), Some(line)) => format!("• {severity} {file}:{line}: {}", finding.message),
-        (Some(file), None) => format!("• {severity} {file}: {}", finding.message),
-        _ => format!("• {severity}: {}", finding.message),
+/// A Run history chip's dot: live, or how it ended.
+pub fn run_look(run: &RunSummary) -> Look {
+    match run.end {
+        None => Look::Running,
+        Some(EndReason::Shippable | EndReason::Merged) => Look::Pass,
+        Some(EndReason::NotShippable | EndReason::OverBudget) => Look::Fail,
+        Some(_) => Look::Skipped,
     }
 }
 
@@ -572,28 +595,47 @@ pub fn step_state(step: &StepView) -> String {
     }
 }
 
-pub fn step_tone(step: &StepView) -> Tone {
-    if step.waiver.is_some() {
-        return Tone::Neutral;
-    }
-    match step.status {
-        StepStatus::Settled {
-            verdict: Verdict::Pass,
-            ..
-        } => Tone::Good,
-        StepStatus::Settled {
-            verdict: Verdict::Fail | Verdict::Error,
-            ..
-        } => Tone::Bad,
-        _ => Tone::Neutral,
+pub fn step_look(step: &StepView) -> Look {
+    match &step.status {
+        StepStatus::Settled { .. } if step.waiver.is_some() => Look::Waived,
+        StepStatus::Settled { verdict, .. } => Look::of_verdict(*verdict),
+        // A running Human Step is waiting for the developer's answer.
+        StepStatus::Running if step.info.plugin == "human" => Look::Asking,
+        StepStatus::Running => Look::Running,
+        StepStatus::Pending => Look::Waiting,
     }
 }
 
-pub fn gate_tone(gate: GateState) -> Tone {
-    match gate {
-        GateState::Pass => Tone::Good,
-        GateState::Fail => Tone::Bad,
-        GateState::Pending => Tone::Neutral,
+/// The Run's Steps split where the Gate row goes: the Steps that don't
+/// come after the Gate, then those that do, such as Merge and Fix, each
+/// in Pipeline order.
+pub fn split_at_gate(steps: &[StepView]) -> (Vec<&StepView>, Vec<&StepView>) {
+    let mut after_gate: Vec<&str> = Vec::new();
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    for step in steps {
+        let downstream = step
+            .info
+            .needs
+            .iter()
+            .any(|need| need == slopwatch_core::GATE || after_gate.contains(&need.as_str()));
+        if downstream {
+            after_gate.push(&step.info.id);
+            after.push(step);
+        } else {
+            before.push(step);
+        }
+    }
+    (before, after)
+}
+
+/// A span of `millis` the way the Step list says it: "12s", "7m",
+/// "1h 5m".
+pub fn duration(millis: i64) -> String {
+    let seconds = millis.max(0) / 1000;
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        _ => format!("{}h {}m", seconds / 3600, seconds % 3600 / 60),
     }
 }
 
@@ -608,8 +650,8 @@ fn capitalized(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slopwatch_protocol::step::{Outputs, Severity};
-    use slopwatch_protocol::{Cost, PrStatus, RunEvent, StepInfo};
+    use slopwatch_protocol::step::Outputs;
+    use slopwatch_protocol::{PrStatus, RunEvent, StepInfo};
 
     fn summary(id: u64, end: Option<EndReason>) -> RunSummary {
         RunSummary {
@@ -618,6 +660,7 @@ mod tests {
             gate: GateState::Pending,
             end,
             waived: false,
+            strip: Vec::new(),
         }
     }
 
@@ -880,7 +923,7 @@ mod tests {
             waiver_line(&step).as_deref(),
             Some("Waived, doesn't apply: docs-only PR")
         );
-        assert_eq!(step_tone(&step), Tone::Neutral);
+        assert_eq!(step_look(&step), Look::Waived);
         assert_eq!(step_state(&step), "fail (waived)");
 
         let mut view = RunView::default();
@@ -922,25 +965,69 @@ mod tests {
     }
 
     #[test]
-    fn a_finding_reads_with_its_severity_and_place() {
-        let finding = |file: Option<&str>, line: Option<u32>| Finding {
-            severity: Severity::Warning,
-            message: "Unwrap can panic.".into(),
-            file: file.map(str::to_owned),
-            line,
+    fn the_gate_row_goes_before_the_steps_that_come_after_it() {
+        let step = |id: &str, needs: &[&str]| StepView {
+            info: StepInfo {
+                id: id.into(),
+                plugin: "ci".into(),
+                needs: needs.iter().map(|need| (*need).to_owned()).collect(),
+                gated: false,
+                write: false,
+                condition: None,
+            },
+            status: StepStatus::Pending,
+            attempt: 0,
+            progress: None,
+            waiver: None,
+            cost: None,
         };
-        assert_eq!(
-            finding_line(&finding(Some("src/a.rs"), Some(4))),
-            "• warning src/a.rs:4: Unwrap can panic."
-        );
-        assert_eq!(
-            finding_line(&finding(Some("src/a.rs"), None)),
-            "• warning src/a.rs: Unwrap can panic."
-        );
-        assert_eq!(
-            finding_line(&finding(None, None)),
-            "• warning: Unwrap can panic."
-        );
+        let steps = [
+            step("ci", &[]),
+            step("fix", &["gate"]),
+            step("notes", &["fix"]),
+            step("codex", &["ci"]),
+        ];
+        let (before, after) = split_at_gate(&steps);
+        let ids = |steps: Vec<&StepView>| -> Vec<String> {
+            steps.iter().map(|step| step.info.id.clone()).collect()
+        };
+        assert_eq!(ids(before), ["ci", "codex"]);
+        assert_eq!(ids(after), ["fix", "notes"]);
+    }
+
+    #[test]
+    fn a_steps_time_runs_from_its_latest_start_to_its_verdict() {
+        let mut pane = RunPane::default();
+        pane.select_pr(&pr(vec![summary(5, None)]));
+        pane.apply(started(5));
+        let event = |seq, ts, event| TopicUpdate::Run {
+            id: RunId(5),
+            seq,
+            ts,
+            event,
+        };
+        let start = |attempt| RunEvent::StepStarted {
+            step: "ci".into(),
+            attempt,
+        };
+        assert_eq!(pane.step_time("ci", 10_000), None, "not started");
+
+        pane.apply(event(2, 1_000, start(1)));
+        assert_eq!(pane.step_time("ci", 13_000).as_deref(), Some("12s"));
+        pane.apply(event(3, 2_000, start(2)));
+        pane.apply(event(
+            4,
+            422_000,
+            RunEvent::StepSettled {
+                step: "ci".into(),
+                verdict: Verdict::Pass,
+                reason: None,
+                outputs: Outputs::default(),
+                reused_from: None,
+            },
+        ));
+        assert_eq!(pane.step_time("ci", 999_000).as_deref(), Some("7m"));
+        assert_eq!(pane.run_time(3_900_001).as_deref(), Some("1h 5m"));
     }
 
     #[test]
@@ -951,9 +1038,10 @@ mod tests {
             "Not shippable"
         );
         assert_eq!(
-            run_tone(&summary(1, Some(EndReason::Shippable))),
-            Tone::Good
+            run_look(&summary(1, Some(EndReason::Shippable))),
+            Look::Pass
         );
+        assert_eq!(run_look(&summary(1, None)), Look::Running);
 
         let step = StepView {
             info: StepInfo {
@@ -975,7 +1063,7 @@ mod tests {
             waiver: None,
             cost: None,
         };
-        assert_eq!(step_line(&step), "cancelled: the Run ended superseded");
+        assert_eq!(step_look(&step), Look::Cancelled);
         assert_eq!(step_state(&step), "cancelled");
 
         let reused = StepView {
@@ -990,42 +1078,21 @@ mod tests {
             },
             ..step
         };
-        assert_eq!(
-            step_line(&reused),
-            "pass: 1 check passed (reused from Run 3)"
-        );
         assert_eq!(step_state(&reused), "pass (reused)");
 
-        let judged = StepView {
-            status: StepStatus::Settled {
-                verdict: Verdict::Pass,
-                reason: None,
-                outputs: Outputs {
-                    note: Some("3 of 3 questions passed".into()),
-                    ..Outputs::default()
-                },
-                reused_from: None,
+        let asking = StepView {
+            info: StepInfo {
+                plugin: "human".into(),
+                ..reused.info.clone()
             },
-            cost: Some(Cost {
-                usd: 0.0013,
-                unknown: false,
-            }),
-            ..reused.clone()
+            status: StepStatus::Running,
+            ..reused
         };
         assert_eq!(
-            step_line(&judged),
-            "pass: 3 of 3 questions passed · $0.0013"
+            step_look(&asking),
+            Look::Asking,
+            "a running Human Step waits on you"
         );
-        let running = StepView {
-            status: StepStatus::Running,
-            progress: Some("Asking Jev 3 questions".into()),
-            cost: Some(Cost {
-                usd: 0.0,
-                unknown: true,
-            }),
-            ..judged
-        };
-        assert_eq!(step_line(&running), "running: Asking Jev 3 questions · +?");
     }
 
     fn event(id: u64, seq: u64, event: RunEvent) -> TopicUpdate {

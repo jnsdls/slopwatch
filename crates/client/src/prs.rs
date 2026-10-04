@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use slopwatch_core::EndReason;
 use slopwatch_protocol::{
-    Command, InboxEntry, PollState, PrStatus, PullRequest, RepoName, StackParent, StorageWarning,
-    TopicUpdate, WatchedPrs, WatchedPrsUpdate,
+    Command, InboxEntry, PollState, PrStatus, PullRequest, RepoName, Scope, StackParent,
+    StorageWarning, TopicUpdate, WatchedPrs, WatchedPrsUpdate,
 };
 
 /// One row of the PR list. A Stack shows as one summary row, and once
@@ -137,6 +137,25 @@ impl Attention<'_> {
     }
 }
 
+/// An open Inbox entry on a PR, as its row's status line names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingOnYou {
+    pub title: String,
+    /// A Human Step's question, not an Escalation.
+    pub human: bool,
+}
+
+impl WaitingOnYou {
+    /// "Needs you: Ship it?", or "Escalation: Not shippable".
+    pub fn line(&self) -> String {
+        if self.human {
+            format!("Needs you: {}", self.title)
+        } else {
+            format!("Escalation: {}", self.title)
+        }
+    }
+}
+
 /// Where a watched PR stands, for a Stack's summary row. Worst first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PrState {
@@ -205,8 +224,8 @@ pub struct Prs {
     /// first snapshot.
     seq: Option<u64>,
     pub source: Source,
-    /// The title of each PR's oldest open Inbox entry.
-    needs_you: HashMap<(RepoName, u64), String>,
+    /// Each PR's oldest open Inbox entry.
+    needs_you: HashMap<(RepoName, u64), WaitingOnYou>,
     /// PRs and parents of the Stacks shown expanded. A Stack is expanded
     /// while any of its PRs is here, so it stays expanded as it lands.
     expanded: HashSet<(RepoName, u64)>,
@@ -247,7 +266,10 @@ impl Prs {
             for pr in &entry.prs {
                 self.needs_you
                     .entry((pr.repo.clone(), pr.number))
-                    .or_insert_with(|| entry.title.clone());
+                    .or_insert_with(|| WaitingOnYou {
+                        title: entry.title.clone(),
+                        human: matches!(entry.scope, Scope::Human { .. }),
+                    });
             }
         }
     }
@@ -288,6 +310,12 @@ impl Prs {
     /// each of its PRs.
     pub fn count(&self, source: &Source) -> usize {
         self.topic.prs.iter().filter(|pr| source.shows(pr)).count()
+    }
+
+    /// The oldest open Inbox entry on `pr`, which its row's status line
+    /// names.
+    pub fn waiting_on_you(&self, pr: &PullRequest) -> Option<&WaitingOnYou> {
+        self.needs_you.get(&(pr.repo.clone(), pr.number))
     }
 
     /// Where a watched PR stands. `None` for one that isn't watched.
@@ -517,7 +545,7 @@ impl Prs {
             why: self
                 .needs_you
                 .get(&(pr.repo.clone(), pr.number))
-                .map(String::as_str),
+                .map(|waiting| waiting.title.as_str()),
         });
         stack
     }
@@ -699,6 +727,7 @@ mod tests {
             gate,
             end,
             waived: false,
+            strip: Vec::new(),
         }
     }
 
@@ -856,6 +885,12 @@ mod tests {
         let attention = stack.attention.expect("a PR needs attention");
         assert_eq!(attention.line(), "#4 Approve the deploy");
         assert_eq!(attention.pr.runs[0].gate, GateState::Fail);
+        let four = prs.pr(&repo("a"), 4).expect("#4 is listed");
+        assert_eq!(
+            prs.waiting_on_you(four).map(WaitingOnYou::line).as_deref(),
+            Some("Escalation: Approve the deploy"),
+            "the row's status line names the entry"
+        );
 
         // The entry closes and a Run starts on #5.
         prs.set_inbox(&[]);

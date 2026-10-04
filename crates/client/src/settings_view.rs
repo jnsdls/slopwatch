@@ -3,18 +3,20 @@
 //! daemon runs, each with its executable, what the daemon resolved it to,
 //! and for the agent CLIs, their `PATH` dirs, config directory and login.
 
+use gpui_kit::component::Sizable;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Cents, Cli, CliListing, Command, DaemonSettings};
 
+use crate::components::section;
 use crate::outbox::Outbox;
 use crate::outbox_view::{Pending, loading, refusal};
 use crate::settings::{
     CliFields, SettingsModel, cli_fields, login_line, save_cli, save_daily, status_line,
 };
+use crate::theme;
 
 /// What the view's commands go out for ([`Outbox`]).
 const GET: &str = "settings-get";
@@ -189,22 +191,16 @@ impl SettingsView {
     }
 
     fn cli_row(&self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
         let row = &self.clis[index];
         let listing = self.model.cli(row.cli);
-        let muted = |text: String| {
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(text)
-        };
+        let muted = |text: String| div().text_xs().text_color(theme::DIM).child(text);
         let status = match listing.map(|listing| status_line(&listing.status)) {
-            None => match refusal(&self.outbox, CLIS, &theme) {
+            None => match refusal(&self.outbox, CLIS) {
                 Some(refused) if !self.outbox.waiting(CLIS) => refused,
                 _ => muted("Checking…".to_owned()),
             },
             Some(Ok(line)) => muted(line),
-            Some(Err(problem)) => div().text_xs().text_color(theme.danger).child(problem),
+            Some(Err(problem)) => div().text_xs().text_color(theme::FAIL).child(problem),
         };
         let login =
             listing
@@ -212,11 +208,7 @@ impl SettingsView {
                 .map(|(line, logged_in)| {
                     div()
                         .text_xs()
-                        .text_color(if logged_in {
-                            theme.success
-                        } else {
-                            theme.warning
-                        })
+                        .text_color(if logged_in { theme::PASS } else { theme::INC })
                         .child(line)
                 });
         div()
@@ -233,7 +225,7 @@ impl SettingsView {
                         div()
                             .w(px(64.))
                             .text_sm()
-                            .font_family("Menlo")
+                            .font_family(theme::MONO)
                             .child(row.cli.name()),
                     )
                     .child(div().flex_1().child(Input::new(&row.executable).small()))
@@ -270,14 +262,11 @@ impl SettingsView {
                     div()
                         .pl(px(72.))
                         .text_xs()
-                        .text_color(theme.danger)
+                        .text_color(theme::FAIL)
                         .child(problem),
                 )
             })
-            .children(
-                refusal(&self.outbox, &save_cli_action(row.cli), &theme)
-                    .map(|line| line.pl(px(72.))),
-            )
+            .children(refusal(&self.outbox, &save_cli_action(row.cli)).map(|line| line.pl(px(72.))))
     }
 }
 
@@ -303,13 +292,7 @@ impl Render for SettingsView {
                 });
             }
         }
-        let theme = cx.theme().clone();
-        let label = |text: &'static str| {
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(text)
-        };
+        let label = |text: &'static str| section(text);
         let rows: Vec<_> = (0..self.clis.len())
             .map(|index| self.cli_row(index, cx).into_any_element())
             .collect();
@@ -338,25 +321,25 @@ impl Render for SettingsView {
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save(cx))),
                     ),
             )
-            .children(refusal(&self.outbox, SAVE, &theme))
+            .children(refusal(&self.outbox, SAVE))
             .map(|this| {
                 if self.model.loaded() {
                     this.child(div().text_sm().child(self.model.spent_line()))
                 } else {
-                    this.child(loading(&self.outbox, GET, "the settings", &theme))
+                    this.child(loading(&self.outbox, GET, "the settings"))
                 }
             })
-            .child(div().text_xs().text_color(theme.muted_foreground).child(
+            .child(div().text_xs().text_color(theme::DIM).child(
                 "What Steps may spend across every repo from local midnight on, at list price \
                  whatever you're billed. Once it's spent, Runs end over budget and every PR \
                  waits until midnight or a raise. Leave it blank to turn it off. PR and Step \
                  Budgets live in each Pipeline as budget_usd.",
             ))
             .when_some(self.problem.clone(), |this, problem| {
-                this.child(div().text_xs().text_color(theme.danger).child(problem))
+                this.child(div().text_xs().text_color(theme::FAIL).child(problem))
             })
             .child(div().pt_3().child(label("CLIS")))
-            .child(div().text_xs().text_color(theme.muted_foreground).child(
+            .child(div().text_xs().text_color(theme::DIM).child(
                 "How the daemon finds each CLI it runs: a name on PATH or an absolute path. \
                  Blank runs the usual name, found on PATH or where Homebrew puts it. The \
                  review and fix Steps run the claude and codex set here, unless a Step names \
