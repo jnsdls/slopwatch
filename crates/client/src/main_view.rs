@@ -33,7 +33,7 @@ use crate::onboarding::Landing;
 use crate::pipeline_editor_view::PipelineEditorView;
 use crate::plugins::unapproved_plugin;
 use crate::plugins_view::PluginsView;
-use crate::prs::{Prs, Row as PrRow, Source, poll_line, status_line, storage_line};
+use crate::prs::{PrState, Prs, Row as PrRow, Source, Stack, poll_line, status_line, storage_line};
 use crate::run_graph_view::{run_graph, tone_color};
 use crate::run_pane::{
     GRAPH_MODE_LIST_WIDTH, PANE_PADDING, RunMode, RunPane, WaiveTarget, commit_line, end_label,
@@ -197,6 +197,7 @@ impl MainView {
             }
             LinkEvent::Topic(update @ TopicUpdate::Inbox { .. }) => {
                 self.inbox.apply(update);
+                self.prs.set_inbox(self.inbox.entries());
                 dock::set_badge(badge(self.inbox.count()).as_deref());
                 // A missing Secret's or an unapproved Plugin's entry
                 // opening or closing changes those lists, and a spent
@@ -308,6 +309,7 @@ impl MainView {
             Some(row) => {
                 self.pane = Pane::Prs;
                 self.prs.source = Source::All;
+                self.prs.expand_to(&row.repo, row.number);
                 for command in self.run_pane.select_pr(&row) {
                     self.send(command);
                 }
@@ -442,6 +444,30 @@ impl MainView {
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.show_prs(Source::All);
+                    cx.notify();
+                })),
+            )
+            .child(
+                entry(
+                    "source-running".into(),
+                    "Running".to_owned(),
+                    Some(self.prs.count(&Source::Running)),
+                    self.showing(&Source::Running),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.show_prs(Source::Running);
+                    cx.notify();
+                })),
+            )
+            .child(
+                entry(
+                    "source-ended".into(),
+                    "Ended".to_owned(),
+                    None,
+                    self.showing(&Source::Ended),
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.show_prs(Source::Ended);
                     cx.notify();
                 })),
             )
@@ -640,6 +666,10 @@ impl MainView {
                 "Loading…"
             } else if self.prs.repos().is_empty() {
                 "Add a repo to see your open PRs."
+            } else if self.prs.source == Source::Running {
+                "No PR has a Run going."
+            } else if self.prs.source == Source::Ended {
+                "No PR's latest Run has ended."
             } else {
                 "No open PRs by you."
             };
@@ -653,6 +683,7 @@ impl MainView {
         }
         for row in rows {
             list = match row {
+                PrRow::Stack(stack) => list.child(self.stack_row(stack, cx)),
                 PrRow::Pr { pr, .. } => list.child(self.pr_row(pr, row, cx)),
                 PrRow::Parent { repo, parent, .. } => {
                     list.child(self.unlisted_parent_row(repo, parent, row, cx))
@@ -660,6 +691,83 @@ impl MainView {
             };
         }
         list
+    }
+
+    /// A Stack's summary row. A click expands or collapses it.
+    fn stack_row(&self, stack: Stack<'_>, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let tone = match stack.worst() {
+            Some(PrState::NeedsYou) => theme.warning,
+            Some(PrState::Failed) => theme.danger,
+            Some(PrState::Passed) => theme.success,
+            _ => theme.muted_foreground,
+        };
+        // The Gate of the PR that needs attention, and why it does.
+        let attention = stack.attention.map(|attention| {
+            let gate = attention.pr.runs.first().map(|run| run.gate);
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .children(gate.map(|gate| {
+                    div()
+                        .px_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(tone_color(theme, gate_tone(gate)))
+                        .text_color(tone_color(theme, gate_tone(gate)))
+                        .child(format!("Gate {gate}"))
+                }))
+                .child(div().truncate().child(attention.line()))
+        });
+        let (repo, root) = (stack.repo.clone(), stack.root);
+        div()
+            .id(SharedString::from(format!(
+                "stack-{}-{}",
+                stack.repo, stack.root
+            )))
+            .flex()
+            .items_center()
+            .gap_3()
+            .pr_4()
+            .pl(row_indent(PrRow::Stack(stack)))
+            .py_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .hover(|this| this.bg(theme.list_hover))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.prs.toggle(&repo, root);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(if stack.expanded { "▾" } else { "▸" }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .text_sm()
+                            .child(div().truncate().child(stack.title()))
+                            .child(
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child(stack.size_line()),
+                            ),
+                    )
+                    .child(div().text_xs().text_color(tone).child(stack.status_line())),
+            )
+            .children(attention)
     }
 
     /// A Stack parent that isn't one of the developer's PRs: dim, and it
@@ -841,6 +949,7 @@ impl MainView {
                 .hover(|this| this.bg(theme.list_hover))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     if let Some(pr) = &held {
+                        this.prs.expand_to(&pr.repo, pr.number);
                         for command in this.run_pane.select_pr(pr) {
                             this.send(command);
                         }
