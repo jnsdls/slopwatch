@@ -442,6 +442,26 @@ pub struct RunSummary {
     /// It ended shippable only because of Waivers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waived: bool,
+    /// Each Step's state in Pipeline order, with the Gate between the
+    /// Steps it reads and the Steps that run after it, for the PR list's
+    /// Step strip. Only the PR's newest Run carries it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strip: Vec<StripMark>,
+}
+
+/// One mark on a PR row's Step strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StripMark {
+    Pending,
+    Running,
+    /// A Human Step waiting on the developer.
+    Asking,
+    Settled(Verdict),
+    /// A settled Step whose Verdict a Waiver counts as pass.
+    Waived,
+    /// Where the Gate sits: the Steps after it run once it settles.
+    Gate,
 }
 
 #[cfg(test)]

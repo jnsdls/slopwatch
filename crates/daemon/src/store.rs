@@ -1090,7 +1090,8 @@ impl Store {
         Ok(runs)
     }
 
-    /// The PR's newest `limit` Runs, newest first.
+    /// The PR's newest `limit` Runs, newest first, without their Step
+    /// strips.
     pub fn run_summaries(
         &self,
         repo: &RepoName,
@@ -1113,6 +1114,7 @@ impl Store {
                         .get::<_, Option<String>>(3)?
                         .and_then(|reason| serde_json::from_value(reason.into()).ok()),
                     waived: row.get(4)?,
+                    strip: Vec::new(),
                 })
             },
         )?;

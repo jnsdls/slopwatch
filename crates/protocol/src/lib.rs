@@ -41,7 +41,7 @@ pub use notifications::{
 pub use plugins::{AGENT_PLUGINS, Grant, PluginListing, PluginSettings, workspace_name};
 pub use runs::{
     CommitView, Cost, EffectView, GateTerm, RunEvent, RunId, RunSummary, RunView, StepInfo,
-    StepStatus, StepView, Waiver,
+    StepStatus, StepView, StripMark, Waiver,
 };
 pub use secrets::{SecretInfo, SecretValue, is_secret_name};
 pub use topics::{
