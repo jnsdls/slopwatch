@@ -11,8 +11,8 @@
 //!
 //! On a subscription the CLI reads its login from the Keychain under
 //! `$USER`, which the daemon passes every Step. A login kept outside
-//! `~/.claude` comes through the Plugin's config directory setting in the
-//! daemon, handed to the CLI as `CLAUDE_CONFIG_DIR`.
+//! `~/.claude` comes through the `claude` CLI's config directory setting
+//! in the daemon, handed to the CLI as `CLAUDE_CONFIG_DIR`.
 //!
 //! Claude reports its own list-price cost per model, which becomes the
 //! Step's usage. The `system/init` line says which credential it used, and

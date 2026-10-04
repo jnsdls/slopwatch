@@ -19,7 +19,7 @@ use slopwatch_daemon::secrets::MemoryKeychain;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::{Daemon, Library, Retention, Runs, RunsConfig, Watching};
 use slopwatch_protocol::step::{Finding, Outputs, Severity, Usage};
-use slopwatch_protocol::{PluginSettings, RepoName, RunEvent, RunId, RunView, SecretValue};
+use slopwatch_protocol::{Cli, CliSettings, RepoName, RunEvent, RunId, RunView, SecretValue};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -34,6 +34,7 @@ ls > "$out.ls"
 printf '%s' "${ANTHROPIC_API_KEY-unset}" > "$out.anthropic"
 printf '%s' "${CODEX_API_KEY-unset}" > "$out.codex"
 printf '%s' "${CLAUDE_CONFIG_DIR-unset}" > "$out.config"
+printf '%s' "${CODEX_HOME-unset}" > "$out.codex_home"
 printf '%s' "${USER-unset}" > "$out.user"
 cat > "$out.prompt"
 cat "$out.reply"
@@ -55,14 +56,31 @@ struct World {
 }
 
 impl World {
+    /// The Step names the fake CLI in its `cli`, at `<control>/<plugin>`.
     fn new(plugin: &str, with: serde_json::Value) -> Self {
         let control = tempfile::tempdir().unwrap();
         let cli = control.path().join(plugin);
-        std::fs::write(&cli, FAKE_CLI).unwrap();
-        std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
         let mut with = with;
         with["cli"] = json!(cli.to_str().unwrap());
+        Self::with_fake(plugin, &cli, with, control)
+    }
+
+    /// The Step names no `cli`, and the fake CLI is `<control>/<name>`,
+    /// for the CLI settings to point at.
+    fn unpinned(plugin: &str, name: &str, with: serde_json::Value) -> Self {
+        let control = tempfile::tempdir().unwrap();
+        let cli = control.path().join(name);
+        Self::with_fake(plugin, &cli, with, control)
+    }
+
+    fn with_fake(
+        plugin: &str,
+        cli: &Path,
+        mut with: serde_json::Value,
+        control: tempfile::TempDir,
+    ) -> Self {
+        std::fs::write(cli, FAKE_CLI).unwrap();
+        std::fs::set_permissions(cli, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         with["prompt"] = json!("Find bugs.");
         // Budgets well past what the fake CLIs report, so the reviews
         // aren't stopped.
@@ -103,12 +121,11 @@ impl World {
     /// Runs a daemon until the PR's first Run ends, setting the Secrets
     /// `secrets` first, and returns the Run.
     fn first_run(&self, secrets: &[(&str, &str)]) -> RunId {
-        self.first_run_with(secrets, PluginSettings::default())
+        self.first_run_with(secrets, &[])
     }
 
-    /// [`World::first_run`], with the `claude` Plugin's settings set to
-    /// `settings`.
-    fn first_run_with(&self, secrets: &[(&str, &str)], settings: PluginSettings) -> RunId {
+    /// [`World::first_run`], with the CLI settings `clis` set first.
+    fn first_run_with(&self, secrets: &[(&str, &str)], clis: &[(Cli, CliSettings)]) -> RunId {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -124,6 +141,7 @@ impl World {
                 github,
                 Arc::clone(&watching),
                 RunsConfig {
+                    clis: Default::default(),
                     data_dir: self.data.path().to_owned(),
                     plugins,
                     login_path: None,
@@ -132,7 +150,9 @@ impl World {
                 },
             )
             .unwrap();
-            runs.set_plugin_settings("claude", settings).await.unwrap();
+            for (cli, settings) in clis {
+                runs.set_cli_settings(*cli, settings.clone()).await.unwrap();
+            }
             for (name, value) in secrets {
                 runs.set_secret((*name).to_owned(), SecretValue::new(*value))
                     .await
@@ -336,19 +356,22 @@ fn a_claude_review_reports_findings_and_cost_from_a_worktree_of_the_head() {
 }
 
 /// Settings that point Claude Steps at a config directory of their own.
-fn claude_dir() -> PluginSettings {
-    PluginSettings {
-        config_dir: Some("/Users/me/.claude-work".into()),
-        ..PluginSettings::default()
-    }
+fn claude_dir() -> [(Cli, CliSettings); 1] {
+    [(
+        Cli::Claude,
+        CliSettings {
+            config_dir: Some("/Users/me/.claude-work".into()),
+            ..CliSettings::default()
+        },
+    )]
 }
 
 #[test]
-fn a_subscription_claude_step_logs_in_from_the_config_dir_in_its_plugin_settings() {
+fn a_subscription_claude_step_logs_in_from_the_config_dir_in_its_cli_settings() {
     let world = World::new("claude", json!({}));
     world.reply("claude", &claude_reply(json!([]), 0.05));
 
-    let run = world.first_run_with(&[], claude_dir());
+    let run = world.first_run_with(&[], &claude_dir());
 
     assert_eq!(world.ended(run), Some(EndReason::Shippable));
     assert_eq!(world.recorded("claude", "config"), "/Users/me/.claude-work");
@@ -359,7 +382,7 @@ fn an_api_key_claude_step_runs_bare_on_the_secret() {
     let world = World::new("claude", json!({ "auth": "api_key", "fail_on": "warning" }));
     world.reply("claude", &claude_reply(json!([]), 0.05));
 
-    let run = world.first_run_with(&[("ANTHROPIC_API_KEY", KEY)], claude_dir());
+    let run = world.first_run_with(&[("ANTHROPIC_API_KEY", KEY)], &claude_dir());
 
     assert_eq!(world.ended(run), Some(EndReason::Shippable));
     assert_eq!(world.recorded("claude", "anthropic"), KEY);
@@ -413,21 +436,115 @@ fn a_cli_that_isnt_logged_in_errors_with_its_own_words() {
     assert_eq!(world.view(run).cost(), None, "it spent nothing");
 }
 
+/// What `codex exec --json` prints for a review with `findings`.
+fn codex_reply(findings: serde_json::Value) -> Vec<serde_json::Value> {
+    vec![
+        json!({ "type": "thread.started", "thread_id": "t1" }),
+        json!({ "type": "item.completed", "item": {
+            "id": "i0", "type": "agent_message",
+            "text": json!({ "summary": "Fine.", "findings": findings }).to_string(),
+        } }),
+        json!({ "type": "turn.completed", "usage": {
+            "input_tokens": 2_000_000, "cached_input_tokens": 1_000_000,
+            "output_tokens": 1_000_000, "reasoning_output_tokens": 10,
+        } }),
+    ]
+}
+
+#[test]
+fn a_claude_review_runs_the_executable_the_cli_settings_name() {
+    let world = World::unpinned("claude", "mclaude", json!({}));
+    world.reply("mclaude", &claude_reply(json!([]), 0.05));
+    let control = world.control.path().display().to_string();
+
+    let run = world.first_run_with(
+        &[],
+        &[(
+            Cli::Claude,
+            CliSettings {
+                executable: Some("mclaude".into()),
+                path: vec![control.clone()],
+                config_dir: None,
+            },
+        )],
+    );
+
+    assert_eq!(world.ended(run), Some(EndReason::Shippable));
+    let args = world.recorded("mclaude", "args");
+    assert!(args.lines().any(|arg| arg == "stream-json"), "{args}");
+    assert!(
+        world.recorded("mclaude", "cwd").contains("worktrees"),
+        "it ran in the Step's worktree"
+    );
+}
+
+#[test]
+fn a_steps_own_cli_wins_over_the_cli_settings() {
+    let world = World::new("claude", json!({}));
+    world.reply("claude", &claude_reply(json!([]), 0.05));
+
+    let run = world.first_run_with(
+        &[],
+        &[(
+            Cli::Claude,
+            CliSettings {
+                executable: Some("/nowhere/mclaude".into()),
+                ..CliSettings::default()
+            },
+        )],
+    );
+
+    assert_eq!(world.ended(run), Some(EndReason::Shippable));
+    assert!(world.recorded_path("claude", "args").exists());
+}
+
+#[test]
+fn a_cli_set_to_a_missing_executable_errors_saying_which() {
+    let world = World::unpinned("claude", "mclaude", json!({}));
+
+    let run = world.first_run_with(
+        &[],
+        &[(
+            Cli::Claude,
+            CliSettings {
+                executable: Some("mclaude-missing".into()),
+                ..CliSettings::default()
+            },
+        )],
+    );
+
+    let (verdict, reason, _) = world.settled(run);
+    assert_eq!(verdict, Verdict::Error);
+    let reason = reason.unwrap();
+    assert!(reason.contains("can't run `mclaude-missing`"), "{reason}");
+}
+
+#[test]
+fn a_subscription_codex_step_logs_in_from_the_config_dir_in_its_cli_settings() {
+    let world = World::new("codex", json!({ "model": "gpt-5.4" }));
+    world.reply("codex", &codex_reply(json!([])));
+
+    let run = world.first_run_with(
+        &[],
+        &[(
+            Cli::Codex,
+            CliSettings {
+                config_dir: Some("/Users/me/.codex-work".into()),
+                ..CliSettings::default()
+            },
+        )],
+    );
+
+    assert_eq!(world.ended(run), Some(EndReason::Shippable));
+    assert_eq!(
+        world.recorded("codex", "codex_home"),
+        "/Users/me/.codex-work"
+    );
+}
+
 #[test]
 fn a_codex_review_is_priced_from_its_tokens_and_unknown_without_a_model() {
-    let reply = |findings: serde_json::Value| {
-        vec![
-            json!({ "type": "thread.started", "thread_id": "t1" }),
-            json!({ "type": "item.completed", "item": {
-                "id": "i0", "type": "agent_message",
-                "text": json!({ "summary": "Fine.", "findings": findings }).to_string(),
-            } }),
-            json!({ "type": "turn.completed", "usage": {
-                "input_tokens": 2_000_000, "cached_input_tokens": 1_000_000,
-                "output_tokens": 1_000_000, "reasoning_output_tokens": 10,
-            } }),
-        ]
-    };
+    let reply = codex_reply;
     let world = World::new("codex", json!({ "model": "gpt-5.4", "auth": "api_key" }));
     world.reply(
         "codex",
@@ -482,6 +599,7 @@ async fn the_review_api_keys_list_as_optional_so_an_unset_one_isnt_missing() {
         github,
         watching,
         RunsConfig {
+            clis: Default::default(),
             data_dir: world.data.path().to_owned(),
             plugins: Plugins::new(env!("CARGO_BIN_EXE_slopwatchd"), library),
             login_path: None,

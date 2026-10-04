@@ -153,6 +153,7 @@ impl Harness {
             dyn_github,
             Arc::clone(&watching),
             RunsConfig {
+                clis: Default::default(),
                 data_dir: data.path().to_owned(),
                 plugins,
                 login_path: login_path.map(str::to_owned),

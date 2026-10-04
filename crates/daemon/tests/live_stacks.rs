@@ -144,6 +144,7 @@ async fn the_daemon_lands_a_stack_bottom_up() {
         Arc::clone(&github),
         Arc::clone(&watching),
         RunsConfig {
+            clis: Default::default(),
             data_dir: data.path().to_owned(),
             plugins,
             login_path: None,

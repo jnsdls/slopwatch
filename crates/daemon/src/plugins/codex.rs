@@ -17,14 +17,18 @@
 //! default can't be priced, and its cost reads as unknown.
 //!
 //! Subscription Steps run one at a time, since concurrent runs can race
-//! on a token refresh in `auth.json` (Secrets for Steps, #30).
+//! on a token refresh in `auth.json` (Secrets for Steps, #30). A login
+//! kept outside `~/.codex` comes through the `codex` CLI's config
+//! directory setting in the daemon, handed to Codex as `CODEX_HOME`.
 
 use std::path::Path;
 use std::process::{Command, ExitStatus};
 
 use serde_json::Value;
 use slopwatch_core::Workspace;
-use slopwatch_protocol::step::{Manifest, PR_DIFF, STEP_DIALECT, SecretSpec, Start, Usage};
+use slopwatch_protocol::step::{
+    CONFIG_DIR_ENV, Manifest, PR_DIFF, STEP_DIALECT, SecretSpec, Start, Usage,
+};
 
 use super::review::{self, Agent, Auth, Config, Event, Finished, Job};
 
@@ -101,6 +105,12 @@ impl Agent for Codex {
             && let Ok(key) = std::env::var(API_KEY)
         {
             command.env("CODEX_API_KEY", key);
+        }
+        command.env_remove(CONFIG_DIR_ENV);
+        if config.auth == Auth::Subscription
+            && let Some(dir) = std::env::var_os(CONFIG_DIR_ENV)
+        {
+            command.env("CODEX_HOME", dir);
         }
         // The prompt comes on stdin.
         command.arg("-");

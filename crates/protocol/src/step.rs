@@ -470,6 +470,11 @@ pub struct CiLog {
 /// Plugin in, when they set one. The Plugin hands it to the CLI it runs.
 pub const CONFIG_DIR_ENV: &str = "SLOPWATCH_CONFIG_DIR";
 
+/// The env var an agent Step gets the CLI it runs in: the executable the
+/// developer set for it in the daemon, resolved to a file when the daemon
+/// could. A Step's own `cli` overrides it.
+pub const CLI_ENV: &str = "SLOPWATCH_CLI";
+
 /// An issue the PR closes when it merges.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkedIssue {

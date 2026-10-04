@@ -140,6 +140,7 @@ async fn publishing_a_draft_opens_the_pipeline_pr_and_then_updates_it() {
         Arc::clone(&api),
         watching,
         RunsConfig {
+            clis: Default::default(),
             data_dir: data.path().to_owned(),
             plugins: Plugins::new(exe, Arc::clone(&library)),
             login_path: None,

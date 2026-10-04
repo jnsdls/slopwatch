@@ -715,6 +715,23 @@ impl Daemon {
                     Err(error) => Err(error),
                 });
             }
+            Command::ListClis => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => Ok(Reply::Clis {
+                        clis: runs.list_clis().await,
+                    }),
+                    Err(error) => Err(error),
+                });
+            }
+            Command::SetCliSettings { cli, settings } => {
+                return respond(match self.runs_or_refuse() {
+                    Ok(runs) => runs
+                        .set_cli_settings(cli, settings)
+                        .await
+                        .map(|()| Reply::Done),
+                    Err(error) => Err(error),
+                });
+            }
         };
         if changes_prs {
             // What changed, even with a failed poll, may start or end a Run.

@@ -87,13 +87,25 @@ impl PluginsView {
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
-        let Some(plugin) = self.list.chosen().map(|plugin| plugin.name.clone()) else {
+        let Some((plugin, agent)) = self
+            .list
+            .chosen()
+            .map(|plugin| (plugin.name.clone(), plugin.runs_agent_cli()))
+        else {
             return;
         };
+        // An agent Plugin shows only its cap.
+        let shown = |input: &Entity<InputState>| {
+            if agent {
+                String::new()
+            } else {
+                input.read(cx).value().to_string()
+            }
+        };
         let fields = Fields {
-            path: self.path.read(cx).value().to_string(),
+            path: shown(&self.path),
             cap: self.cap.read(cx).value().to_string(),
-            config_dir: self.config_dir.read(cx).value().to_string(),
+            config_dir: shown(&self.config_dir),
         };
         match save_settings(&plugin, &fields) {
             Ok(command) => {
@@ -241,6 +253,13 @@ impl PluginsView {
                     )),
             );
         }
+        // An agent Plugin's PATH dirs and config directory are its CLI's,
+        // under Settings, so only its cap is set here.
+        let agent = plugin.runs_agent_cli();
+        let save = Button::new("plugin-save-settings")
+            .label("Save")
+            .small()
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save(cx)));
         detail
             .child(
                 div()
@@ -252,21 +271,28 @@ impl PluginsView {
                 div()
                     .flex()
                     .gap_2()
-                    .child(div().flex_1().child(Input::new(&self.path).small()))
+                    .when(!agent, |this| {
+                        this.child(div().flex_1().child(Input::new(&self.path).small()))
+                    })
                     .child(div().w(px(90.)).child(Input::new(&self.cap).small()))
-                    .child(
-                        Button::new("plugin-save-settings")
-                            .label("Save")
-                            .small()
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save(cx))),
-                    ),
+                    .child(save),
             )
-            .child(Input::new(&self.config_dir).small())
-            .child(div().text_xs().text_color(theme.muted_foreground).child(
-                "PATH dirs go in front of the PATH its describe and Steps get. The cap \
-                 limits how many of its Steps run at once. The config directory goes to \
-                 the CLI it runs: claude logs in from it on a subscription.",
-            ))
+            .when(!agent, |this| {
+                this.child(Input::new(&self.config_dir).small()).child(
+                    div().text_xs().text_color(theme.muted_foreground).child(
+                        "PATH dirs go in front of the PATH its describe and Steps get. The \
+                         cap limits how many of its Steps run at once. The config directory \
+                         goes to the CLI it runs.",
+                    ),
+                )
+            })
+            .when(agent, |this| {
+                this.child(div().text_xs().text_color(theme.muted_foreground).child(
+                    "The cap limits how many of its Steps run at once. Which claude or \
+                     codex it runs, with their PATH dirs and config directory, is set under \
+                     Settings, CLIs.",
+                ))
+            })
             .when_some(self.problem.clone(), |this, problem| {
                 this.child(div().text_xs().text_color(theme.danger).child(problem))
             })
