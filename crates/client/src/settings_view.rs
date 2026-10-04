@@ -3,8 +3,6 @@
 //! daemon runs, each with its executable, what the daemon resolved it to,
 //! and for the agent CLIs, their `PATH` dirs, config directory and login.
 
-use std::sync::mpsc::Sender;
-
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Sizable};
@@ -12,9 +10,20 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Cents, Cli, CliListing, Command, DaemonSettings};
 
+use crate::outbox::Outbox;
+use crate::outbox_view::{Pending, loading, refusal};
 use crate::settings::{
     CliFields, SettingsModel, cli_fields, login_line, save_cli, save_daily, status_line,
 };
+
+/// What the view's commands go out for ([`Outbox`]).
+const GET: &str = "settings-get";
+const SAVE: &str = "settings-save";
+const CLIS: &str = "settings-clis";
+
+fn save_cli_action(cli: Cli) -> String {
+    format!("cli-save-{cli}")
+}
 
 pub struct SettingsView {
     model: SettingsModel,
@@ -30,7 +39,7 @@ pub struct SettingsView {
     /// The next CLI listing fills the CLI fields, as `fill` does the daily
     /// Budget's.
     fill_clis: bool,
-    commands: Sender<Command>,
+    outbox: Outbox,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -48,7 +57,7 @@ struct CliRow {
 }
 
 impl SettingsView {
-    pub fn new(commands: Sender<Command>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(outbox: Outbox, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let daily = cx.new(|cx| InputState::new(window, cx).placeholder("Off"));
         let mut _subscriptions =
             vec![
@@ -95,7 +104,7 @@ impl SettingsView {
             filling: None,
             clis,
             fill_clis: true,
-            commands,
+            outbox,
             _subscriptions,
         }
     }
@@ -103,7 +112,7 @@ impl SettingsView {
     /// Asks the daemon for its settings. The answer comes to
     /// [`Self::listed`].
     pub fn refresh(&self) {
-        let _ = self.commands.send(Command::GetSettings);
+        self.outbox.load(GET, Command::GetSettings);
     }
 
     /// Asks for the settings and the CLIs, and fills the fields with them,
@@ -112,7 +121,7 @@ impl SettingsView {
         self.fill = true;
         self.fill_clis = true;
         self.refresh();
-        let _ = self.commands.send(Command::ListClis);
+        self.outbox.load(CLIS, Command::ListClis);
     }
 
     /// The daemon's settings arrived.
@@ -142,9 +151,10 @@ impl SettingsView {
         match save_daily(&field) {
             Ok(command) => {
                 self.problem = None;
-                let _ = self.commands.send(command);
-                self.fill = true;
-                self.refresh();
+                if self.outbox.press(SAVE, command) {
+                    self.fill = true;
+                    self.refresh();
+                }
             }
             Err(problem) => self.problem = Some(problem),
         }
@@ -169,8 +179,9 @@ impl SettingsView {
         match save_cli(row.cli, &fields) {
             Ok(command) => {
                 row.problem = None;
-                let _ = self.commands.send(command);
-                let _ = self.commands.send(Command::ListClis);
+                if self.outbox.press(&save_cli_action(row.cli), command) {
+                    self.outbox.load(CLIS, Command::ListClis);
+                }
             }
             Err(problem) => row.problem = Some(problem),
         }
@@ -188,7 +199,10 @@ impl SettingsView {
                 .child(text)
         };
         let status = match listing.map(|listing| status_line(&listing.status)) {
-            None => muted("Checking…".to_owned()),
+            None => match refusal(&self.outbox, CLIS, &theme) {
+                Some(refused) if !self.outbox.waiting(CLIS) => refused,
+                _ => muted("Checking…".to_owned()),
+            },
             Some(Ok(line)) => muted(line),
             Some(Err(problem)) => div().text_xs().text_color(theme.danger).child(problem),
         };
@@ -224,9 +238,10 @@ impl SettingsView {
                     )
                     .child(div().flex_1().child(Input::new(&row.executable).small()))
                     .child(
-                        Button::new(SharedString::from(format!("cli-save-{}", row.cli)))
+                        Button::new(SharedString::from(save_cli_action(row.cli)))
                             .label("Save")
                             .small()
+                            .pending(self.outbox.waiting(&save_cli_action(row.cli)))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 this.save_cli(index, cx)
                             })),
@@ -259,6 +274,10 @@ impl SettingsView {
                         .child(problem),
                 )
             })
+            .children(
+                refusal(&self.outbox, &save_cli_action(row.cli), &theme)
+                    .map(|line| line.pl(px(72.))),
+            )
     }
 }
 
@@ -312,14 +331,20 @@ impl Render for SettingsView {
                     .gap_2()
                     .child(div().w(px(160.)).child(Input::new(&self.daily).small()))
                     .child(
-                        Button::new("settings-save")
+                        Button::new(SAVE)
                             .label("Save")
                             .small()
+                            .pending(self.outbox.waiting(SAVE))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save(cx))),
                     ),
             )
-            .when(self.model.loaded(), |this| {
-                this.child(div().text_sm().child(self.model.spent_line()))
+            .children(refusal(&self.outbox, SAVE, &theme))
+            .map(|this| {
+                if self.model.loaded() {
+                    this.child(div().text_sm().child(self.model.spent_line()))
+                } else {
+                    this.child(loading(&self.outbox, GET, "the settings", &theme))
+                }
             })
             .child(div().text_xs().text_color(theme.muted_foreground).child(
                 "What Steps may spend across every repo from local midnight on, at list price \

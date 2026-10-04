@@ -8,6 +8,7 @@ use slopwatch_client::agent::Agent;
 use slopwatch_client::link::{self, Pace};
 use slopwatch_client::main_view::MainView;
 use slopwatch_client::notifications;
+use slopwatch_client::outbox::Outbox;
 use slopwatch_protocol::{Flavor, socket_path};
 
 gpui_kit::actions!(slopwatch, [Quit]);
@@ -37,7 +38,9 @@ fn main() {
     // GUI runs (ADR 0013): no window and no focus until the developer asks.
     let background = std::env::args().any(|arg| arg == "--background");
     let main_window: Rc<Cell<Option<AnyWindowHandle>>> = Rc::default();
-    let app = gpui_kit::application();
+    // The component icons, such as the spinner on a button whose command is
+    // out.
+    let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     // Clicking the Dock icon with the window hidden shows it.
     let reopened = Rc::clone(&main_window);
     app.on_reopen(move |cx| show(reopened.get(), cx));
@@ -59,7 +62,7 @@ fn main() {
             ..Default::default()
         };
         let (window, view) = gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| MainView::new(commands, agent, reregister, window, cx))
+            cx.new(|cx| MainView::new(Outbox::new(commands), agent, reregister, window, cx))
         })
         .expect("open the main window");
         main_window.set(Some(window));

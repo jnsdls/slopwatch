@@ -2,8 +2,6 @@
 //! which Plugins it's granted to, with a masked field to set or rotate one.
 //! The daemon never sends a value back, so the list can't show one.
 
-use std::sync::mpsc::Sender;
-
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Sizable};
@@ -11,18 +9,28 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Command, SecretInfo};
 
+use crate::outbox::Outbox;
+use crate::outbox_view::{Pending, loading, refusal};
 use crate::secrets::{SecretsList, granted_line, needed, state_line};
+
+/// What the view's commands go out for ([`Outbox`]).
+const LIST: &str = "secrets-list";
+const SET: &str = "secret-set";
+
+fn delete_action(name: &str) -> String {
+    format!("secret-delete-{name}")
+}
 
 pub struct SecretsView {
     list: SecretsList,
     name: Entity<InputState>,
     value: Entity<InputState>,
-    commands: Sender<Command>,
+    outbox: Outbox,
     _subscriptions: Vec<Subscription>,
 }
 
 impl SecretsView {
-    pub fn new(commands: Sender<Command>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(outbox: Outbox, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("NEW_SECRET_NAME"));
         let value = cx.new(|cx| {
             InputState::new(window, cx)
@@ -41,7 +49,7 @@ impl SecretsView {
             list: SecretsList::default(),
             name,
             value,
-            commands,
+            outbox,
             _subscriptions,
         }
     }
@@ -54,7 +62,7 @@ impl SecretsView {
 
     /// Asks the daemon for the list. The answer comes to [`Self::listed`].
     pub fn refresh(&self) {
-        let _ = self.commands.send(Command::ListSecrets);
+        self.outbox.load(LIST, Command::ListSecrets);
     }
 
     pub fn listed(&mut self, secrets: Vec<SecretInfo>, cx: &mut Context<Self>) {
@@ -79,7 +87,9 @@ impl SecretsView {
         let Some(command) = self.list.set(&name, &value) else {
             return;
         };
-        let _ = self.commands.send(command);
+        if !self.outbox.press(SET, command) {
+            return;
+        }
         self.value
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.name
@@ -88,10 +98,12 @@ impl SecretsView {
     }
 
     fn delete(&self, name: &str) {
-        let _ = self.commands.send(Command::DeleteSecret {
+        let command = Command::DeleteSecret {
             secret: name.to_owned(),
-        });
-        self.refresh();
+        };
+        if self.outbox.press(&delete_action(name), command) {
+            self.refresh();
+        }
     }
 
     fn rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -101,7 +113,10 @@ impl SecretsView {
             .map_or(0, |since| since.as_secs() as i64);
         let chosen = self.list.chosen().map(str::to_owned);
         let mut rows = div().flex().flex_col().gap_1();
-        if self.list.loaded() && self.list.secrets().is_empty() {
+        if !self.list.loaded() {
+            return rows.child(loading(&self.outbox, LIST, "the Secrets", theme));
+        }
+        if self.list.secrets().is_empty() {
             rows = rows.child(
                 div()
                     .text_sm()
@@ -137,7 +152,8 @@ impl SecretsView {
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(granted_line(secret)),
-                            ),
+                            )
+                            .children(refusal(&self.outbox, &delete_action(&name), theme)),
                     )
                     .child(
                         div()
@@ -151,10 +167,11 @@ impl SecretsView {
                     )
                     .when(secret.is_set(), |this| {
                         this.child(
-                            Button::new(SharedString::from(format!("secret-delete-{name}")))
+                            Button::new(SharedString::from(delete_action(&name)))
                                 .label("Delete")
                                 .small()
                                 .ghost()
+                                .pending(self.outbox.waiting(&delete_action(&name)))
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, _| {
                                     this.delete(&delete);
                                 })),
@@ -194,15 +211,17 @@ impl SecretsView {
                     .child(div().w(px(220.)).child(Input::new(&self.name).small()))
                     .child(div().flex_1().child(Input::new(&self.value).small()))
                     .child(
-                        Button::new("secret-set")
+                        Button::new(SET)
                             .label("Set")
                             .small()
                             .primary()
+                            .pending(self.outbox.waiting(SET))
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.set(window, cx);
                             })),
                     ),
             )
+            .children(refusal(&self.outbox, SET, theme))
             .child(div().text_xs().text_color(theme.muted_foreground).child(
                 "The value goes to the Keychain and is never shown again. Steps \
                          started from now on get it; running ones keep the old one.",

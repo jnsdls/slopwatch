@@ -2,8 +2,6 @@
 //! stands, and for the one picked, what its manifest asks for, what its
 //! Approval covers, the Approve button and its daemon settings (ADR 0012).
 
-use std::sync::mpsc::Sender;
-
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme, Sizable};
@@ -11,10 +9,17 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Command, PluginListing};
 
+use crate::outbox::Outbox;
+use crate::outbox_view::{Pending, loading, refusal};
 use crate::plugins::{
     Fields, PluginsList, approve, asks_more, grant_lines, save_settings, settings_fields,
     state_line,
 };
+
+/// What the view's commands go out for ([`Outbox`]).
+const LIST: &str = "plugins-list";
+const APPROVE: &str = "plugin-approve";
+const SAVE: &str = "plugin-save-settings";
 
 pub struct PluginsView {
     list: PluginsList,
@@ -23,11 +28,11 @@ pub struct PluginsView {
     config_dir: Entity<InputState>,
     /// Why the settings fields can't be saved, until they're fixed.
     problem: Option<String>,
-    commands: Sender<Command>,
+    outbox: Outbox,
 }
 
 impl PluginsView {
-    pub fn new(commands: Sender<Command>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(outbox: Outbox, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let path =
             cx.new(|cx| InputState::new(window, cx).placeholder("/opt/tool/bin:/usr/local/bin"));
         let cap = cx.new(|cx| InputState::new(window, cx).placeholder("manifest's"));
@@ -40,7 +45,7 @@ impl PluginsView {
             cap,
             config_dir,
             problem: None,
-            commands,
+            outbox,
         }
     }
 
@@ -51,7 +56,7 @@ impl PluginsView {
 
     /// Asks the daemon for the list. The answer comes to [`Self::listed`].
     pub fn refresh(&self) {
-        let _ = self.commands.send(Command::ListPlugins);
+        self.outbox.load(LIST, Command::ListPlugins);
     }
 
     pub fn listed(&mut self, plugins: Vec<PluginListing>, cx: &mut Context<Self>) {
@@ -80,8 +85,9 @@ impl PluginsView {
     }
 
     fn approve(&self) {
-        if let Some(command) = self.list.chosen().and_then(approve) {
-            let _ = self.commands.send(command);
+        if let Some(command) = self.list.chosen().and_then(approve)
+            && self.outbox.press(APPROVE, command)
+        {
             self.refresh();
         }
     }
@@ -110,8 +116,9 @@ impl PluginsView {
         match save_settings(&plugin, &fields) {
             Ok(command) => {
                 self.problem = None;
-                let _ = self.commands.send(command);
-                self.refresh();
+                if self.outbox.press(SAVE, command) {
+                    self.refresh();
+                }
             }
             Err(problem) => self.problem = Some(problem),
         }
@@ -125,6 +132,9 @@ impl PluginsView {
             .chosen()
             .map(|plugin| (plugin.name.clone(), plugin.builtin));
         let mut rows = div().flex().flex_col().gap_1();
+        if !self.list.loaded() {
+            return rows.child(loading(&self.outbox, LIST, "the Plugins", theme));
+        }
         for (index, plugin) in self.list.plugins().iter().enumerate() {
             let name = plugin.name.clone();
             let selected = chosen == Some((name.clone(), plugin.builtin));
@@ -241,10 +251,11 @@ impl PluginsView {
                     .items_center()
                     .gap_2()
                     .child(
-                        Button::new("plugin-approve")
+                        Button::new(APPROVE)
                             .label("Approve")
                             .small()
                             .primary()
+                            .pending(self.outbox.waiting(APPROVE))
                             .on_click(cx.listener(|this, _: &ClickEvent, _, _| this.approve())),
                     )
                     .child(div().text_xs().text_color(theme.muted_foreground).child(
@@ -253,12 +264,14 @@ impl PluginsView {
                     )),
             );
         }
+        detail = detail.children(refusal(&self.outbox, APPROVE, &theme));
         // An agent Plugin's PATH dirs and config directory are its CLI's,
         // under Settings, so only its cap is set here.
         let agent = plugin.runs_agent_cli();
-        let save = Button::new("plugin-save-settings")
+        let save = Button::new(SAVE)
             .label("Save")
             .small()
+            .pending(self.outbox.waiting(SAVE))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save(cx)));
         detail
             .child(
@@ -296,6 +309,7 @@ impl PluginsView {
             .when_some(self.problem.clone(), |this, problem| {
                 this.child(div().text_xs().text_color(theme.danger).child(problem))
             })
+            .children(refusal(&self.outbox, SAVE, &theme))
     }
 }
 
