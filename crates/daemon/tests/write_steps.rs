@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use slopwatch_core::{EndReason, Verdict};
+use slopwatch_daemon::clis::Clis;
 use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::fake::{FakeGitHub, Hold};
 use slopwatch_daemon::plugins::Plugins;
@@ -26,7 +27,7 @@ use slopwatch_daemon::secrets::MemoryKeychain;
 use slopwatch_daemon::store::Store;
 use slopwatch_daemon::{Daemon, Library, Retention, Runs, RunsConfig, Watching};
 use slopwatch_protocol::step::{Manifest, Start};
-use slopwatch_protocol::{InboxEntry, RepoName, RunEvent, RunId};
+use slopwatch_protocol::{Cli, CliSettings, InboxEntry, RepoName, RunEvent, RunId};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -39,6 +40,8 @@ struct World {
     github: Arc<FakeGitHub>,
     data: tempfile::TempDir,
     control: tempfile::TempDir,
+    /// The CLI settings every life of the daemon runs with.
+    clis: Arc<Clis>,
 }
 
 impl World {
@@ -65,6 +68,7 @@ impl World {
             github,
             data: tempfile::tempdir().unwrap(),
             control,
+            clis: Arc::default(),
         };
         world.write_plugins();
         world.set_writer(writer);
@@ -148,6 +152,7 @@ printf '%s\n' '{{"type":"outcome","verdict":"pass","outputs":{{"note":"Add fixed
                 github,
                 Arc::clone(&watching),
                 RunsConfig {
+                    clis: Arc::clone(&self.clis),
                     data_dir: self.data.path().to_owned(),
                     plugins,
                     login_path: None,
@@ -539,7 +544,7 @@ fn a_commit_that_never_reached_github_is_made_again_after_a_crash() {
 /// `<control>/claude.*`, writes `fixed.txt` where it runs, and answers as
 /// `claude -p --output-format stream-json` does for a fix.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
-out="$(dirname "$0")/claude"
+out="$(dirname "$0")/$(basename "$0")"
 printf '%s\n' "$@" > "$out.args"
 cat > "$out.prompt"
 echo 'Fixed.' > fixed.txt
@@ -552,17 +557,24 @@ fn the_fix_plugin_acts_on_findings_and_ci_logs_and_its_edits_are_committed() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let world = World::new(None, "true\n");
-    let cli = world.control.path().join("claude");
+    // The agent is the `claude` the CLI settings name; the Pipeline names
+    // none.
+    let cli = world.control.path().join("mclaude");
     std::fs::write(&cli, FAKE_CLAUDE).unwrap();
     std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    world.clis.set(
+        Cli::Claude,
+        CliSettings {
+            executable: Some("mclaude".into()),
+            path: vec![world.control.path().display().to_string()],
+            config_dir: None,
+        },
+    );
     world.github.set_pipeline(
         &repo(),
         "main",
-        &format!(
-            "version: 1\nsteps:\n  judge: {{ uses: judge }}\n  fix: {{ uses: fix, needs: [gate], \
-             with: {{ agent: claude, model: haiku, cli: {} }} }}\ngate: [judge]\n",
-            cli.display()
-        ),
+        "version: 1\nsteps:\n  judge: { uses: judge }\n  fix: { uses: fix, needs: [gate], with: \
+         { agent: claude, model: haiku } }\ngate: [judge]\n",
     );
     world.github.set_checks(
         &repo(),
@@ -598,7 +610,7 @@ fn the_fix_plugin_acts_on_findings_and_ci_logs_and_its_edits_are_committed() {
         "{message}"
     );
 
-    let prompt = std::fs::read_to_string(world.control.path().join("claude.prompt")).unwrap();
+    let prompt = std::fs::read_to_string(world.control.path().join("mclaude.prompt")).unwrap();
     assert!(prompt.contains("Step `judge` ended fail."), "{prompt}");
     assert!(
         prompt.contains("- error fixed.txt: fixed.txt is missing"),
@@ -609,7 +621,7 @@ fn the_fix_plugin_acts_on_findings_and_ci_logs_and_its_edits_are_committed() {
         prompt.contains("thread 'main' panicked: empty list"),
         "{prompt}"
     );
-    let args = std::fs::read_to_string(world.control.path().join("claude.args")).unwrap();
+    let args = std::fs::read_to_string(world.control.path().join("mclaude.args")).unwrap();
     let args: Vec<&str> = args.lines().collect();
     assert!(
         args.windows(2)

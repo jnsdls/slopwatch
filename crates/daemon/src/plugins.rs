@@ -35,9 +35,10 @@ use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
+use serde_json::{Map, Value};
 use slopwatch_core::{PluginInfo, Resolver};
 use slopwatch_protocol::step::Manifest;
-use slopwatch_protocol::{Flavor, Grant, PluginListing, PluginSettings};
+use slopwatch_protocol::{Cli, Flavor, Grant, PluginListing, PluginSettings};
 
 use crate::Library;
 use crate::approvals::Approval;
@@ -439,6 +440,20 @@ impl Plugins {
     }
 }
 
+/// The agent CLI a built-in Plugin's Step runs, by its `with:`: Claude or
+/// Codex for their own Plugins, and the one `fix` names in `agent`.
+pub fn agent_cli(plugin: &str, with: &Map<String, Value>) -> Option<Cli> {
+    match plugin {
+        "claude" => Some(Cli::Claude),
+        "codex" => Some(Cli::Codex),
+        fix::ID => Some(match with.get("agent").and_then(Value::as_str) {
+            Some("codex") => Cli::Codex,
+            _ => Cli::Claude,
+        }),
+        _ => None,
+    }
+}
+
 /// Why a Plugin can't be approved.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NotApprovable {
@@ -774,5 +789,22 @@ mod tests {
             format!("{tools}:/usr/bin")
         );
         assert_eq!(plugins.path("ci", "/usr/bin"), "/usr/bin");
+    }
+
+    #[test]
+    fn a_fix_step_runs_the_cli_of_the_agent_it_names() {
+        use slopwatch_protocol::AGENT_PLUGINS;
+        let with = |value: serde_json::Value| value.as_object().unwrap().clone();
+        let none = Map::new();
+        assert_eq!(agent_cli("claude", &none), Some(Cli::Claude));
+        assert_eq!(agent_cli("codex", &none), Some(Cli::Codex));
+        assert_eq!(agent_cli("fix", &none), Some(Cli::Claude));
+        let codex = with(serde_json::json!({ "agent": "codex" }));
+        assert_eq!(agent_cli("fix", &codex), Some(Cli::Codex));
+        assert_eq!(agent_cli("ci", &none), None);
+        assert_eq!(agent_cli("lint", &none), None);
+        for plugin in AGENT_PLUGINS {
+            assert!(agent_cli(plugin, &none).is_some(), "{plugin}");
+        }
     }
 }

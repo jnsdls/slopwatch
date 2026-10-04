@@ -2,6 +2,9 @@
 # on the Findings behind failing, unwaived Gate terms. The daemon commits
 # its diff, and the Pipeline's `fix_rounds` caps the loop. Uses your own
 # Claude login unless `auth` names an API key Secret.
+# It runs the `claude` or `codex` executable set under Settings, CLIs. A
+# `cli` key here overrides that for this Step, but the Pipeline is
+# committed, so a path in it only exists on your machine.
 uses: fix
 with:
   agent: claude

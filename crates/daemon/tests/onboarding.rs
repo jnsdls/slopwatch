@@ -55,6 +55,7 @@ fn harness() -> Harness {
         dyn_github,
         Arc::clone(&watching),
         RunsConfig {
+            clis: Default::default(),
             data_dir: data.path().to_owned(),
             plugins: Plugins::new(exe, Arc::clone(&library)),
             login_path: None,

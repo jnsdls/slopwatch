@@ -12,8 +12,8 @@ use slopwatch_protocol::step::{
     Effect, EffectKind, EffectResult, LinkedIssue, Outputs, UpdateMethod,
 };
 use slopwatch_protocol::{
-    BudgetKind, EntryId, InboxEntry, Notification, NotificationId, PluginSettings, RepoName, RunId,
-    RunSummary, Waiver,
+    BudgetKind, Cli, CliSettings, EntryId, InboxEntry, Notification, NotificationId,
+    PluginSettings, RepoName, RunId, RunSummary, Waiver,
 };
 
 use crate::approvals::Approval;
@@ -336,6 +336,24 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX commits_open ON commits (finished, id);
     CREATE INDEX commits_by_run ON commits (run_id, sha);
+",
+    // CLI settings (#116): one `settings` row per CLI, `cli.<name>`. The
+    // `PATH` dirs and config directory the `claude` and `codex` Plugins
+    // held move to their CLI's row. The `fix` Plugin's go to Claude's
+    // unless it had its own, since `fix` ran Claude by default.
+    "
+    INSERT OR IGNORE INTO settings (name, value)
+    SELECT 'cli.' || CASE plugin WHEN 'fix' THEN 'claude' ELSE plugin END,
+           json_remove(settings_json, '$.cap')
+    FROM plugin_settings
+    WHERE plugin IN ('claude', 'codex', 'fix')
+      AND (json_extract(settings_json, '$.path') IS NOT NULL
+           OR json_extract(settings_json, '$.config_dir') IS NOT NULL)
+    ORDER BY plugin = 'fix';
+    UPDATE plugin_settings
+    SET settings_json = json_remove(settings_json, '$.path', '$.config_dir')
+    WHERE plugin IN ('claude', 'codex', 'fix');
+    DELETE FROM plugin_settings WHERE settings_json = '{}';
 ",
 ];
 
@@ -1647,6 +1665,43 @@ impl Store {
         rows.collect()
     }
 
+    /// Keeps the developer's settings for `cli`. Default settings are kept
+    /// as no row.
+    pub fn put_cli_settings(&self, cli: Cli, settings: &CliSettings) -> Result<(), StoreError> {
+        let name = format!("cli.{cli}");
+        if *settings == CliSettings::default() {
+            self.db()
+                .execute("DELETE FROM settings WHERE name = ?1", params![name])?;
+            return Ok(());
+        }
+        let json = serde_json::to_string(settings).expect("settings always serialize");
+        self.db().execute(
+            "INSERT INTO settings (name, value) VALUES (?1, ?2)
+             ON CONFLICT (name) DO UPDATE SET value = excluded.value",
+            params![name, json],
+        )?;
+        Ok(())
+    }
+
+    /// Every CLI's settings that aren't the default.
+    pub fn cli_settings(&self) -> Result<HashMap<Cli, CliSettings>, StoreError> {
+        let mut settings = HashMap::new();
+        for cli in Cli::ALL {
+            let saved: Option<String> = self
+                .db()
+                .query_row(
+                    "SELECT value FROM settings WHERE name = ?1",
+                    params![format!("cli.{cli}")],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(json) = saved {
+                settings.insert(cli, json_column(0, &json)?);
+            }
+        }
+        Ok(settings)
+    }
+
     /// Records a SHA slopwatch pushed.
     pub fn record_push(&self, repo: &RepoName, sha: &str) -> Result<(), StoreError> {
         self.db().execute(
@@ -2635,6 +2690,85 @@ mod tests {
             .put_plugin_settings("lint", &PluginSettings::default())
             .unwrap();
         assert!(store.plugin_settings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cli_settings_survive_a_restart_and_the_default_leaves_no_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let settings = CliSettings {
+            executable: Some("mclaude".into()),
+            path: vec!["/opt/bin".into()],
+            config_dir: Some("/Users/me/.claude-work".into()),
+        };
+        Store::open(&path)
+            .unwrap()
+            .put_cli_settings(Cli::Claude, &settings)
+            .unwrap();
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.cli_settings().unwrap(),
+            HashMap::from([(Cli::Claude, settings)])
+        );
+        store
+            .put_cli_settings(Cli::Claude, &CliSettings::default())
+            .unwrap();
+        assert!(store.cli_settings().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_agent_plugins_path_and_config_dir_move_to_their_clis() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = MIGRATIONS.len() - 1;
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before as i64)
+            .unwrap();
+        for (plugin, json) in [
+            ("claude", r#"{"path":["/opt/bin"],"cap":2}"#),
+            ("codex", r#"{"config_dir":"/Users/me/.codex-work"}"#),
+            ("fix", r#"{"config_dir":"/Users/me/.fix"}"#),
+            ("lint", r#"{"path":["/lint/bin"],"config_dir":"/lint"}"#),
+        ] {
+            db.execute(
+                "INSERT INTO plugin_settings (plugin, settings_json) VALUES (?1, ?2)",
+                params![plugin, json],
+            )
+            .unwrap();
+        }
+
+        let store = Store::migrate(db).unwrap();
+
+        assert_eq!(
+            store.cli_settings().unwrap(),
+            HashMap::from([
+                (
+                    Cli::Claude,
+                    CliSettings {
+                        path: vec!["/opt/bin".into()],
+                        ..CliSettings::default()
+                    }
+                ),
+                (
+                    Cli::Codex,
+                    CliSettings {
+                        config_dir: Some("/Users/me/.codex-work".into()),
+                        ..CliSettings::default()
+                    }
+                ),
+            ])
+        );
+        let plugins = store.plugin_settings().unwrap();
+        assert_eq!(plugins["claude"].cap, Some(2));
+        assert_eq!(plugins["claude"].path, Vec::<String>::new());
+        assert!(!plugins.contains_key("codex") && !plugins.contains_key("fix"));
+        assert_eq!(
+            plugins["lint"].config_dir.as_deref(),
+            Some("/lint"),
+            "a third-party Plugin keeps its own"
+        );
     }
 
     #[test]

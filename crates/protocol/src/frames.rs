@@ -6,8 +6,8 @@ use slopwatch_core::{Edit, WaiverCategory};
 use crate::logs::{LogFilter, LogKey, LogPage, StepLogPage};
 use crate::pipeline::NodePosition;
 use crate::{
-    Answer, Cents, DaemonSettings, EntryId, Grant, Notification, PluginListing, PluginSettings,
-    RepoName, RunId, SecretInfo, SecretValue, Topic, TopicUpdate,
+    Answer, Cents, Cli, CliListing, CliSettings, DaemonSettings, EntryId, Grant, Notification,
+    PluginListing, PluginSettings, RepoName, RunId, SecretInfo, SecretValue, Topic, TopicUpdate,
 };
 
 /// A frame a client sends to the daemon.
@@ -371,6 +371,16 @@ pub enum Command {
     SetSettings {
         settings: DaemonSettings,
     },
+    /// Every CLI the daemon runs, with its settings and what the daemon
+    /// found when it tried it: the file it resolved to, its version and,
+    /// for the agent CLIs, its login.
+    ListClis,
+    /// Replaces the daemon's settings for `cli`. Steps that run it, and
+    /// the daemon's own calls, use them from then on.
+    SetCliSettings {
+        cli: Cli,
+        settings: CliSettings,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,6 +426,10 @@ pub enum Reply {
         /// What Steps reported spending since local midnight, at list
         /// price.
         spent_today: Cents,
+    },
+    Clis {
+        /// In [`Cli::ALL`]'s order.
+        clis: Vec<CliListing>,
     },
 }
 
@@ -727,6 +741,50 @@ mod tests {
                     "path": "/plugins/lint",
                     "problem": "`describe` hung",
                     "settings": { "cap": 2 },
+                }],
+            }),
+        );
+        assert_eq!(parse::<Reply>(wire(&listed)), listed);
+    }
+
+    #[test]
+    fn cli_commands_name_the_cli_and_leave_defaults_out() {
+        let set = Command::SetCliSettings {
+            cli: Cli::Claude,
+            settings: CliSettings {
+                executable: Some("mclaude".into()),
+                ..CliSettings::default()
+            },
+        };
+        assert_eq!(
+            wire(&set),
+            json!({
+                "name": "set_cli_settings",
+                "cli": "claude",
+                "settings": { "executable": "mclaude" },
+            }),
+        );
+        assert_eq!(parse::<Command>(wire(&set)), set);
+        assert_eq!(wire(&Command::ListClis), json!({ "name": "list_clis" }));
+
+        let listed = Reply::Clis {
+            clis: vec![CliListing {
+                cli: Cli::Gh,
+                settings: CliSettings::default(),
+                status: crate::CliStatus {
+                    problem: Some("`gh` isn't on PATH".into()),
+                    ..crate::CliStatus::default()
+                },
+            }],
+        };
+        assert_eq!(
+            wire(&listed),
+            json!({
+                "reply": "clis",
+                "clis": [{
+                    "cli": "gh",
+                    "settings": {},
+                    "status": { "problem": "`gh` isn't on PATH" },
                 }],
             }),
         );

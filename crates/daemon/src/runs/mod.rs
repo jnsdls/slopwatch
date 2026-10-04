@@ -64,23 +64,25 @@ use slopwatch_core::{
     Verdict, Workspace, load, parse_duration,
 };
 use slopwatch_protocol::step::{
-    CI_LOGS, CONFIG_DIR_ENV, CheckState, CiLog, EffectKind, FromStep, LinkedIssue, MERGE_STATE,
-    Manifest, MergeState, Outcome, Outputs, PR_DIFF, PrSnapshot, Start, ToStep,
+    CI_LOGS, CLI_ENV, CONFIG_DIR_ENV, CheckState, CiLog, EffectKind, FromStep, LinkedIssue,
+    MERGE_STATE, Manifest, MergeState, Outcome, Outputs, PR_DIFF, PrSnapshot, Start, ToStep,
 };
 use slopwatch_protocol::{
-    Actor, Answer, BudgetHit, BudgetKind, Cause, Cents, Closing, DaemonSettings, EntryId, GateTerm,
-    LogFilter, LogKey, LogPage, LogRecord, PluginListing, PluginSettings, PrRef, RepoName,
-    RunEvent, RunId, SecretInfo, SecretValue, StepInfo, StepLogPage, Waiver,
+    AGENT_PLUGINS, Actor, Answer, BudgetHit, BudgetKind, Cause, Cents, Cli, CliListing,
+    CliSettings, Closing, DaemonSettings, EntryId, GateTerm, LogFilter, LogKey, LogPage, LogRecord,
+    PluginListing, PluginSettings, PrRef, RepoName, RunEvent, RunId, SecretInfo, SecretValue,
+    StepInfo, StepLogPage, Waiver,
 };
 use tokio::sync::mpsc;
 
 use crate::approvals::{self, Approval, Grant, Unapproved, unapproved_plugin};
+use crate::clis::Clis;
 use crate::clones::{Clones, PipelineAt};
 use crate::drafts::StepNeeds;
 use crate::github::{GitHub, GitHubError, OpenPr};
 use crate::inbox::Inbox;
 use crate::notifications::Notifications;
-use crate::plugins::{NotApprovable, Plugins, human};
+use crate::plugins::{self, NotApprovable, Plugins, human};
 use crate::secrets::{Keychain, Mask, SecretError, Secrets, held_by_secret, missing_secret};
 use crate::shell_env;
 use crate::store::{
@@ -136,6 +138,9 @@ pub struct Runs {
     notifications: Arc<Notifications>,
     secrets: Arc<Secrets>,
     plugins: Arc<Plugins>,
+    clis: Arc<Clis>,
+    /// The `PATH` every Step gets, which CLIs are looked up on.
+    step_path: String,
     /// The Secrets each built-in Plugin runs without, by Plugin.
     optional_secrets: HashMap<String, HashSet<String>>,
     /// Runs with a commit call out in this daemon, which settles its own
@@ -159,6 +164,9 @@ pub struct RunsConfig {
     /// Where Secret values live: the login Keychain in the daemon, a
     /// [`MemoryKeychain`](crate::secrets::MemoryKeychain) in tests.
     pub keychain: Arc<dyn Keychain>,
+    /// The developer's settings for the CLIs Steps and clones run, as the
+    /// store kept them.
+    pub clis: Arc<Clis>,
 }
 
 #[derive(Debug)]
@@ -218,10 +226,13 @@ impl Runs {
     ) -> Result<Arc<Self>, StoreError> {
         let journal = Arc::new(Journal::new(store.clone()));
         let (reports, mut received) = mpsc::unbounded_channel();
-        let clones = Arc::new(Clones::new(config.data_dir.join("repos")));
         let step_path = shell_env::merge(
             std::env::var("PATH").ok().as_deref(),
             config.login_path.as_deref(),
+        );
+        let clones = Arc::new(
+            Clones::new(config.data_dir.join("repos"))
+                .with_git(Arc::clone(&config.clis), step_path.clone()),
         );
         let logs = log::Hub::default();
         let notifications = Arc::new(Notifications::load(store.clone())?);
@@ -264,7 +275,8 @@ impl Runs {
             notifications: Arc::clone(&notifications),
             data_dir: config.data_dir.clone(),
             plugins: Arc::clone(&plugins),
-            step_path,
+            clis: Arc::clone(&config.clis),
+            step_path: step_path.clone(),
             ready: VecDeque::new(),
             processes: HashMap::new(),
             logs: logs.clone(),
@@ -304,6 +316,8 @@ impl Runs {
             notifications,
             secrets,
             plugins,
+            clis: config.clis,
+            step_path,
             optional_secrets,
             committing,
         });
@@ -633,12 +647,37 @@ impl Runs {
         if !self.plugins.knows(plugin) {
             return Err(RunError::NotFound(format!("No Plugin `{plugin}`")));
         }
+        if AGENT_PLUGINS.contains(&plugin)
+            && (!settings.path.is_empty() || settings.config_dir.is_some())
+        {
+            return Err(RunError::Invalid(format!(
+                "`{plugin}` takes its PATH dirs and config directory from its CLI's settings, \
+                 under Settings"
+            )));
+        }
         self.store.put_plugin_settings(plugin, &settings)?;
         self.plugins.set_settings(plugin, settings);
         // A new `PATH` may be what its `describe` lacked.
         self.plugins.scan().await;
         // A higher cap may free a Step waiting for a slot.
         self.command(|_| Ok(())).await
+    }
+
+    /// Every CLI the daemon runs, with its settings, the file it resolves
+    /// to on the Steps' `PATH`, its version and its login.
+    pub async fn list_clis(&self) -> Vec<CliListing> {
+        self.clis.listings(&self.step_path).await
+    }
+
+    /// Replaces the developer's settings for `cli`. The next Step that
+    /// runs it, and the daemon's next call to it, use them.
+    pub async fn set_cli_settings(&self, cli: Cli, settings: CliSettings) -> Result<(), RunError> {
+        if let Some(problem) = settings.problem(cli) {
+            return Err(RunError::Invalid(problem));
+        }
+        self.store.put_cli_settings(cli, &settings)?;
+        self.clis.set(cli, settings);
+        Ok(())
     }
 
     /// Runs `work` on the blocking pool, since it waits on the Keychain.
@@ -893,6 +932,7 @@ struct Engine {
     inbox: Arc<Inbox>,
     notifications: Arc<Notifications>,
     plugins: Arc<Plugins>,
+    clis: Arc<Clis>,
     logs: log::Hub,
     journal: Arc<Journal>,
     watching: Arc<Watching>,
@@ -2407,8 +2447,21 @@ impl Engine {
             budget_usd,
         });
         let path = self.plugins.path(&step.plugin, &self.step_path);
+        // An agent Step runs the CLI its settings name, with that CLI's
+        // dirs and config directory, whichever Plugin runs it.
+        let (path, cli, config_dir) = match plugins::agent_cli(&step.plugin, &step.config) {
+            Some(cli) => (
+                self.clis.path(cli, &path),
+                Some(self.clis.program(cli, &path)),
+                self.clis.config_dir(cli),
+            ),
+            None => (path, None, self.plugins.config_dir(&step.plugin)),
+        };
         let mut env = step_env(run.id, step_id, &path);
-        if let Some(dir) = self.plugins.config_dir(&step.plugin) {
+        if let Some(cli) = cli {
+            env.push((CLI_ENV.to_owned(), cli));
+        }
+        if let Some(dir) = config_dir {
             env.push((CONFIG_DIR_ENV.to_owned(), dir));
         }
         env.extend(

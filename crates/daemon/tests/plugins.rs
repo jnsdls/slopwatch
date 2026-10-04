@@ -22,9 +22,9 @@ use slopwatch_daemon::transport::in_process::InProcessClient;
 use slopwatch_daemon::{Daemon, Library, Retention, Runs, RunsConfig, Watching};
 use slopwatch_protocol::step::EffectKind;
 use slopwatch_protocol::{
-    Cause, ClientFrame, ClientHello, Command, ErrorCode, Grant, Inbox, InboxUpdate, PluginListing,
-    PluginSettings, PrRef, Reply, RepoName, ResponseBody, RunId, RunView, Scope, ServerFrame,
-    StepStatus, Topic, TopicUpdate, WatchedPrs, WatchedPrsUpdate,
+    Cause, Cli, CliSettings, CliStatus, ClientFrame, ClientHello, Command, ErrorCode, Grant, Inbox,
+    InboxUpdate, Login, PluginListing, PluginSettings, PrRef, Reply, RepoName, ResponseBody, RunId,
+    RunView, Scope, ServerFrame, StepStatus, Topic, TopicUpdate, WatchedPrs, WatchedPrsUpdate,
 };
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -98,6 +98,7 @@ impl Harness {
             dyn_github,
             Arc::clone(&watching),
             RunsConfig {
+                clis: Default::default(),
                 data_dir: data.path().to_owned(),
                 plugins: found,
                 login_path: None,
@@ -400,6 +401,143 @@ async fn settings_take_absolute_paths_and_a_cap_and_show_in_the_list() {
             .await;
         assert_eq!(client.plugin(plugin).await.settings, settings);
     }
+}
+
+#[tokio::test]
+async fn the_agent_plugins_take_their_path_and_config_dir_from_the_cli_settings() {
+    let harness = Harness::new(&[]).await;
+    let mut client = Client::connect(&harness.daemon).await;
+
+    for plugin in ["claude", "codex", "fix"] {
+        let (code, message) = client
+            .refused(Command::SetPluginSettings {
+                plugin: plugin.into(),
+                settings: PluginSettings {
+                    config_dir: Some("/Users/me/.claude-work".into()),
+                    ..PluginSettings::default()
+                },
+            })
+            .await;
+        assert_eq!(code, ErrorCode::Invalid, "{plugin}");
+        assert!(message.contains("CLI's settings"), "{message}");
+    }
+    let cap = PluginSettings {
+        cap: Some(1),
+        ..PluginSettings::default()
+    };
+    client
+        .ok(Command::SetPluginSettings {
+            plugin: "claude".into(),
+            settings: cap.clone(),
+        })
+        .await;
+    assert_eq!(client.plugin("claude").await.settings, cap);
+}
+
+#[tokio::test]
+async fn each_cli_lists_what_it_resolved_to_its_version_and_its_login() {
+    let harness = Harness::new(&[]).await;
+    let mut client = Client::connect(&harness.daemon).await;
+    let dir = harness.folder.parent().unwrap();
+    let fake = |name: &str, body: &str| {
+        let file = dir.join(name);
+        std::fs::write(&file, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        file.display().to_string()
+    };
+    let claude = fake(
+        "mclaude",
+        r#"case "$1" in
+--version) echo "2.1.0 (Claude Code)" ;;
+auth) echo '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}' ;;
+esac"#,
+    );
+    let codex = fake(
+        "codex",
+        r#"case "$1" in
+--version) echo "codex-cli 0.159.0" ;;
+login) echo "Not logged in" >&2; exit 1 ;;
+esac"#,
+    );
+    let gh = fake("gh", r#"echo "gh version 2.90.0 (2026-04-16)""#);
+    let missing = dir.join("no-git").display().to_string();
+
+    for (cli, settings) in [
+        (
+            Cli::Gh,
+            CliSettings {
+                executable: Some("bin/gh".into()),
+                ..CliSettings::default()
+            },
+        ),
+        (
+            Cli::Gh,
+            CliSettings {
+                path: vec!["/opt/bin".into()],
+                ..CliSettings::default()
+            },
+        ),
+    ] {
+        let (code, _) = client
+            .refused(Command::SetCliSettings { cli, settings })
+            .await;
+        assert_eq!(code, ErrorCode::Invalid);
+    }
+    for (cli, executable) in [
+        (Cli::Claude, &claude),
+        (Cli::Codex, &codex),
+        (Cli::Gh, &gh),
+        (Cli::Git, &missing),
+    ] {
+        client
+            .ok(Command::SetCliSettings {
+                cli,
+                settings: CliSettings {
+                    executable: Some(executable.clone()),
+                    ..CliSettings::default()
+                },
+            })
+            .await;
+    }
+
+    let Reply::Clis { clis } = client.ok(Command::ListClis).await else {
+        panic!("expected Clis");
+    };
+    let listed: Vec<Cli> = clis.iter().map(|listing| listing.cli).collect();
+    assert_eq!(listed, Cli::ALL);
+    let status = |cli: Cli| &clis.iter().find(|l| l.cli == cli).unwrap().status;
+    assert_eq!(
+        status(Cli::Claude),
+        &CliStatus {
+            resolved: Some(claude.clone()),
+            version: Some("2.1.0 (Claude Code)".into()),
+            login: Some(Login {
+                logged_in: true,
+                detail: Some("claude.ai (max)".into()),
+            }),
+            problem: None,
+        }
+    );
+    assert_eq!(
+        status(Cli::Codex).login,
+        Some(Login {
+            logged_in: false,
+            detail: None,
+        })
+    );
+    assert_eq!(
+        status(Cli::Gh).version.as_deref(),
+        Some("gh version 2.90.0 (2026-04-16)")
+    );
+    assert_eq!(status(Cli::Gh).login, None);
+    assert_eq!(
+        status(Cli::Git).problem,
+        Some(format!("`{missing}` doesn't exist"))
+    );
+    assert_eq!(
+        clis[0].settings.executable.as_deref(),
+        Some(claude.as_str())
+    );
 }
 
 /// A client that keeps its copy of `watched_prs`, the Inbox and its Runs.

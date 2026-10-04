@@ -3,6 +3,9 @@
 # still reach Fix. It runs on your own Codex login. `auth: api_key` runs it
 # on the OPENAI_API_KEY Secret instead. Codex reports tokens, so the model
 # is named here for slopwatch to price them.
+# It runs the `codex` executable set under Settings, CLIs. A `cli` key
+# here overrides that for this Step, but the Pipeline is committed, so a
+# path in it only exists on your machine.
 uses: codex
 with:
   model: gpt-5.4

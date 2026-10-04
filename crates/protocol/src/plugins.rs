@@ -118,7 +118,17 @@ pub struct PluginListing {
     pub settings: PluginSettings,
 }
 
+/// The built-in Plugins whose Steps run an agent CLI. Their `PATH` dirs and
+/// config directory are that CLI's settings ([`crate::CliSettings`]), not
+/// their own.
+pub const AGENT_PLUGINS: [&str; 3] = ["claude", "codex", "fix"];
+
 impl PluginListing {
+    /// A built-in that runs an agent CLI, so only its cap is its own.
+    pub fn runs_agent_cli(&self) -> bool {
+        self.builtin && AGENT_PLUGINS.contains(&self.name.as_str())
+    }
+
     /// It loaded, and its Approval doesn't cover what it asks for now, so
     /// its Steps error until the developer approves it.
     pub fn needs_approval(&self) -> bool {
@@ -142,9 +152,9 @@ pub struct PluginSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap: Option<u32>,
     /// An absolute config directory for the CLI the Plugin runs, which its
-    /// Steps get as `SLOPWATCH_CONFIG_DIR`. The `claude` Plugin runs Claude
-    /// Code on a subscription with it as `CLAUDE_CONFIG_DIR`, for a login
-    /// kept outside `~/.claude`.
+    /// Steps get as `SLOPWATCH_CONFIG_DIR`. The built-in agent Plugins,
+    /// `claude`, `codex` and `fix`, take theirs and their `PATH` dirs from
+    /// their CLI's settings ([`crate::CliSettings`]) instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_dir: Option<String>,
 }

@@ -281,15 +281,15 @@ mod tests {
         };
         assert_eq!(
             save_settings(
-                "claude",
-                &fields(" /opt/a/bin : /opt/b ", "2", " /Users/me/.claude-work ")
+                "lint",
+                &fields(" /opt/a/bin : /opt/b ", "2", " /Users/me/.lint ")
             ),
             Ok(Command::SetPluginSettings {
-                plugin: "claude".into(),
+                plugin: "lint".into(),
                 settings: PluginSettings {
                     path: vec!["/opt/a/bin".into(), "/opt/b".into()],
                     cap: Some(2),
-                    config_dir: Some("/Users/me/.claude-work".into()),
+                    config_dir: Some("/Users/me/.lint".into()),
                 },
             })
         );
@@ -303,7 +303,7 @@ mod tests {
         assert!(save_settings("lint", &fields("bin", "", "")).is_err());
         assert!(save_settings("lint", &fields("", "two", "")).is_err());
         assert!(save_settings("lint", &fields("", "0", "")).is_err());
-        assert!(save_settings("claude", &fields("", "", "~/.claude")).is_err());
+        assert!(save_settings("lint", &fields("", "", "~/.lint")).is_err());
         let settings = PluginSettings {
             path: vec!["/a".into(), "/b".into()],
             cap: Some(3),

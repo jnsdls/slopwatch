@@ -138,6 +138,7 @@ done
                 github,
                 Arc::clone(&watching),
                 RunsConfig {
+                    clis: Default::default(),
                     data_dir: self.data.path().to_owned(),
                     plugins,
                     login_path: None,

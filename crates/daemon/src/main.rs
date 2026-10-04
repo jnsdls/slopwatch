@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use slopwatch_daemon::auth::GhToken;
+use slopwatch_daemon::clis::Clis;
 use slopwatch_daemon::drafts::{Drafts, PipelineSource, StepNeeds};
 use slopwatch_daemon::github::GitHub;
 use slopwatch_daemon::github::api::Api;
@@ -61,7 +62,27 @@ async fn serve() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let github: Arc<dyn GitHub> = Arc::new(Api::new(Arc::new(GhToken::default())));
+    // launchd's PATH lacks what the developer's shell finds, so Steps get
+    // the login shell's merged in. Asking it takes a moment, and the
+    // first Step can't start without it.
+    let login_path = tokio::task::spawn_blocking(shell_env::login_shell_path)
+        .await
+        .unwrap_or_default();
+    // Third-party Plugins are found before any Run loads its Pipeline,
+    // and their `describe` gets the PATH Steps get. The CLIs the daemon
+    // runs itself, `gh` and `git`, are looked up on it too.
+    let step_path = shell_env::merge(std::env::var("PATH").ok().as_deref(), login_path.as_deref());
+    let clis = match store.cli_settings() {
+        Ok(settings) => Arc::new(Clis::new(settings)),
+        Err(error) => {
+            eprintln!("slopwatchd: can't load {}: {error}", db.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let github: Arc<dyn GitHub> = Arc::new(Api::new(Arc::new(GhToken::new(
+        Arc::clone(&clis),
+        step_path.clone(),
+    ))));
     let watching = match Watching::new(store.clone(), Arc::clone(&github)) {
         Ok(watching) => Arc::new(watching),
         Err(error) => {
@@ -87,15 +108,6 @@ async fn serve() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // launchd's PATH lacks what the developer's shell finds, so Steps get
-    // the login shell's merged in. Asking it takes a moment, and the
-    // first Step can't start without it.
-    let login_path = tokio::task::spawn_blocking(shell_env::login_shell_path)
-        .await
-        .unwrap_or_default();
-    // Third-party Plugins are found before any Run loads its Pipeline,
-    // and their `describe` gets the PATH Steps get.
-    let step_path = shell_env::merge(std::env::var("PATH").ok().as_deref(), login_path.as_deref());
     let plugins = Plugins::new(exe, Arc::clone(&library))
         .in_folder(plugins::default_dir(Flavor::CURRENT), step_path)
         .await;
@@ -107,6 +119,7 @@ async fn serve() -> ExitCode {
         keychain: Arc::new(SecurityCli::new(SecurityCli::default_service(
             Flavor::CURRENT,
         ))),
+        clis,
     };
     let runs = match Runs::start(store.clone(), github, Arc::clone(&watching), config) {
         Ok(runs) => runs,

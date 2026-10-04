@@ -4,6 +4,9 @@
 # your own Claude login. `auth: api_key` runs it on the ANTHROPIC_API_KEY
 # Secret instead. The PR's own hooks and MCP servers stay off unless you
 # add `repo_config: true`.
+# It runs the `claude` executable set under Settings, CLIs. A `cli` key
+# here overrides that for this Step, but the Pipeline is committed, so a
+# path in it only exists on your machine.
 uses: claude
 with:
   model: opus

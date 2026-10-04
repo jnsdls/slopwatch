@@ -16,6 +16,7 @@
 
 pub mod approvals;
 pub mod auth;
+pub mod clis;
 pub mod clones;
 mod connection;
 mod data_dir;

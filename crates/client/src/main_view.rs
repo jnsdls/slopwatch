@@ -279,6 +279,10 @@ impl MainView {
                     self.settings
                         .update(cx, |view, cx| view.listed(settings, spent_today, cx));
                 }
+                ResponseBody::Ok(Reply::Clis { clis }) => {
+                    self.settings
+                        .update(cx, |view, cx| view.clis_listed(clis, cx));
+                }
                 ResponseBody::Ok(Reply::StepLog(page)) => {
                     self.error = None;
                     self.run_pane.log_page(page);

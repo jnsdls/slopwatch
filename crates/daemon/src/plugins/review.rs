@@ -16,7 +16,9 @@
 //!   when any Finding is at least this severe.
 //! - `repo_config`: `true` lets the CLI load the repo's hooks and MCP
 //!   servers. Off by default, because the PR's branch controls them.
-//! - `cli`: the executable, as an absolute path or a name on `PATH`.
+//! - `cli`: the executable, as an absolute path or a name on `PATH`, in
+//!   place of the one the daemon's CLI settings name. The Pipeline is
+//!   committed, so a path here only exists on the machine that wrote it.
 //!
 //! The CLI's environment is the Step's: `PATH`, `HOME` and the Secrets the
 //! Plugin is granted. On a subscription, the API key Secret is taken out,
@@ -31,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Map, Value, json};
 use slopwatch_core::Verdict;
 use slopwatch_protocol::step::{
-    Finding, FromStep, Outcome, Outputs, PrSnapshot, Severity, Start, ToStep, Usage,
+    CLI_ENV, Finding, FromStep, Outcome, Outputs, PrSnapshot, Severity, Start, ToStep, Usage,
 };
 
 /// The most diff a prompt carries inline. A longer one stays in its file,
@@ -416,11 +418,20 @@ pub fn run<A: Agent>(agent: A) -> std::io::Result<()> {
     let Some(start) = read_start(&mut input, A::NAME)? else {
         return Ok(());
     };
-    let config = match Config::parse(&start.config, A::NAME) {
+    let config = match Config::parse(&start.config, &default_cli(A::NAME)) {
         Ok(config) => config,
         Err(reason) => return send(&mut output, &FromStep::Error { reason }),
     };
     session(agent, &config, &start, input, &mut output)
+}
+
+/// The executable a Step runs when its `with:` names none: the one the
+/// daemon's CLI settings name, handed over in [`CLI_ENV`], or else `name`.
+pub fn default_cli(name: &str) -> String {
+    std::env::var(CLI_ENV)
+        .ok()
+        .filter(|cli| !cli.is_empty())
+        .unwrap_or_else(|| name.to_owned())
 }
 
 /// Reads the daemon's `start`, the first line of a session. `None` when

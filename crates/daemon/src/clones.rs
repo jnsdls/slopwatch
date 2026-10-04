@@ -8,14 +8,18 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use slopwatch_protocol::RepoName;
+use slopwatch_protocol::{Cli, RepoName};
 use tokio::process::Command;
 
+use crate::clis::Clis;
 use crate::github::{GitRemote, PIPELINE_PATH};
 
 pub struct Clones {
     root: PathBuf,
     locks: Mutex<HashMap<RepoName, Arc<tokio::sync::Mutex<()>>>>,
+    /// The CLI settings that say which git to run, and the `PATH` it's
+    /// looked up on. `None` runs `git` from the daemon's own `PATH`.
+    clis: Option<(Arc<Clis>, String)>,
 }
 
 /// The Pipeline file as it stands at the tip of a branch.
@@ -43,6 +47,21 @@ impl Clones {
         Self {
             root: root.into(),
             locks: Mutex::new(HashMap::new()),
+            clis: None,
+        }
+    }
+
+    /// Runs the git the CLI settings name, looked up on `path`.
+    pub fn with_git(mut self, clis: Arc<Clis>, path: impl Into<String>) -> Self {
+        self.clis = Some((clis, path.into()));
+        self
+    }
+
+    /// The git to run.
+    fn program(&self) -> String {
+        match &self.clis {
+            Some((clis, path)) => clis.program(Cli::Git, path),
+            None => "git".to_owned(),
         }
     }
 
@@ -62,19 +81,20 @@ impl Clones {
     ) -> Result<PipelineAt, GitError> {
         let _turn = self.turn(repo).await;
         let path = self.cloned(repo, remote).await?;
-        let sha = fetch_branch(&path, remote, branch).await?;
-        let listed = git(
-            &path,
-            remote,
-            &["ls-tree", "--name-only", &sha, "--", PIPELINE_PATH],
-        )
-        .await?;
+        let sha = self.fetch_branch(&path, remote, branch).await?;
+        let listed = self
+            .git(
+                &path,
+                remote,
+                &["ls-tree", "--name-only", &sha, "--", PIPELINE_PATH],
+            )
+            .await?;
         let text = if listed.is_empty() {
             None
         } else {
             // A blobless clone fetches the blob from the remote here.
             Some(
-                git(
+                self.git(
                     &path,
                     remote,
                     &["cat-file", "blob", &format!("{sha}:{PIPELINE_PATH}")],
@@ -96,12 +116,13 @@ impl Clones {
             let _turn = self.turn(repo).await;
             self.cloned(repo, remote).await?
         };
-        let head = git(
-            &path,
-            remote,
-            &["ls-remote", "--symref", &remote.url, "HEAD"],
-        )
-        .await?;
+        let head = self
+            .git(
+                &path,
+                remote,
+                &["ls-remote", "--symref", &remote.url, "HEAD"],
+            )
+            .await?;
         let branch = head
             .lines()
             .find_map(|line| {
@@ -114,7 +135,7 @@ impl Clones {
         let blob = match at.text {
             Some(_) => {
                 let file = format!("{}:{PIPELINE_PATH}", at.sha);
-                Some(git(&path, remote, &["rev-parse", &file]).await?)
+                Some(self.git(&path, remote, &["rev-parse", &file]).await?)
             }
             None => None,
         };
@@ -140,7 +161,7 @@ impl Clones {
         }
         let _turn = self.turn(repo).await;
         let path = self.cloned(repo, remote).await?;
-        git(
+        self.git(
             &path,
             remote,
             &[
@@ -153,19 +174,20 @@ impl Clones {
             ],
         )
         .await?;
-        let listed = git(
-            &path,
-            remote,
-            &[
-                "diff",
-                "--name-only",
-                "--no-renames",
-                "-z",
-                &format!("{base_sha}...{head_sha}"),
-                "--",
-            ],
-        )
-        .await?;
+        let listed = self
+            .git(
+                &path,
+                remote,
+                &[
+                    "diff",
+                    "--name-only",
+                    "--no-renames",
+                    "-z",
+                    &format!("{base_sha}...{head_sha}"),
+                    "--",
+                ],
+            )
+            .await?;
         Ok(listed
             .split('\0')
             .filter(|path| !path.is_empty())
@@ -192,7 +214,7 @@ impl Clones {
         }
         let _turn = self.turn(repo).await;
         let path = self.cloned(repo, remote).await?;
-        git(
+        self.git(
             &path,
             remote,
             &[
@@ -205,19 +227,20 @@ impl Clones {
             ],
         )
         .await?;
-        let output = git_output(
-            &path,
-            remote,
-            &[
-                "diff",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-textconv",
-                &format!("{base_sha}...{head_sha}"),
-                "--",
-            ],
-        )
-        .await?;
+        let output = self
+            .git_output(
+                &path,
+                remote,
+                &[
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    &format!("{base_sha}...{head_sha}"),
+                    "--",
+                ],
+            )
+            .await?;
         Ok(String::from_utf8_lossy(&output).into_owned())
     }
 
@@ -231,7 +254,7 @@ impl Clones {
     ) -> Result<String, GitError> {
         let _turn = self.turn(repo).await;
         let path = self.cloned(repo, remote).await?;
-        fetch_branch(&path, remote, branch).await
+        self.fetch_branch(&path, remote, branch).await
     }
 
     /// The commit at the tip of `branch` on the remote, or `None` if the
@@ -246,12 +269,13 @@ impl Clones {
             let _turn = self.turn(repo).await;
             self.cloned(repo, remote).await?
         };
-        let listed = git(
-            &path,
-            remote,
-            &["ls-remote", &remote.url, &format!("refs/heads/{branch}")],
-        )
-        .await?;
+        let listed = self
+            .git(
+                &path,
+                remote,
+                &["ls-remote", &remote.url, &format!("refs/heads/{branch}")],
+            )
+            .await?;
         Ok(listed.split_whitespace().next().map(str::to_owned))
     }
 
@@ -267,9 +291,13 @@ impl Clones {
     ) -> Result<bool, GitError> {
         let _turn = self.turn(repo).await;
         let path = self.cloned(repo, remote).await?;
-        let fork = git(&path, remote, &["merge-base", head_sha, base_sha]).await?;
+        let fork = self
+            .git(&path, remote, &["merge-base", head_sha, base_sha])
+            .await?;
         let blob = async |commit: &str| {
-            let listed = git(&path, remote, &["ls-tree", commit, "--", PIPELINE_PATH]).await?;
+            let listed = self
+                .git(&path, remote, &["ls-tree", commit, "--", PIPELINE_PATH])
+                .await?;
             Ok::<_, GitError>(listed.split_whitespace().nth(2).map(str::to_owned))
         };
         Ok(blob(&fork).await? != blob(base_sha).await?)
@@ -284,7 +312,9 @@ impl Clones {
     ) -> Result<Vec<String>, GitError> {
         let _turn = self.turn(repo).await;
         let path = self.cloned(repo, remote).await?;
-        let listed = git(&path, remote, &["log", "-1", "--format=%P", sha]).await?;
+        let listed = self
+            .git(&path, remote, &["log", "-1", "--format=%P", sha])
+            .await?;
         Ok(listed.split_whitespace().map(str::to_owned).collect())
     }
 
@@ -307,11 +337,12 @@ impl Clones {
         let _turn = self.turn(repo).await;
         let clone = self.cloned(repo, remote).await?;
         let commit = format!("{head_sha}^{{commit}}");
-        if git(&clone, remote, &["cat-file", "-e", &commit])
+        if self
+            .git(&clone, remote, &["cat-file", "-e", &commit])
             .await
             .is_err()
         {
-            git(
+            self.git(
                 &clone,
                 remote,
                 &[
@@ -325,12 +356,12 @@ impl Clones {
             )
             .await?;
         }
-        git(&clone, remote, &["worktree", "prune"]).await?;
+        self.git(&clone, remote, &["worktree", "prune"]).await?;
         let _ = tokio::fs::remove_dir_all(dir).await;
         let target = dir
             .to_str()
             .ok_or_else(|| GitError(format!("{} isn't UTF-8", dir.display())))?;
-        git(
+        self.git(
             &clone,
             remote,
             &[
@@ -382,7 +413,7 @@ impl Clones {
         let result = async {
             let run = async |args: Vec<String>| {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                git_output_env(dir, remote, &env, &args).await
+                self.git_output_env(dir, remote, &env, &args).await
             };
             run(safe(&["read-tree", head])).await?;
             run(safe(&["add", "--all", "--", "."])).await?;
@@ -424,17 +455,18 @@ impl Clones {
         };
         let mut trees = Vec::new();
         for commit in commits {
-            if let Ok(tree) = git(
-                &path,
-                remote,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &format!("{commit}^{{tree}}"),
-                ],
-            )
-            .await
+            if let Ok(tree) = self
+                .git(
+                    &path,
+                    remote,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        &format!("{commit}^{{tree}}"),
+                    ],
+                )
+                .await
             {
                 trees.push(tree);
             }
@@ -451,7 +483,8 @@ impl Clones {
     ) -> Result<Vec<u8>, GitError> {
         let _turn = self.turn(repo).await;
         let path = self.cloned(repo, remote).await?;
-        git_output_env(&path, remote, &[], &["cat-file", "blob", oid]).await
+        self.git_output_env(&path, remote, &[], &["cat-file", "blob", oid])
+            .await
     }
 
     /// The parents and tree of `sha`, PR `number`'s head on GitHub,
@@ -466,11 +499,12 @@ impl Clones {
         let _turn = self.turn(repo).await;
         let path = self.cloned(repo, remote).await?;
         let commit = format!("{sha}^{{commit}}");
-        if git(&path, remote, &["cat-file", "-e", &commit])
+        if self
+            .git(&path, remote, &["cat-file", "-e", &commit])
             .await
             .is_err()
         {
-            git(
+            self.git(
                 &path,
                 remote,
                 &[
@@ -484,7 +518,9 @@ impl Clones {
             )
             .await?;
         }
-        let listed = git(&path, remote, &["log", "-1", "--format=%P%n%T", sha]).await?;
+        let listed = self
+            .git(&path, remote, &["log", "-1", "--format=%P%n%T", sha])
+            .await?;
         let mut lines = listed.lines();
         let parents = lines
             .next()
@@ -525,7 +561,7 @@ impl Clones {
             .await
             .map_err(|error| GitError(format!("can't create {}: {error}", parent.display())))?;
         let target = path.to_str().expect("clone paths are UTF-8");
-        git(
+        self.git(
             parent,
             remote,
             &[
@@ -597,84 +633,99 @@ fn parse_raw_diff(raw: &[u8]) -> Result<Vec<Change>, GitError> {
     Ok(changes)
 }
 
-/// Fetches `branch` into the clone at `path` and returns its tip.
-async fn fetch_branch(path: &Path, remote: &GitRemote, branch: &str) -> Result<String, GitError> {
-    if branch.starts_with('-') || branch.contains("..") || branch.contains(':') {
-        return Err(GitError(format!("`{branch}` isn't a branch name")));
+impl Clones {
+    /// Fetches `branch` into the clone at `path` and returns its tip.
+    async fn fetch_branch(
+        &self,
+        path: &Path,
+        remote: &GitRemote,
+        branch: &str,
+    ) -> Result<String, GitError> {
+        if branch.starts_with('-') || branch.contains("..") || branch.contains(':') {
+            return Err(GitError(format!("`{branch}` isn't a branch name")));
+        }
+        let local = format!("refs/slopwatch/base/{branch}");
+        self.git(
+            path,
+            remote,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--filter=blob:none",
+                &remote.url,
+                &format!("+refs/heads/{branch}:{local}"),
+            ],
+        )
+        .await?;
+        self.git(path, remote, &["rev-parse", "--verify", &local])
+            .await
     }
-    let local = format!("refs/slopwatch/base/{branch}");
-    git(
-        path,
-        remote,
-        &[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--filter=blob:none",
-            &remote.url,
-            &format!("+refs/heads/{branch}:{local}"),
-        ],
-    )
-    .await?;
-    git(path, remote, &["rev-parse", "--verify", &local]).await
-}
 
-/// Runs git in `dir` and returns its stdout, trimmed of the final newline
-/// for one-line answers. Text output keeps everything else as is.
-async fn git(dir: &Path, remote: &GitRemote, args: &[&str]) -> Result<String, GitError> {
-    git_env(dir, remote, &[], args).await
-}
-
-/// [`git`] with `env` set besides the remote's.
-async fn git_env(
-    dir: &Path,
-    remote: &GitRemote,
-    env: &[(&str, &str)],
-    args: &[&str],
-) -> Result<String, GitError> {
-    let output = git_output_env(dir, remote, env, args).await?;
-    let mut text = String::from_utf8(output)
-        .map_err(|_| GitError(format!("git {} wrote non-UTF-8", args[0])))?;
-    if args[0] != "cat-file" {
-        text.truncate(text.trim_end().len());
+    /// Runs git in `dir` and returns its stdout, trimmed of the final newline
+    /// for one-line answers. Text output keeps everything else as is.
+    async fn git(&self, dir: &Path, remote: &GitRemote, args: &[&str]) -> Result<String, GitError> {
+        self.git_env(dir, remote, &[], args).await
     }
-    Ok(text)
-}
 
-/// Runs git in `dir` and returns its stdout as it wrote it.
-async fn git_output(dir: &Path, remote: &GitRemote, args: &[&str]) -> Result<Vec<u8>, GitError> {
-    git_output_env(dir, remote, &[], args).await
-}
-
-/// [`git_output`] with `env` set besides the remote's.
-async fn git_output_env(
-    dir: &Path,
-    remote: &GitRemote,
-    env: &[(&str, &str)],
-    args: &[&str],
-) -> Result<Vec<u8>, GitError> {
-    let output = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .envs(remote.env.iter().map(|(k, v)| (k, v)))
-        .envs(env.iter().copied())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        // A checkout fetches the blobs it needs from the remote, but not
-        // Git LFS objects, which a review doesn't need and which would
-        // need credentials of their own.
-        .env("GIT_LFS_SKIP_SMUDGE", "1")
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(|error| GitError(format!("can't run git: {error}")))?;
-    if !output.status.success() {
-        return Err(GitError(format!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&""),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+    /// [`Self::git`] with `env` set besides the remote's.
+    async fn git_env(
+        &self,
+        dir: &Path,
+        remote: &GitRemote,
+        env: &[(&str, &str)],
+        args: &[&str],
+    ) -> Result<String, GitError> {
+        let output = self.git_output_env(dir, remote, env, args).await?;
+        let mut text = String::from_utf8(output)
+            .map_err(|_| GitError(format!("git {} wrote non-UTF-8", args[0])))?;
+        if args[0] != "cat-file" {
+            text.truncate(text.trim_end().len());
+        }
+        Ok(text)
     }
-    Ok(output.stdout)
+
+    /// Runs git in `dir` and returns its stdout as it wrote it.
+    async fn git_output(
+        &self,
+        dir: &Path,
+        remote: &GitRemote,
+        args: &[&str],
+    ) -> Result<Vec<u8>, GitError> {
+        self.git_output_env(dir, remote, &[], args).await
+    }
+
+    /// [`Self::git_output`] with `env` set besides the remote's.
+    async fn git_output_env(
+        &self,
+        dir: &Path,
+        remote: &GitRemote,
+        env: &[(&str, &str)],
+        args: &[&str],
+    ) -> Result<Vec<u8>, GitError> {
+        let output = Command::new(self.program())
+            .current_dir(dir)
+            .args(args)
+            .envs(remote.env.iter().map(|(k, v)| (k, v)))
+            .envs(env.iter().copied())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            // A checkout fetches the blobs it needs from the remote, but not
+            // Git LFS objects, which a review doesn't need and which would
+            // need credentials of their own.
+            .env("GIT_LFS_SKIP_SMUDGE", "1")
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|error| GitError(format!("can't run git: {error}")))?;
+        if !output.status.success() {
+            return Err(GitError(format!(
+                "git {} failed: {}",
+                args.first().unwrap_or(&""),
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(output.stdout)
+    }
 }
 
 #[cfg(test)]

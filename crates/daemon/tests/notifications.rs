@@ -130,6 +130,7 @@ fn daemon(github: &Arc<FakeGitHub>, data: &Path) -> (Arc<Daemon>, Arc<Runs>) {
         dyn_github,
         Arc::clone(&watching),
         RunsConfig {
+            clis: Default::default(),
             data_dir: data.to_owned(),
             plugins,
             login_path: None,

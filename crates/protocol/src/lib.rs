@@ -7,6 +7,7 @@
 //! topic also gets topic updates: a snapshot, then ordered deltas.
 
 mod budgets;
+mod clis;
 mod flavor;
 mod frames;
 mod inbox;
@@ -20,6 +21,7 @@ pub mod step;
 mod topics;
 
 pub use budgets::{BudgetHit, BudgetKind, Cents, DAILY_BUDGET_DEFAULT, DaemonSettings};
+pub use clis::{Cli, CliListing, CliSettings, CliStatus, Login};
 pub use flavor::{DATA_DIR_ENV, Flavor, socket_path};
 pub use frames::{
     Actor, Auth, ClientFrame, ClientHello, Command, ErrorBody, ErrorCode, LibraryStep, Refusal,
@@ -36,7 +38,7 @@ pub use logs::{
 pub use notifications::{
     About, Notification, NotificationId, NotificationsDelta, NotificationsUpdate,
 };
-pub use plugins::{Grant, PluginListing, PluginSettings, workspace_name};
+pub use plugins::{AGENT_PLUGINS, Grant, PluginListing, PluginSettings, workspace_name};
 pub use runs::{
     CommitView, Cost, EffectView, GateTerm, RunEvent, RunId, RunSummary, RunView, StepInfo,
     StepStatus, StepView, Waiver,
@@ -104,6 +106,8 @@ pub const DIALECT: u32 = 1;
 /// `budgets`: the `raise_budget`, `run_anyway_once`, `get_settings` and
 /// `set_settings` commands, the `daily_budget` Inbox cause, and `budget`
 /// on an entry a spent Budget raised.
+///
+/// `clis`: the `list_clis` and `set_cli_settings` commands.
 pub const FEATURES: &[&str] = &[
     "watched_prs",
     "restart",
@@ -122,6 +126,7 @@ pub const FEATURES: &[&str] = &[
     "pipeline_publish",
     "onboarding",
     "budgets",
+    "clis",
 ];
 
 /// The URL clients put in the WebSocket handshake. A Unix socket has no

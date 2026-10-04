@@ -52,6 +52,7 @@ fn harness(retention: Retention) -> Harness {
         dyn_github,
         Arc::clone(&watching),
         RunsConfig {
+            clis: Default::default(),
             data_dir: data.path().to_owned(),
             plugins: Plugins::new(env!("CARGO_BIN_EXE_slopwatchd"), Arc::clone(&library)),
             login_path: None,

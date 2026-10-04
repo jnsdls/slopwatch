@@ -85,8 +85,12 @@ fn config_schema() -> Value {
 }
 
 /// Reads a fix Step's `with:`: the agent it names, and the session config
-/// for it, or what's wrong with it.
-pub fn parse(with: &Map<String, Value>) -> Result<(String, Config), String> {
+/// for it, or what's wrong with it. `default_cli` gives the agent's
+/// executable, by the agent's name, when the Step names none.
+pub fn parse(
+    with: &Map<String, Value>,
+    default_cli: impl FnOnce(&str) -> String,
+) -> Result<(String, Config), String> {
     if let Some(key) = with.keys().find(|key| !KEYS.contains(&key.as_str())) {
         return Err(format!(
             "`with:` has an unknown key `{key}`. It takes {}.",
@@ -109,7 +113,7 @@ pub fn parse(with: &Map<String, Value>) -> Result<(String, Config), String> {
     review.remove("agent");
     let extra = review.remove("prompt");
     review.insert("prompt".into(), Value::String("fix".into()));
-    let mut config = Config::parse(&review, &agent)?;
+    let mut config = Config::parse(&review, &default_cli(&agent))?;
     config.job = Job::Fix;
     config.prompt = match extra {
         None | Some(Value::Null) => String::new(),
@@ -253,7 +257,7 @@ pub fn run() -> std::io::Result<()> {
     let Some(start) = review::read_start(&mut input, ID)? else {
         return Ok(());
     };
-    let (agent, config) = match parse(&start.config) {
+    let (agent, config) = match parse(&start.config, review::default_cli) {
         Ok(parsed) => parsed,
         Err(reason) => return review::send(&mut output, &FromStep::Error { reason }),
     };
@@ -282,15 +286,16 @@ mod tests {
 
     #[test]
     fn a_config_picks_its_agent_and_reads_the_review_keys() {
-        let (agent, config) = parse(&with(json!({}))).unwrap();
+        let parse = |value: Value| parse(&with(value), str::to_owned);
+        let (agent, config) = parse(json!({})).unwrap();
         assert_eq!(agent, "claude");
         assert_eq!(config.job, Job::Fix);
         assert_eq!(config.cli, "claude");
         assert!(config.prompt.is_empty());
 
-        let (agent, config) = parse(&with(json!({
+        let (agent, config) = parse(json!({
             "agent": "codex", "auth": "api_key", "model": "gpt-5.4", "prompt": "Keep it small.",
-        })))
+        }))
         .unwrap();
         assert_eq!(agent, "codex");
         assert_eq!(config.cli, "codex");
@@ -298,20 +303,29 @@ mod tests {
         assert_eq!(config.prompt, "Keep it small.");
 
         assert!(
-            parse(&with(json!({ "agent": "gemini" })))
+            parse(json!({ "agent": "gemini" }))
                 .unwrap_err()
                 .contains("gemini")
         );
         assert!(
-            parse(&with(json!({ "fail_on": "error" })))
+            parse(json!({ "fail_on": "error" }))
                 .unwrap_err()
                 .contains("fail_on")
         );
     }
 
     #[test]
+    fn the_agent_runs_the_cli_its_settings_name_unless_the_step_names_one() {
+        let set = |agent: &str| format!("/opt/{agent}-from-settings");
+        let (_, config) = parse(&with(json!({ "agent": "codex" })), set).unwrap();
+        assert_eq!(config.cli, "/opt/codex-from-settings");
+        let (_, config) = parse(&with(json!({ "cli": "/usr/local/bin/claude" })), set).unwrap();
+        assert_eq!(config.cli, "/usr/local/bin/claude");
+    }
+
+    #[test]
     fn the_prompt_lists_the_failing_steps_findings_and_the_ci_log_tails() {
-        let (_, config) = parse(&with(json!({ "prompt": "Add a test." }))).unwrap();
+        let (_, config) = parse(&with(json!({ "prompt": "Add a test." })), str::to_owned).unwrap();
         let failing = Outcome {
             verdict: Verdict::Fail,
             outputs: Outputs {
