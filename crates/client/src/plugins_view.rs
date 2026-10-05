@@ -9,7 +9,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Command, PluginListing};
 
-use crate::components::{ButtonLooks, ChipKind, chip, list_row, section};
+use crate::components::{ButtonLooks, ChipKind, chip, list_row, section, truncated};
 use crate::outbox::Outbox;
 use crate::outbox_view::{Pending, loading, refusal};
 use crate::plugins::{
@@ -156,10 +156,22 @@ impl PluginsView {
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .flex()
                         .flex_col()
-                        .child(div().text_sm().font_family(theme::MONO).child(name.clone()))
-                        .child(div().text_xs().text_color(theme::DIM).child(detail)),
+                        .child(
+                            truncated("name", name.clone())
+                                .text_sm()
+                                .font_family(theme::MONO),
+                        )
+                        .child(
+                            // Its version, and the Plugin's own name at the
+                            // end of its path.
+                            truncated("detail", detail)
+                                .text_ellipsis_middle()
+                                .text_xs()
+                                .text_color(theme::DIM),
+                        ),
                 )
                 .child(
                     chip(
@@ -295,6 +307,7 @@ impl Render for PluginsView {
         div()
             .id("plugins")
             .flex_1()
+            .min_w_0()
             .h_full()
             .flex()
             .flex_col()

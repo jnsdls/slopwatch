@@ -24,7 +24,8 @@ use slopwatch_protocol::pipeline::PipelineDraft;
 use slopwatch_protocol::{Command, GateTerm, PullRequest, RepoName, SecretValue};
 
 use crate::components::{
-    ButtonLooks, ChipKind, PillTone, chip, dot_grid, mono, pill, plain_dot, section, well,
+    ButtonLooks, ChipKind, PillTone, chip, clamped, dot_grid, mono, pill, plain_dot, section,
+    truncated, well,
 };
 use crate::onboarding::{Anchor, Stop, Tour, intersect, place_card, watch_line};
 use crate::outbox::Outbox;
@@ -40,10 +41,31 @@ use crate::theme;
 
 const PALETTE_WIDTH: f32 = 230.;
 const INSPECTOR_WIDTH: f32 = 330.;
+/// On a narrow window the palette and the inspector give up width, down to
+/// these, so the canvas keeps [`CANVAS_MIN_WIDTH`].
+const PALETTE_MIN_WIDTH: f32 = 190.;
+const INSPECTOR_MIN_WIDTH: f32 = 260.;
+const CANVAS_MIN_WIDTH: f32 = 480.;
+
+/// The palette's and the inspector's widths in an editor `width` wide: their
+/// own, or narrower by the same share of what the canvas lacks.
+fn side_widths(width: f32) -> (f32, f32) {
+    let sides = PALETTE_WIDTH + INSPECTOR_WIDTH;
+    let short = (sides + CANVAS_MIN_WIDTH - width).max(0.);
+    let narrowed = |own: f32, least: f32| (own - short * own / sides).max(least);
+    (
+        narrowed(PALETTE_WIDTH, PALETTE_MIN_WIDTH),
+        narrowed(INSPECTOR_WIDTH, INSPECTOR_MIN_WIDTH),
+    )
+}
 const PORT: f32 = 18.;
 /// The cards' width, and the coach card's height until it's measured.
 const CARD_WIDTH: f32 = 340.;
 const CARD_HEIGHT: f32 = 200.;
+/// The tour's list of PRs to watch shows about five and scrolls.
+const WATCH_LIST_HEIGHT: f32 = 170.;
+/// Room a dialog leaves to the editor's edges.
+const DIALOG_MARGIN: f32 = 24.;
 /// Room the spotlight leaves around its anchor.
 const SPOT_PAD: f32 = 6.;
 /// The tour's shade over everything but its spotlight: the prototype's
@@ -355,11 +377,11 @@ impl PipelineEditorView {
         }
     }
 
-    fn palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn palette(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let starters = self.starters(cx);
         let mut list = div()
             .id("palette")
-            .w(px(PALETTE_WIDTH))
+            .w(px(width))
             .h_full()
             .flex_none()
             .flex()
@@ -388,13 +410,16 @@ impl PipelineEditorView {
             list = list.child(
                 preset(SharedString::from(format!("palette-{uses}")))
                     .cursor_grab()
-                    .child(mono(format!("+ {label}")).font_weight(FontWeight::SEMIBOLD))
                     .child(
-                        div()
+                        truncated("label", format!("+ {label}"))
+                            .font_family(theme::MONO)
+                            .text_size(theme::MONO_SIZE)
+                            .font_weight(FontWeight::SEMIBOLD),
+                    )
+                    .child(
+                        clamped("detail", detail, 2)
                             .text_xs()
-                            .text_color(theme::DIM)
-                            .line_clamp(2)
-                            .child(detail),
+                            .text_color(theme::DIM),
                     )
                     .when(!item.installed, |this| {
                         this.child(
@@ -430,11 +455,9 @@ impl PipelineEditorView {
                     .cursor_pointer()
                     .child(div().font_weight(FontWeight::SEMIBOLD).child(starter.name))
                     .child(
-                        div()
+                        clamped("blurb", starter.blurb, 2)
                             .text_xs()
-                            .text_color(theme::DIM)
-                            .line_clamp(2)
-                            .child(starter.blurb),
+                            .text_color(theme::DIM),
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         let commands = this.editor.pick_starter(key);
@@ -462,6 +485,7 @@ impl PipelineEditorView {
             .size_full()
             .min_w(px(layout.width + 200.))
             .min_h(px(layout.height + 120.))
+            .child(dot_grid())
             .child(self.edges(&layout).absolute().size_full())
             .on_drag_move::<NodeDrag>(cx.listener(
                 |this, event: &DragMoveEvent<NodeDrag>, _, cx| {
@@ -533,6 +557,7 @@ impl PipelineEditorView {
         div()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .relative()
             .flex()
             .child(
@@ -540,10 +565,10 @@ impl PipelineEditorView {
                     .id("editor-canvas-scroll")
                     .relative()
                     .flex_1()
+                    .min_w_0()
                     .bg(theme::BG)
                     .overflow_scroll()
                     .track_scroll(&self.canvas_scroll)
-                    .child(dot_grid())
                     .child(inner),
             )
             .child(bounds_of(&self.viewport, &self.this))
@@ -674,12 +699,9 @@ impl PipelineEditorView {
                             .gap(px(6.))
                             .child(plain_dot(theme::MUTED))
                             .child(
-                                div()
+                                truncated("name", id.clone())
                                     .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(id.clone()),
+                                    .font_weight(FontWeight::SEMIBOLD),
                             ),
                     )
                     // What the Step lacks matters more than its Plugin's name.
@@ -689,14 +711,16 @@ impl PipelineEditorView {
                         } else {
                             format!("{} · {}", step.uses, info.plugin)
                         };
-                        mono(if info.write {
-                            format!("{uses} · terminal")
-                        } else {
-                            uses
-                        })
-                        .text_xs()
-                        .text_color(theme::DIM)
-                        .truncate()
+                        div()
+                            .font_family(theme::MONO)
+                            .text_xs()
+                            .text_color(theme::DIM)
+                            .truncate()
+                            .child(if info.write {
+                                format!("{uses} · terminal")
+                            } else {
+                                uses
+                            })
                     }))
                     .child(chips),
             )
@@ -805,10 +829,10 @@ impl PipelineEditorView {
             }))
     }
 
-    fn inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn inspector(&self, width: f32, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = div()
             .id("inspector")
-            .w(px(INSPECTOR_WIDTH))
+            .w(px(width))
             .h_full()
             .flex_none()
             .flex()
@@ -847,7 +871,7 @@ impl PipelineEditorView {
             let action = format!("uses-{}", item.uses);
             uses = uses.child(
                 Button::new(SharedString::from(action.clone()))
-                    .label(item.uses.clone())
+                    .long_label(item.uses.clone())
                     .xsmall()
                     .when(item.uses == step.uses, |button| button.accent())
                     .pending(self.outbox.waiting(&action))
@@ -871,7 +895,7 @@ impl PipelineEditorView {
             let action = format!("need-{other}");
             needs = needs.child(
                 Button::new(SharedString::from(action.clone()))
-                    .label(other.clone())
+                    .long_label(other.clone())
                     .xsmall()
                     .when(step.info.needs.contains(&other), |button| button.accent())
                     .pending(self.outbox.waiting(&action))
@@ -898,10 +922,9 @@ impl PipelineEditorView {
                     .flex_col()
                     .gap(px(2.))
                     .child(
-                        div()
+                        truncated("inspector-title", id.to_owned())
                             .text_size(theme::HEADING_SIZE)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(id.to_owned()),
+                            .font_weight(FontWeight::SEMIBOLD),
                     )
                     .child(div().text_size(px(12.)).text_color(theme::DIM).child(
                         if step.info.write {
@@ -1014,13 +1037,18 @@ impl PipelineEditorView {
             };
             rows = rows.child(
                 div()
+                    .id(SharedString::from(format!("gate-row-{id}")))
                     .flex()
                     .flex_col()
                     .gap(px(4.))
                     .py(px(6.))
                     .border_b_1()
                     .border_color(theme::LINE)
-                    .child(mono(info.id))
+                    .child(
+                        truncated("name", info.id)
+                            .font_family(theme::MONO)
+                            .text_size(theme::MONO_SIZE),
+                    )
                     .child(control),
             );
         }
@@ -1167,16 +1195,19 @@ impl PipelineEditorView {
             .border_b_1()
             .border_color(theme::LINE)
             .child(
-                div()
+                truncated("draft-status", status)
                     .flex_1()
-                    .min_w_0()
-                    .truncate()
                     .text_xs()
-                    .text_color(theme::DIM)
-                    .child(status),
+                    .text_color(theme::DIM),
             )
             .when_some(busy, |toolbar, busy| {
-                toolbar.child(div().text_xs().text_color(theme::DIM).child(busy))
+                toolbar.child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme::DIM)
+                        .child(busy),
+                )
             })
             .children(self.busy_refusal())
             .when(!self.tour.on(), |toolbar| {
@@ -1273,6 +1304,7 @@ impl Render for PipelineEditorView {
             self.wire = None;
         }
         let overlay = self.overlay(cx);
+        let (palette, inspector) = side_widths(f32::from(window.viewport_size().width));
         div()
             .flex_1()
             .h_full()
@@ -1280,7 +1312,7 @@ impl Render for PipelineEditorView {
             .flex()
             .overflow_hidden()
             .child(bounds_of(&self.bounds, &self.this))
-            .child(self.palette(cx))
+            .child(self.palette(palette, cx))
             .child(
                 div()
                     .flex_1()
@@ -1292,7 +1324,7 @@ impl Render for PipelineEditorView {
                     .child(self.canvas(cx))
                     .child(self.footer(cx)),
             )
-            .child(self.inspector(cx))
+            .child(self.inspector(inspector, cx))
             .children(overlay)
     }
 }
@@ -1380,26 +1412,35 @@ impl PipelineEditorView {
         ]
     }
 
-    /// Scrolls the canvas so `rect`, in canvas pixels, is in sight.
+    /// Scrolls the canvas so `rect`, in canvas pixels, is in sight. One out
+    /// of sight sideways comes in at the left, which leaves the coach card
+    /// room on its right on a narrow window.
     fn reveal(&self, rect: run_graph::Rect) {
         const MARGIN: f32 = 40.;
         let size = self.viewport.get().size;
         let (width, height) = (f32::from(size.width), f32::from(size.height));
         let offset = self.canvas_scroll.offset();
-        let axis = |offset: f32, start: f32, length: f32, room: f32| {
-            let seen = -offset;
-            if start + length + MARGIN > seen + room {
-                -(start + length + MARGIN - room).min(start - MARGIN).max(0.)
-            } else if start < seen {
+        let seen = |offset: f32, start: f32, length: f32, room: f32| {
+            start >= -offset && start + length + MARGIN <= -offset + room
+        };
+        let x = if seen(f32::from(offset.x), rect.x, rect.width, width) {
+            f32::from(offset.x)
+        } else {
+            -(rect.x - MARGIN).max(0.)
+        };
+        let y = {
+            let (offset, start, length) = (f32::from(offset.y), rect.y, rect.height);
+            if start + length + MARGIN > -offset + height {
+                -(start + length + MARGIN - height)
+                    .min(start - MARGIN)
+                    .max(0.)
+            } else if start < -offset {
                 -(start - MARGIN).max(0.)
             } else {
                 offset
             }
         };
-        let to = gpui_kit::Point {
-            x: px(axis(f32::from(offset.x), rect.x, rect.width, width)),
-            y: px(axis(f32::from(offset.y), rect.y, rect.height, height)),
-        };
+        let to = gpui_kit::Point { x: px(x), y: px(y) };
         if to != offset {
             // The canvas then paints at its new origin, which redraws.
             self.canvas_scroll.set_offset(to);
@@ -1526,9 +1567,14 @@ impl PipelineEditorView {
 
     /// The repo's open PRs, each with Watch or Unwatch.
     fn watch_list(&self, draft: &PipelineDraft, cx: &mut Context<Self>) -> Div {
-        let mut list = div().flex().flex_col();
+        let mut prs = div()
+            .id("tour-prs")
+            .flex()
+            .flex_col()
+            .max_h(px(WATCH_LIST_HEIGHT))
+            .overflow_y_scroll();
         if self.prs.is_empty() {
-            list = list.child(
+            prs = prs.child(
                 div()
                     .text_xs()
                     .text_color(theme::DIM)
@@ -1539,8 +1585,10 @@ impl PipelineEditorView {
             let (number, watched) = (pr.number, pr.watched());
             let (action, command) = toggle_watch(pr);
             let refused = refusal(&self.outbox, &action);
-            list = list.child(
+            prs = prs.child(
                 div()
+                    .id(SharedString::from(format!("tour-pr-{number}")))
+                    .flex_none()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1559,11 +1607,12 @@ impl PipelineEditorView {
                             })),
                     )
                     .child(div().text_color(theme::DIM).child(format!("#{number}")))
-                    .child(div().flex_1().min_w_0().truncate().child(pr.title.clone()))
+                    .child(truncated("title", pr.title.clone()).flex_1())
                     .children(watch_line(pr).map(|line| div().text_color(theme::INC).child(line)))
                     .children(refused),
             );
         }
+        let mut list = div().flex().flex_col().child(prs);
         if draft.published.is_some() {
             list = list.child(self.publish_actions(draft, cx).mt(px(8.)));
         }
@@ -1578,6 +1627,8 @@ impl PipelineEditorView {
             .id("paste-secret")
             .occlude()
             .w(px(CARD_WIDTH))
+            .max_h(px((room.height - 2. * DIALOG_MARGIN).max(0.)))
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(10.))
@@ -1769,7 +1820,10 @@ fn gate_term(term: &GateTerm, cx: &mut Context<PipelineEditorView>) -> AnyElemen
             .gap(px(6.))
             .text_size(px(12.))
             .child(plain_dot(theme::MUTED))
-            .child(div().min_w_0().truncate().child(id.clone()))
+            .child(truncated(
+                SharedString::from(format!("term-{id}")),
+                id.clone(),
+            ))
             .when(*accepts_skipped, |this| {
                 this.child(chip(ChipKind::Required, "skip ok").flex_none())
             })
@@ -1780,8 +1834,10 @@ fn gate_term(term: &GateTerm, cx: &mut Context<PipelineEditorView>) -> AnyElemen
             .flex()
             .items_center()
             .text_size(px(12.))
-            .truncate()
-            .child(text.clone())
+            .child(truncated(
+                SharedString::from(format!("term-{text}")),
+                text.clone(),
+            ))
             .into_any_element(),
     }
 }
@@ -1851,4 +1907,22 @@ fn preset(id: SharedString) -> Stateful<Div> {
         .border_color(theme::LINE)
         .bg(theme::PANEL)
         .hover(|this| this.border_color(theme::DIM))
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: gpui's own `test` attribute would shadow the std one.
+    use super::{
+        CANVAS_MIN_WIDTH, INSPECTOR_MIN_WIDTH, INSPECTOR_WIDTH, PALETTE_MIN_WIDTH, PALETTE_WIDTH,
+        side_widths,
+    };
+
+    #[test]
+    fn the_palette_and_inspector_narrow_to_keep_the_canvas() {
+        assert_eq!(side_widths(1440.), (PALETTE_WIDTH, INSPECTOR_WIDTH));
+        let (palette, inspector) = side_widths(960.);
+        assert_eq!(palette + inspector + CANVAS_MIN_WIDTH, 960.);
+        assert!(palette < PALETTE_WIDTH && inspector < INSPECTOR_WIDTH);
+        assert_eq!(side_widths(400.), (PALETTE_MIN_WIDTH, INSPECTOR_MIN_WIDTH));
+    }
 }

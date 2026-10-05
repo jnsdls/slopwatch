@@ -20,8 +20,8 @@ use slopwatch_protocol::{
 
 use crate::agent::Agent;
 use crate::components::{
-    self, Ask, ButtonLooks, ChipKind, ask_card, chip, dot, gate_pill, mono, run_pill, section,
-    segment, severity, strip, verdict_label, well,
+    self, Ask, ButtonLooks, ChipKind, ask_card, chip, dot, gate_pill, hover_text, mono, run_pill,
+    section, segment, severity, strip, truncated, verdict_label, well,
 };
 use crate::dock;
 use crate::inbox::{
@@ -44,8 +44,8 @@ use crate::prs::{
 };
 use crate::run_graph_view::run_graph;
 use crate::run_pane::{
-    GRAPH_MODE_LIST_WIDTH, Look, PANE_PADDING, RunMode, RunPane, WaiveTarget, commit_line,
-    end_label, run_look, split_at_gate, step_look, step_state, waiver_line,
+    Look, PANE_PADDING, PR_PANE_MIN_WIDTH, RunMode, RunPane, WaiveTarget, commit_line, end_label,
+    list_width, run_look, split_at_gate, step_look, step_state, waiver_line,
 };
 use crate::secrets::missing_secret;
 use crate::secrets_view::SecretsView;
@@ -55,10 +55,19 @@ use crate::theme;
 
 /// How see-through a PR list row is when it doesn't open.
 const DIM: f32 = 0.55;
-/// The prototype's column widths: the sources pane, then the PR list or
-/// the Inbox. The PR pane takes the rest.
+/// The sources pane's width, from the prototype. The list beside it is
+/// [`list_width`].
 const SOURCES_WIDTH: f32 = 210.;
-const LIST_WIDTH: f32 = 380.;
+/// The window can't get smaller than this: the sources pane, the narrowest
+/// list and the narrowest PR pane side by side.
+pub const MIN_WINDOW: (f32, f32) = (960., 600.);
+/// A PR row's repo and number keep this much of the row from its Step
+/// strip.
+const REPO_MIN_WIDTH: f32 = 110.;
+/// A Stack's PRs step in this far at most, however deep the Stack.
+const MAX_INDENT_LEVELS: usize = 3;
+/// The Run history chips show this high, about three rows, and scroll.
+const RUN_HISTORY_HEIGHT: f32 = 84.;
 /// The PR list row under the mouse, which shows its Unwatch button.
 const ROW_GROUP: &str = "pr-row";
 
@@ -84,9 +93,9 @@ fn waive_action(target: &WaiveTarget) -> String {
 }
 
 /// A PR list row's left padding: a Stack's PRs step in one level per
-/// parent.
+/// parent, up to [`MAX_INDENT_LEVELS`].
 fn row_indent(row: PrRow<'_>) -> Pixels {
-    px(12.0 + 20.0 * row.depth() as f32)
+    px(12.0 + 20.0 * row.depth().min(MAX_INDENT_LEVELS) as f32)
 }
 
 /// What fills the window right of the sources pane.
@@ -468,7 +477,7 @@ impl MainView {
                 .cursor_pointer()
                 .when(selected, |this| this.bg(theme::CHOSEN))
                 .when(!selected, |this| this.hover(|this| this.bg(theme::HOVER)))
-                .child(div().truncate().child(label))
+                .child(truncated("label", label))
                 .children(count)
         };
         let counted = |n: usize| (n > 0).then(|| components::count(n, false));
@@ -666,6 +675,7 @@ impl MainView {
     fn repo_picker(&self, available: &[RepoName], cx: &mut Context<Self>) -> impl IntoElement {
         let mut card = components::card()
             .w(px(560.))
+            .max_h_full()
             .p(px(16.))
             .gap(px(4.))
             .child(
@@ -685,17 +695,29 @@ impl MainView {
         if available.is_empty() {
             card = card.child(div().text_color(theme::DIM).child("None left to add."));
         }
+        let mut repos = div()
+            .id("picker-repos")
+            .flex_shrink(1.)
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll();
         for repo in available {
             let chosen = repo.clone();
-            card = card.child(
+            repos = repos.child(
                 div()
                     .id(SharedString::from(format!("add-{repo}")))
+                    .flex_none()
                     .py(px(6.))
                     .border_b_1()
                     .border_color(theme::LINE)
                     .cursor_pointer()
                     .hover(|this| this.text_color(theme::ACCENT))
-                    .child(mono(repo.to_string()))
+                    .child(
+                        truncated("repo", repo.to_string())
+                            .font_family(theme::MONO)
+                            .text_size(theme::MONO_SIZE),
+                    )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.send(Command::AddRepo {
                             repo: chosen.clone(),
@@ -709,6 +731,7 @@ impl MainView {
             );
         }
         card = card
+            .child(repos)
             .child(div().pt(px(6.)).text_xs().text_color(theme::DIM).child(
                 "From gh: repos you can push to. The daemon makes its own blobless clone, \
                  never your checkout.",
@@ -727,22 +750,26 @@ impl MainView {
         div()
             .relative()
             .flex_1()
+            .min_w_0()
             .h_full()
             .flex()
             .items_center()
             .justify_center()
+            .p(px(24.))
             .child(components::dot_grid())
             .child(card)
     }
 
-    /// The PR list's or the Inbox's column: fixed, and narrower while the
-    /// PR pane draws a graph.
-    fn list_column(&self, id: &'static str) -> Stateful<Div> {
-        let width = if self.run_pane.graph_shown() {
-            GRAPH_MODE_LIST_WIDTH
+    /// The PR list's or the Inbox's column: narrower while the PR pane draws
+    /// a graph, and on a narrow window.
+    fn list_column(&self, id: &'static str, window: &Window) -> Stateful<Div> {
+        let left = if self.sources_shown() {
+            SOURCES_WIDTH
         } else {
-            LIST_WIDTH
+            0.
         };
+        let window_width = f32::from(window.viewport_size().width);
+        let width = list_width(window_width, left, self.run_pane.graph_shown());
         div()
             .id(id)
             .w(px(width))
@@ -755,8 +782,8 @@ impl MainView {
             .overflow_y_scroll()
     }
 
-    fn pr_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = self.list_column("pr-list");
+    fn pr_list(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut list = self.list_column("pr-list", window);
         let rows = self.prs.rows();
         if rows.is_empty() {
             let empty = if !self.prs.loaded() {
@@ -837,12 +864,9 @@ impl MainView {
                         .child(if stack.expanded { "▾" } else { "▸" }),
                 )
                 .child(
-                    div()
+                    truncated("title", stack.title())
                         .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(stack.title()),
+                        .font_weight(FontWeight::SEMIBOLD),
                 )
                 .children(gate),
         )
@@ -863,13 +887,9 @@ impl MainView {
                         .text_color(tone)
                         .child(stack.status_line()),
                 )
-                .children(attention.map(|line| {
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_color(theme::DIM)
-                        .child(line)
-                })),
+                .children(
+                    attention.map(|line| truncated("attention", line).text_color(theme::DIM)),
+                ),
         )
     }
 
@@ -886,17 +906,15 @@ impl MainView {
             row,
         )
         .opacity(DIM)
+        .child(truncated("title", parent.title.clone()).font_weight(FontWeight::SEMIBOLD))
         .child(
-            div()
-                .truncate()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(parent.title.clone()),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme::DIM)
-                .child(format!("{repo}#{} · not yours, not watched", parent.number)),
+            truncated(
+                "repo",
+                format!("{repo}#{} · not yours, not watched", parent.number),
+            )
+            .text_ellipsis_middle()
+            .text_xs()
+            .text_color(theme::DIM),
         )
     }
 
@@ -963,12 +981,9 @@ impl MainView {
                 .items_center()
                 .gap_2()
                 .child(
-                    div()
+                    truncated("title", pr.title.clone())
                         .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(pr.title.clone()),
+                        .font_weight(FontWeight::SEMIBOLD),
                 )
                 .children(latest.map(run_pill)),
         )
@@ -978,13 +993,13 @@ impl MainView {
                 .items_center()
                 .gap_2()
                 .child(
-                    div()
+                    // The number matters as much as the repo's name.
+                    truncated("repo", format!("{}#{}", pr.repo, pr.number))
+                        .text_ellipsis_middle()
                         .flex_1()
-                        .min_w_0()
-                        .truncate()
+                        .min_w(px(REPO_MIN_WIDTH))
                         .text_xs()
-                        .text_color(theme::DIM)
-                        .child(format!("{}#{}", pr.repo, pr.number)),
+                        .text_color(theme::DIM),
                 )
                 .children(latest.map(|run| strip(&run.strip))),
         )
@@ -994,12 +1009,10 @@ impl MainView {
                 .items_center()
                 .gap_2()
                 .child(
-                    div()
+                    truncated("status", status)
                         .flex_1()
-                        .min_w_0()
                         .text_size(px(12.))
-                        .text_color(tone)
-                        .child(status),
+                        .text_color(tone),
                 )
                 .child(toggle),
         )
@@ -1008,8 +1021,8 @@ impl MainView {
 
     /// Every open entry, oldest first. Clicking one opens its first PR in
     /// the PR pane.
-    fn inbox_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = self.list_column("inbox-list").gap_2().p(px(12.));
+    fn inbox_list(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut list = self.list_column("inbox-list", window).gap_2().p(px(12.));
         if let Some(text) = notice(SystemCenter::new(cx).permission()) {
             list = list.child(
                 components::card()
@@ -1040,10 +1053,9 @@ impl MainView {
             let card = self
                 .entry_card(entry, "inbox", false, cx)
                 .child(
-                    div()
+                    truncated("held", held_line(entry))
                         .text_xs()
-                        .text_color(theme::DIM)
-                        .child(held_line(entry)),
+                        .text_color(theme::DIM),
                 )
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1196,7 +1208,7 @@ impl MainView {
         let mut pane = div()
             .id("pr-pane")
             .flex_1()
-            .min_w_0()
+            .min_w(px(PR_PANE_MIN_WIDTH))
             .h_full()
             .flex()
             .flex_col()
@@ -1233,12 +1245,9 @@ impl MainView {
                         .items_center()
                         .gap(px(10.))
                         .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
+                            truncated("pr-title", pr.title.clone())
                                 .text_size(theme::TITLE_SIZE)
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(pr.title.clone()),
+                                .font_weight(FontWeight::SEMIBOLD),
                         )
                         .children(shown.map(run_pill)),
                 )
@@ -1249,8 +1258,15 @@ impl MainView {
                         .gap_1()
                         .text_xs()
                         .text_color(theme::DIM)
-                        .child(format!("{}#{} ·", pr.repo, pr.number))
-                        .child(components::link("pr-link", "PR on GitHub ↗", url)),
+                        .child(
+                            truncated("pr-repo", format!("{}#{} ·", pr.repo, pr.number))
+                                .text_ellipsis_middle(),
+                        )
+                        .child(
+                            components::link("pr-link", "PR on GitHub ↗", url)
+                                .flex_none()
+                                .whitespace_nowrap(),
+                        ),
                 ),
         );
         if let Some(blocked) = &pr.blocked {
@@ -1274,7 +1290,13 @@ impl MainView {
             return pane.child(div().text_color(theme::DIM).child("No Runs yet."));
         }
 
-        let mut chips = div().flex().flex_wrap().gap(px(6.));
+        let mut chips = div()
+            .id("run-history")
+            .flex()
+            .flex_wrap()
+            .gap(px(6.))
+            .max_h(px(RUN_HISTORY_HEIGHT))
+            .overflow_y_scroll();
         for run in &pr.runs {
             let on = self.run_pane.shown() == Some(run.id);
             let (id, row) = (run.id, pr.clone());
@@ -1375,29 +1397,39 @@ impl MainView {
 
     /// One line about the shown Run: its number, head SHA, time, cost and
     /// where its Pipeline came from, then the List/Graph toggle and Cancel
-    /// Run.
+    /// Run. Where the facts don't fit, they're cut and show whole on hover.
     fn run_line(&self, view: &RunView, cx: &mut Context<Self>) -> impl IntoElement {
         let short = |sha: &str| sha.chars().take(7).collect::<String>();
         let shown = self.run_pane.shown().map_or(0, |run| run.0);
-        let mut facts = div()
+        let head = short(&view.head_sha);
+        let mut rest = Vec::new();
+        if let Some(time) = self.run_pane.run_time(now_millis()) {
+            let so_far = if view.end.is_some() { "" } else { " so far" };
+            rest.push(format!("{time}{so_far}"));
+        }
+        if let Some(cost) = view.cost() {
+            rest.push(cost.to_string());
+        }
+        rest.push(format!(
+            "Pipeline from {} at {}",
+            view.base,
+            short(&view.base_sha)
+        ));
+        let rest = format!("· {}", rest.join(" · "));
+        let whole = SharedString::from(format!("Run {shown} · {head} {rest}"));
+        let facts = div()
+            .id("run-facts")
             .flex_1()
             .min_w_0()
             .flex()
-            .flex_wrap()
             .items_center()
             .gap_1()
-            .child(format!("Run {shown} ·"))
-            .child(mono(short(&view.head_sha)).text_color(theme::TEXT));
-        if let Some(time) = self.run_pane.run_time(now_millis()) {
-            let so_far = if view.end.is_some() { "" } else { " so far" };
-            facts = facts.child(format!("· {time}{so_far}"));
-        }
-        if let Some(cost) = view.cost() {
-            facts = facts.child(format!("· {cost}"));
-        }
-        facts = facts
-            .child(format!("· Pipeline from {} at", view.base))
-            .child(mono(short(&view.base_sha)));
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(div().flex_none().child(format!("Run {shown} ·")))
+            .child(mono(head).flex_none().text_color(theme::TEXT))
+            .child(div().min_w_0().truncate().child(rest))
+            .tooltip(move |window, cx| hover_text(whole.clone(), window, cx));
         let mode = self.run_pane.mode();
         let mut toggle = div().flex_none().flex();
         for (index, each) in RunMode::ALL.into_iter().enumerate() {
@@ -1483,13 +1515,10 @@ impl MainView {
                 )
                 .child(gate_pill(gate))
                 .child(
-                    div()
+                    truncated("gate-reads", reads.join(" · "))
                         .flex_1()
-                        .min_w_0()
-                        .truncate()
                         .text_xs()
-                        .text_color(theme::DIM)
-                        .child(reads.join(" · ")),
+                        .text_color(theme::DIM),
                 )
                 .when(self.run_pane.can_override(), |this| {
                     this.child(self.override_button(cx))
@@ -1612,12 +1641,9 @@ impl MainView {
             }))
             .child(dot(look))
             .child(
-                div()
+                truncated("name", info.id.clone())
                     .flex_shrink(1.)
-                    .min_w_0()
-                    .truncate()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(info.id.clone()),
+                    .font_weight(FontWeight::SEMIBOLD),
             )
             .when(info.write, |this| {
                 this.child(chip(ChipKind::Write, "commit ends Run").flex_none())
@@ -1633,13 +1659,12 @@ impl MainView {
                 this.child(chip(ChipKind::Plain, text).flex_none())
             })
             .child(div().flex_1())
+            // The reason gives up its width before the Step's name does.
             .children(skip_reason.map(|reason| {
-                div()
-                    .min_w_0()
-                    .truncate()
+                truncated("skip-reason", reason)
+                    .flex_shrink(4.)
                     .text_xs()
                     .text_color(theme::DIM)
-                    .child(reason)
             }))
             .child(verdict_label(look, label))
             .child(
@@ -1762,7 +1787,7 @@ impl MainView {
             if !outputs.findings.is_empty() {
                 body = body.child(section("Findings").mt(px(6.)));
             }
-            for finding in &outputs.findings {
+            for (index, finding) in outputs.findings.iter().enumerate() {
                 let place = match (&finding.file, finding.line) {
                     (Some(file), Some(line)) => Some(format!("{file}:{line}")),
                     (Some(file), None) => Some(file.clone()),
@@ -1778,12 +1803,19 @@ impl MainView {
                         .child(severity(finding.severity))
                         .child(
                             div()
+                                .flex_1()
                                 .min_w_0()
                                 .flex()
-                                .flex_wrap()
-                                .gap_x(px(6.))
+                                .flex_col()
                                 .child(finding.message.clone())
-                                .children(place.map(|place| mono(place).text_color(theme::DIM))),
+                                .children(place.map(|place| {
+                                    // The file and line matter more than the dirs.
+                                    truncated(("finding-place", index), place)
+                                        .text_ellipsis_start()
+                                        .font_family(theme::MONO)
+                                        .text_size(theme::MONO_SIZE)
+                                        .text_color(theme::DIM)
+                                })),
                         ),
                 );
             }
@@ -1893,7 +1925,7 @@ impl MainView {
                     .child("Not started yet."),
             );
         }
-        let mut lines = well().max_h(px(140.)).overflow_hidden();
+        let mut lines = well().id("log-tail").max_h(px(140.)).overflow_y_scroll();
         let mut any = false;
         for record in self.run_pane.tail() {
             any = true;
@@ -1956,9 +1988,7 @@ impl MainView {
                     })),
             )
             .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(viewer.key.step.clone()),
+                truncated("log-step", viewer.key.step.clone()).font_weight(FontWeight::SEMIBOLD),
             );
         if attempts > 1 {
             for attempt in (1..=attempts).rev() {
@@ -2130,6 +2160,7 @@ impl MainView {
         let name = repo.as_ref().map_or_else(String::new, ToString::to_string);
         div()
             .flex_1()
+            .min_w_0()
             .h_full()
             .flex()
             .flex_col()
@@ -2156,14 +2187,22 @@ impl MainView {
                     )
                     .child(
                         div()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child(name))
-                            .child(div().text_color(theme::DIM).child("› Pipeline")),
+                            .child(truncated("repo", name).font_weight(FontWeight::SEMIBOLD))
+                            .child(div().flex_none().text_color(theme::DIM).child("› Pipeline")),
                     ),
             )
-            .child(div().flex_1().min_h_0().flex().child(self.pipeline.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .flex()
+                    .child(self.pipeline.clone()),
+            )
     }
 
     fn footer(&self) -> Option<impl IntoElement> {
@@ -2174,6 +2213,7 @@ impl MainView {
         };
         Some(
             div()
+                .flex()
                 .px(px(14.))
                 .py(px(4.))
                 .bg(theme::PANEL)
@@ -2181,7 +2221,7 @@ impl MainView {
                 .border_color(theme::LINE)
                 .text_xs()
                 .text_color(color)
-                .child(text),
+                .child(truncated("footer", text)),
         )
     }
 }
@@ -2203,7 +2243,7 @@ fn now_millis() -> i64 {
 }
 
 impl Render for MainView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let root = div()
             .size_full()
             .flex()
@@ -2219,14 +2259,17 @@ impl Render for MainView {
             div()
                 .flex_1()
                 .min_h_0()
+                .min_w_0()
                 .flex()
                 .overflow_hidden()
                 .when(self.sources_shown(), |this| this.child(self.sources(cx)))
                 .map(|this| match (&self.picker, self.pane) {
                     (Some(available), _) => this.child(self.repo_picker(available, cx)),
                     (None, pane) => match pane {
-                        Pane::Prs => this.child(self.pr_list(cx)).child(self.pr_pane(cx)),
-                        Pane::Inbox => this.child(self.inbox_list(cx)).child(self.pr_pane(cx)),
+                        Pane::Prs => this.child(self.pr_list(window, cx)).child(self.pr_pane(cx)),
+                        Pane::Inbox => this
+                            .child(self.inbox_list(window, cx))
+                            .child(self.pr_pane(cx)),
                         Pane::Library => this.child(self.library.clone()),
                         Pane::Secrets => this.child(self.secrets.clone()),
                         Pane::Pipeline => this.child(self.pipeline_pane(cx)),

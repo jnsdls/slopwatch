@@ -307,7 +307,8 @@ const GAP: f32 = 16.;
 /// tries the right, left, below and above, in that order, and takes the
 /// first side with room that covers nothing in `keep_clear`, such as the
 /// Steps after the Gate. When every side covers something, it takes the
-/// side that covers least. All rects share one coordinate space.
+/// side that covers least, and covering the anchor itself counts as worse
+/// than covering any other Step. All rects share one coordinate space.
 pub fn place_card(anchor: Rect, size: (f32, f32), room: Rect, keep_clear: &[Rect]) -> Point {
     let (width, height) = size;
     let sides = [
@@ -351,11 +352,9 @@ pub fn place_card(anchor: Rect, size: (f32, f32), room: Rect, keep_clear: &[Rect
             width,
             height,
         };
-        keep_clear
-            .iter()
-            .chain([&anchor])
-            .map(|other| overlap(card, *other))
-            .sum::<f32>()
+        let others: f32 = keep_clear.iter().map(|other| overlap(card, *other)).sum();
+        // Every Step together covers less than the whole canvas.
+        others + overlap(card, anchor) * (room.width * room.height)
     };
     // A side with room comes first; failing all, each side clamped into
     // the room.
@@ -641,6 +640,23 @@ mod tests {
         assert!(!covers(at, size, gate), "{at:?} covers the Gate");
         assert!(at.x >= 0. && at.x + size.0 <= room.width, "{at:?}");
         assert!(at.y >= 0. && at.y + size.1 <= room.height, "{at:?}");
+    }
+
+    #[test]
+    fn with_no_clear_side_the_card_covers_another_step_before_its_anchor() {
+        // The editor at its narrowest: Fix spotlit near the right, too
+        // close to the edge for the card beside it, Merge below it and the
+        // Gate to its left.
+        let room = rect(0., 0., 960., 560.);
+        let fix = rect(460., 160., 164., 78.);
+        let merge = rect(460., 252., 164., 78.);
+        let gate = rect(240., 160., 184., 160.);
+        let size = (340., 190.);
+
+        let at = place_card(fix, size, room, &[fix, merge, gate]);
+
+        assert!(!covers(at, size, fix), "{at:?} covers the anchor");
+        assert!(at.x >= 0. && at.x + size.0 <= room.width, "{at:?}");
     }
 
     #[test]

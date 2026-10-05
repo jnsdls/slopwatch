@@ -5,6 +5,7 @@
 //! the section labels, wells and buttons around them.
 
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_core::GateState;
@@ -137,8 +138,15 @@ pub fn plain_dot(color: Rgba) -> Div {
 }
 
 /// A PR row's Step strip: a dot per Step and a tick where the Gate sits.
+/// A Pipeline too long for the row loses the dots past its end.
 pub fn strip(marks: &[StripMark]) -> Div {
-    let mut strip = div().flex_none().flex().items_center().gap(px(3.));
+    let mut strip = div()
+        .flex_shrink(1.)
+        .min_w_0()
+        .overflow_hidden()
+        .flex()
+        .items_center()
+        .gap(px(3.));
     for mark in marks {
         strip = strip.child(match Look::of_mark(*mark) {
             Some(look) => dot(look),
@@ -151,6 +159,50 @@ pub fn strip(marks: &[StripMark]) -> Div {
         });
     }
     strip
+}
+
+/// How wide a tooltip grows before its text wraps.
+const TOOLTIP_WIDTH: f32 = 420.;
+
+/// Text that can be long, such as a PR title, a repo name or a path, on one
+/// line: cut with an ellipsis where it doesn't fit, and whole on hover.
+pub fn truncated(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Stateful<Div> {
+    let text = text.into();
+    div()
+        .id(id)
+        .min_w_0()
+        .truncate()
+        .child(text.clone())
+        .tooltip(move |window, cx| hover_text(text.clone(), window, cx))
+}
+
+/// Text cut to `lines` lines, the last ending in an ellipsis where it's
+/// cut, and whole on hover.
+pub fn clamped(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    lines: usize,
+) -> Stateful<Div> {
+    let text = text.into();
+    div()
+        .id(id)
+        .min_w_0()
+        .line_clamp(lines)
+        .text_ellipsis()
+        .child(text.clone())
+        .tooltip(move |window, cx| hover_text(text.clone(), window, cx))
+}
+
+/// The tooltip that shows a truncated text whole.
+pub fn hover_text(text: SharedString, window: &mut Window, cx: &mut App) -> AnyView {
+    Tooltip::element(move |_, _| {
+        div()
+            .max_w(px(TOOLTIP_WIDTH))
+            .whitespace_normal()
+            .text_xs()
+            .child(text.clone())
+    })
+    .build(window, cx)
 }
 
 /// A Verdict or state in its colour: the prototype's `.vl`.
@@ -257,11 +309,10 @@ pub fn ask_card(ask: Ask, kicker: &str) -> Div {
         .border_color(line)
         .bg(bg)
         .child(
-            div()
+            truncated("kicker", kicker.to_uppercase())
                 .text_size(theme::LABEL_SIZE)
                 .font_weight(FontWeight::BOLD)
-                .text_color(fg)
-                .child(kicker.to_uppercase()),
+                .text_color(fg),
         )
 }
 
@@ -345,6 +396,23 @@ pub trait ButtonLooks {
     fn approve(self) -> Self;
     /// The red Reject, Cancel Run or Remove.
     fn reject(self) -> Self;
+    /// A label that can be long, such as a Step's name: a button can't
+    /// truncate its own, so one past [`LABEL_CHARS`] is cut with an
+    /// ellipsis and shows whole on hover.
+    fn long_label(self, text: impl Into<String>) -> Self;
+}
+
+/// The most characters a button's [`ButtonLooks::long_label`] shows.
+pub const LABEL_CHARS: usize = 32;
+
+/// `text` cut to `max` characters, the last an ellipsis, or `None` when it
+/// fits.
+pub fn shortened(text: &str, max: usize) -> Option<String> {
+    if text.chars().count() <= max {
+        return None;
+    }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    Some(format!("{kept}…"))
 }
 
 impl ButtonLooks for Button {
@@ -358,6 +426,14 @@ impl ButtonLooks for Button {
 
     fn reject(self) -> Self {
         self.danger().border_1().border_color(theme::FAIL_LINE)
+    }
+
+    fn long_label(self, text: impl Into<String>) -> Self {
+        let text = text.into();
+        match shortened(&text, LABEL_CHARS) {
+            Some(short) => self.label(short).tooltip(text),
+            None => self.label(text),
+        }
     }
 }
 
@@ -386,4 +462,17 @@ pub fn dot_grid() -> impl IntoElement {
     )
     .absolute()
     .size_full()
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: gpui's own `test` attribute would shadow the std one.
+    use super::shortened;
+
+    #[test]
+    fn a_long_label_is_cut_to_the_limit_with_an_ellipsis() {
+        assert_eq!(shortened("merge", 8), None);
+        assert_eq!(shortened("12345678", 8), None);
+        assert_eq!(shortened("123456789", 8).as_deref(), Some("1234567…"));
+    }
 }
