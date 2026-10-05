@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use gpui_kit::*;
 use slopwatch_client::agent::Agent;
 use slopwatch_client::link::{self, Pace};
-use slopwatch_client::main_view::MainView;
+use slopwatch_client::main_view::{self, MainView};
 use slopwatch_client::notifications;
 use slopwatch_client::outbox::Outbox;
 use slopwatch_protocol::{Flavor, socket_path};
@@ -57,8 +57,10 @@ fn main() {
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_window_closed(|cx, _| cx.quit()).detach();
 
+        let (min_width, min_height) = main_view::MIN_WINDOW;
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(960.), px(600.)), cx)),
+            window_bounds: Some(WindowBounds::centered(size(px(1200.), px(760.)), cx)),
+            window_min_size: Some(size(px(min_width), px(min_height))),
             titlebar: Some(TitlebarOptions {
                 title: Some(Flavor::CURRENT.app_name().into()),
                 ..Default::default()

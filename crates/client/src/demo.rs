@@ -8,7 +8,9 @@
 //! in the tour fills the draft.
 //!
 //! The fixture is [`prs`], [`inbox`] and the Pipelines in [`PIPELINES`].
-//! Add a PR or a Run there to put it on screen.
+//! Add a PR or a Run there to put it on screen. [`LONG_REPO`] holds the
+//! stress cases: a 200-character title, a 30-Step Pipeline, 30 Runs on one
+//! PR and a 20-PR Stack, so every screen can be checked for overflow.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc::Receiver;
@@ -20,13 +22,14 @@ use slopwatch_core::{
     Resolver, STARTERS, Verdict, Workspace, flow_style, library_step_plugin, load,
 };
 use slopwatch_protocol::pipeline::{DraftBase, DraftStep, PaletteItem, PipelineDraft, PipelinePr};
-use slopwatch_protocol::step::{Finding, Outputs, Severity, Usage};
+use slopwatch_protocol::step::{EffectKind, Finding, Outputs, Severity, Usage};
 use slopwatch_protocol::{
     Cause, Cli, CliListing, CliSettings, CliStatus, Command, DaemonSettings, EntryId, GateTerm,
-    Inbox, InboxEntry, InboxUpdate, LibraryStep, PluginListing, PollState, PrRef, PrStatus,
-    PullRequest, Reply, RepoName, RequestId, Response, ResponseBody, RunEvent, RunId, RunSummary,
-    RunView, Scope, SecretInfo, StackParent, StackPlace, StepInfo, StepStatus, StripMark, Topic,
-    TopicUpdate, WatchedPrs, WatchedPrsDelta, WatchedPrsUpdate,
+    Grant, Inbox, InboxEntry, InboxUpdate, LibraryStep, LogLevel, LogRecord, LogSource,
+    PluginListing, PluginSettings, PollState, PrRef, PrStatus, PullRequest, Reply, RepoName,
+    RequestId, Response, ResponseBody, RunEvent, RunId, RunSummary, RunView, Scope, SecretInfo,
+    StackParent, StackPlace, StepInfo, StepLogPage, StepStatus, StripMark, Topic, TopicUpdate,
+    WatchedPrs, WatchedPrsDelta, WatchedPrsUpdate,
 };
 
 use crate::link::{LinkEvent, LinkState};
@@ -78,8 +81,98 @@ gate: [ci, claude-review]
     ),
 ];
 
-/// Repos the picker offers, which have no Pipeline yet.
-const AVAILABLE: &[&str] = &["jnsdls/dotfiles", "typesafe-ai/web"];
+/// A repo with a long name, whose Pipeline has 30 Steps: [`long_pipeline`].
+const LONG_REPO: &str = "acme-platform-engineering/internal-developer-experience-monorepo";
+
+/// A PR title 200 characters long.
+const LONG_TITLE: &str = "Migrate the webhook ingest, billing reconciliation and audit-log \
+                          exporters from the legacy v1 queue onto the partitioned event bus, \
+                          with dual writes, a resumable backfill job and a kill switch per org";
+
+/// The 25 checks in [`long_pipeline`], beside its CI, review, Human Step,
+/// Merge and Fix.
+const LONG_CHECKS: [&str; 25] = [
+    "scope-matches-issue",
+    "description-matches-diff",
+    "migrations-are-reversible-and-idempotent-on-a-copy-of-production",
+    "no-new-public-api-without-docs",
+    "feature-flags-default-off",
+    "changelog-entry",
+    "license-headers",
+    "no-secrets-in-diff",
+    "bundle-size-budget",
+    "accessibility-labels",
+    "i18n-strings-extracted",
+    "error-messages-are-actionable",
+    "metrics-have-owners",
+    "dashboards-updated",
+    "runbook-updated",
+    "rollback-plan",
+    "load-test-p99-under-budget",
+    "dependency-licences",
+    "sbom-updated",
+    "tests-cover-new-branches",
+    "no-todo-without-a-ticket",
+    "api-backward-compatible",
+    "schema-versioned",
+    "cache-keys-namespaced",
+    "retry-policy-bounded",
+];
+
+/// The long repo's Human Step.
+const LONG_HUMAN: &str = "approve-the-production-rollout-plan-with-the-on-call-sre";
+
+/// [`LONG_REPO`]'s Pipeline: CI, 25 checks and a review before the Gate, a
+/// Human Step after the review, then Merge and Fix. Ten of them in the Gate.
+fn long_pipeline() -> String {
+    let mut text = "version: 1\nsteps:\n  ci: { uses: ci }\n".to_owned();
+    for check in LONG_CHECKS {
+        text += &format!("  {check}: {{ uses: jev, needs: [ci] }}\n");
+    }
+    text += "  claude-review: { uses: lib/claude-review, needs: [ci] }\n";
+    text += &format!("  {LONG_HUMAN}: {{ uses: human, needs: [claude-review] }}\n");
+    text += "  merge: { uses: merge, needs: [gate] }\n";
+    text += "  claude-fix: { uses: lib/claude-fix, needs: [gate] }\n";
+    let gated = ["ci", "claude-review", LONG_HUMAN]
+        .into_iter()
+        .chain(LONG_CHECKS.into_iter().take(7));
+    text += &format!("gate: [{}]\n", gated.collect::<Vec<_>>().join(", "));
+    text
+}
+
+/// Every demo repo's Pipeline text.
+fn pipelines() -> Vec<(&'static str, String)> {
+    PIPELINES
+        .iter()
+        .map(|(repo, text)| (*repo, (*text).to_owned()))
+        .chain([(LONG_REPO, long_pipeline())])
+        .collect()
+}
+
+/// `repo`'s Pipeline text, if it's a demo repo.
+fn pipeline_text(repo: &RepoName) -> Option<String> {
+    pipelines()
+        .into_iter()
+        .find(|(name, _)| repo_name(name) == *repo)
+        .map(|(_, text)| text)
+}
+
+/// Repos the picker offers, which have no Pipeline yet: more than fit,
+/// one with a long name.
+const AVAILABLE: &[&str] = &[
+    "jnsdls/dotfiles",
+    "typesafe-ai/web",
+    "acme-platform-engineering/observability-gateway-terraform-modules-for-every-region",
+    "acme/android",
+    "acme/billing",
+    "acme/data-pipelines",
+    "acme/design-system",
+    "acme/docs",
+    "acme/infra",
+    "acme/ios",
+    "acme/notifications",
+    "acme/search",
+];
 
 /// Reports what a daemon would until `report` returns false or the window
 /// stops sending commands.
@@ -187,7 +280,10 @@ impl Fixture {
             .collect();
         prs.sort_by(|a, b| (&a.repo, a.number).cmp(&(&b.repo, b.number)));
         WatchedPrs {
-            repos: PIPELINES.iter().map(|(repo, _)| repo_name(repo)).collect(),
+            repos: pipelines()
+                .iter()
+                .map(|(repo, _)| repo_name(repo))
+                .collect(),
             prs,
             poll: PollState::Online,
             storage: None,
@@ -206,15 +302,32 @@ impl Fixture {
                 (updates, Reply::Done)
             }
             Command::Subscribe {
+                topic: Topic::StepLog(key),
+                ..
+            } => {
+                let records = log(&self.now);
+                (vec![TopicUpdate::StepLog { key, records }], Reply::Done)
+            }
+            Command::ReadStepLog { key, page, filter } => {
+                let page = StepLogPage {
+                    key,
+                    page,
+                    filter,
+                    records: log(&self.now),
+                    more_before: false,
+                    more_after: false,
+                    truncated: None,
+                };
+                (Vec::new(), Reply::StepLog(page))
+            }
+            Command::Subscribe {
                 topic: Topic::Pipeline(repo),
                 ..
             } => {
                 let draft = self.drafts.entry(repo.clone()).or_insert_with(|| {
-                    let text = PIPELINES
-                        .iter()
-                        .find(|(name, _)| repo_name(name) == repo)
-                        .map(|(_, text)| *text);
-                    draft(&repo, text.unwrap_or(EMPTY_PIPELINE), text.is_some())
+                    let text = pipeline_text(&repo);
+                    let committed = text.is_some();
+                    draft(&repo, text.as_deref().unwrap_or(EMPTY_PIPELINE), committed)
                 });
                 (vec![pipeline_update(draft)], Reply::Done)
             }
@@ -267,6 +380,14 @@ impl Fixture {
                 (Vec::new(), Reply::AvailableRepos { repos })
             }
             Command::ListLibrarySteps => {
+                let long = LibraryStep {
+                    name: format!("{LONG_PLUGIN}-and-idempotent-on-a-production-snapshot"),
+                    text: format!("uses: {LONG_PLUGIN}\n"),
+                    problem: Some(format!(
+                        "Plugin `{LONG_PLUGIN}` has no Approval, so a Pipeline that uses this \
+                         Step won't load until it's approved under Plugins."
+                    )),
+                };
                 let steps = PRESETS
                     .iter()
                     .map(|preset| LibraryStep {
@@ -274,6 +395,7 @@ impl Fixture {
                         text: preset.text.into(),
                         problem: None,
                     })
+                    .chain([long])
                     .collect();
                 (Vec::new(), Reply::LibrarySteps { steps })
             }
@@ -454,6 +576,130 @@ fn prs(now: Now) -> Vec<DemoPr> {
             runs: Vec::new(),
         },
     ]
+    .into_iter()
+    .chain(long_prs(now))
+    .collect()
+}
+
+/// A long file path, for Findings.
+const LONG_PATH: &str = "services/ingest/src/partitioned_event_bus/consumers/billing_reconciliation/dual_write_coordinator.rs";
+
+/// [`LONG_REPO`]'s PRs: one with a 200-character title and 30 Runs, the
+/// newest live with every kind of Step, then a Stack of 20.
+fn long_prs(now: Now) -> Vec<DemoPr> {
+    let long = DemoPipeline::of(LONG_REPO);
+    let review = |findings| Outputs {
+        findings,
+        ..Outputs::default()
+    };
+    let note = |text: &str| Outputs {
+        note: Some(text.into()),
+        ..Outputs::default()
+    };
+    let mut live = long
+        .run(now, 130, "deadbee", 30.)
+        .settle("ci", 30., 22., Verdict::Pass, Outputs::default())
+        .settle("claude-review", 22., 15., Verdict::Fail, review(vec![
+            finding(Severity::Error, "The dual-write coordinator acknowledges the v1 queue before the event bus confirms the write, so a crash between the two loses the event.", Some((LONG_PATH, 1184))),
+            finding(Severity::Warning, "Backfill cursor is stored per process, not per partition.", Some(("services/ingest/src/partitioned_event_bus/backfill/resumable_cursor_store_with_lease_renewal.rs", 77))),
+            finding(Severity::Info, "Consider naming the kill switch after the tenant setting it reads.", None),
+        ]))
+        .cost("claude-review", 1.27)
+        .settle(LONG_CHECKS[2], 22., 18., Verdict::Error, note(
+            "The migration runner exited 137 while restoring the production snapshot into the scratch database: \
+             out of memory at /var/folders/xy/scratch-databases/acme-platform-engineering/internal-developer-experience-monorepo/snapshot-2026-10-04.dump",
+        ));
+    for (index, check) in LONG_CHECKS.iter().enumerate() {
+        let start = 22. - index as f64 * 0.3;
+        live = match index {
+            2 => live,
+            1 | 9 => live.settle(check, start, start - 2., Verdict::Fail, review(vec![
+                finding(Severity::Warning, "The description promises a kill switch per tenant, but the diff adds one per org.", Some((LONG_PATH, 42))),
+            ])),
+            5 => live.settle(check, start, start - 1., Verdict::Inconclusive, Outputs::default()),
+            20.. => live.start(check, start),
+            _ => live.settle(check, start, start - 1.5, Verdict::Pass, Outputs::default()),
+        };
+    }
+    let live = live.start(LONG_HUMAN, 14.);
+    let ends = [
+        EndReason::Superseded,
+        EndReason::Pushed,
+        EndReason::NotShippable,
+        EndReason::Cancelled,
+        EndReason::OverBudget,
+    ];
+    let mut runs = vec![live];
+    for id in (101..130_u64).rev() {
+        let minutes = 30. + (130 - id) as f64 * 20.;
+        let reason = ends[id as usize % ends.len()];
+        runs.push(
+            long.run(now, id, "0ldc0de", minutes)
+                .settle(
+                    "ci",
+                    minutes,
+                    minutes - 8.,
+                    Verdict::Pass,
+                    Outputs::default(),
+                )
+                .end(reason, minutes - 10.),
+        );
+    }
+    let mut prs = vec![DemoPr {
+        pr: pr(LONG_REPO, 4242, LONG_TITLE, "deadbee"),
+        runs,
+    }];
+    let part = |number: u64| {
+        format!(
+            "Event bus migration, part {} of 20: move one more consumer onto the partitioned bus",
+            number - 9000
+        )
+    };
+    for number in 9001..=9020 {
+        let mut each = pr(LONG_REPO, number, &part(number), "5ac5ac5");
+        if number > 9001 {
+            each = stacked(each, number - 1, &part(number - 1));
+        }
+        prs.push(DemoPr {
+            pr: each,
+            runs: Vec::new(),
+        });
+    }
+    prs
+}
+
+/// Every Step's log: a few lines, one of them too long for the pane and
+/// one a path with no spaces to wrap at.
+fn log(now: &Now) -> Vec<LogRecord> {
+    let lines = [
+        (LogSource::Log, Some(LogLevel::Info), "Reading the diff against main".to_owned()),
+        (LogSource::Stderr, None, format!("warning: unused import in {LONG_PATH}:12")),
+        (
+            LogSource::Log,
+            Some(LogLevel::Warn),
+            "Restoring the production snapshot into the scratch database took longer than \
+             the five minutes the runbook allows, so the check retried it once with a \
+             smaller sample of tenants before it gave up and reported the timing."
+                .to_owned(),
+        ),
+        (
+            LogSource::Stderr,
+            None,
+            "/var/folders/xy/scratch-databases/acme-platform-engineering/internal-developer-experience-monorepo/snapshot-2026-10-04.dump".to_owned(),
+        ),
+        (LogSource::Log, Some(LogLevel::Info), "Done".to_owned()),
+    ];
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, (source, level, text))| LogRecord {
+            seq: index as u64 + 1,
+            ts: now.minutes_ago(5. - index as f64),
+            source,
+            level,
+            text,
+        })
+        .collect()
 }
 
 /// The open Inbox entries, oldest first.
@@ -513,8 +759,66 @@ fn inbox(now: &Now) -> Vec<InboxEntry> {
             budget: None,
             closed: None,
         },
+        InboxEntry {
+            id: EntryId(40),
+            scope: Scope::Human {
+                run: RunId(130),
+                step: LONG_HUMAN.into(),
+            },
+            title: "Read the rollout plan in the PR description and confirm the on-call SRE \
+                    has signed off: dual writes stay on for two weeks, the backfill runs at \
+                    night in batches of ten thousand events, and the kill switch per org is \
+                    tested in staging against a copy of the largest tenant before it ships."
+                .into(),
+            reasons: Vec::new(),
+            prs: vec![pr_ref(LONG_REPO, 4242)],
+            raised_at: seconds(14.),
+            budget: None,
+            closed: None,
+        },
+        InboxEntry {
+            id: EntryId(41),
+            scope: Scope::Run {
+                run: RunId(130),
+                step: Some(LONG_CHECKS[2].into()),
+            },
+            title: format!("{} errored", LONG_CHECKS[2]),
+            reasons: vec![
+                "The migration runner exited 137 while restoring the production snapshot \
+                 into the scratch database, which usually means it ran out of memory. Retry \
+                 it once the snapshot is smaller, or raise the scratch database's memory in \
+                 /etc/acme/scratch-databases/internal-developer-experience-monorepo.toml."
+                    .into(),
+            ],
+            prs: vec![pr_ref(LONG_REPO, 4242)],
+            raised_at: seconds(18.),
+            budget: None,
+            closed: None,
+        },
+        InboxEntry {
+            id: EntryId(42),
+            scope: Scope::Cause {
+                cause: Cause::MissingSecret {
+                    name: LONG_SECRET.into(),
+                },
+            },
+            title: format!("Missing Secret {LONG_SECRET}"),
+            reasons: vec![format!("{} needs it to run.", LONG_CHECKS[3])],
+            prs: (9001..=9020)
+                .map(|number| pr_ref(LONG_REPO, number))
+                .collect(),
+            raised_at: seconds(1.),
+            budget: None,
+            closed: None,
+        },
     ]
 }
+
+/// A Secret with a long name, which a third-party Plugin needs.
+const LONG_SECRET: &str = "ACME_INTERNAL_DEVELOPER_PLATFORM_OBSERVABILITY_GATEWAY_API_KEY";
+
+/// A third-party Plugin with a long name, found at a long path.
+const LONG_PLUGIN: &str = "verify-database-migrations-are-reversible";
 
 fn secrets() -> Reply {
     Reply::Secrets {
@@ -530,6 +834,12 @@ fn secrets() -> Reply {
                 set_at: Some(1_790_000_000),
                 granted_to: vec!["claude".into(), "fix".into()],
                 optional: true,
+            },
+            SecretInfo {
+                name: LONG_SECRET.into(),
+                set_at: None,
+                granted_to: vec![LONG_PLUGIN.into(), "jev".into()],
+                optional: false,
             },
         ],
     }
@@ -547,9 +857,34 @@ fn plugins() -> Reply {
         problem: None,
         settings: Default::default(),
     };
+    let third_party = PluginListing {
+        name: LONG_PLUGIN.into(),
+        builtin: false,
+        path: Some(format!(
+            "/Users/jnsdls/Library/Application Support/slopwatch/plugins/{LONG_PLUGIN}/target/release/{LONG_PLUGIN}"
+        )),
+        version: Some("2.14.0-rc.3+build.20261004".into()),
+        asks: Some(Grant {
+            workspace: Workspace::Read,
+            effects: vec![EffectKind::Comment, EffectKind::Label],
+            secrets: vec![LONG_SECRET.into()],
+        }),
+        approved: None,
+        approved_at: None,
+        problem: None,
+        settings: PluginSettings {
+            path: vec![
+                "/opt/homebrew/opt/postgresql@17/bin".into(),
+                "/Users/jnsdls/code/acme/internal-developer-experience-monorepo/tools/bin".into(),
+            ],
+            cap: Some(2),
+            config_dir: None,
+        },
+    };
     let plugins = ["ci", "claude", "codex", "fix", "human", "jev", "merge"]
         .into_iter()
         .map(builtin)
+        .chain([third_party])
         .collect();
     Reply::Plugins { plugins }
 }
@@ -573,12 +908,8 @@ struct DemoPipeline {
 
 impl DemoPipeline {
     fn of(repo: &str) -> Self {
-        let text = PIPELINES
-            .iter()
-            .find(|(name, _)| *name == repo)
-            .map(|(_, text)| *text)
-            .expect("a demo repo");
-        let pipeline = load(text, &Builtins).unwrap_or_else(|errors| {
+        let text = pipeline_text(&repo_name(repo)).expect("a demo repo");
+        let pipeline = load(&text, &Builtins).unwrap_or_else(|errors| {
             let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
             panic!("the {repo} demo Pipeline loads: {}", errors.join("; "))
         });
@@ -1013,8 +1344,8 @@ mod tests {
     #[test]
     fn every_demo_pipeline_loads_and_every_run_replays() {
         let fixture = Fixture::new();
-        for (repo, text) in PIPELINES {
-            let draft = draft(&repo_name(repo), text, true);
+        for (repo, text) in pipelines() {
+            let draft = draft(&repo_name(repo), &text, true);
             assert!(draft.problems.is_empty(), "{repo}: {:?}", draft.problems);
         }
         for demo in &fixture.prs {
@@ -1024,6 +1355,25 @@ mod tests {
                 assert!(run.summary().strip.contains(&StripMark::Gate));
             }
         }
+    }
+
+    #[test]
+    fn the_stress_cases_are_as_long_as_they_say() {
+        assert_eq!(LONG_TITLE.chars().count(), 200);
+        let fixture = Fixture::new();
+        let long = fixture
+            .prs
+            .iter()
+            .find(|demo| demo.pr.title == LONG_TITLE)
+            .expect("the long PR");
+        assert_eq!(long.runs.len(), 30);
+        assert_eq!(long.runs[0].view().steps.len(), 30);
+        let stack = fixture
+            .prs
+            .iter()
+            .filter(|demo| (9001..=9020).contains(&demo.pr.number))
+            .count();
+        assert_eq!(stack, 20);
     }
 
     #[test]

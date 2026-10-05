@@ -54,9 +54,27 @@ pub enum WaiveTarget {
     Gate,
 }
 
+/// The PR list's or the Inbox's width, from the prototype. The PR pane
+/// takes the rest of the window.
+pub const LIST_WIDTH: f32 = 380.;
 /// In Graph mode the sources column collapses and the PR list narrows to
 /// this, leaving the rest of the window to the PR pane.
 pub const GRAPH_MODE_LIST_WIDTH: f32 = 300.;
+/// On a narrow window the list gives up width down to
+/// [`GRAPH_MODE_LIST_WIDTH`], so the PR pane keeps this much.
+pub const PR_PANE_MIN_WIDTH: f32 = 440.;
+
+/// The list's width in a window `window_width` wide, `left` of which the
+/// sources pane takes.
+pub fn list_width(window_width: f32, left: f32, graph: bool) -> f32 {
+    let width = if graph {
+        GRAPH_MODE_LIST_WIDTH
+    } else {
+        LIST_WIDTH
+    };
+    let room = window_width - left - PR_PANE_MIN_WIDTH;
+    width.min(room).max(GRAPH_MODE_LIST_WIDTH)
+}
 /// The PR pane's padding on each side.
 pub const PANE_PADDING: f32 = 18.;
 /// The graph's border, on each side.
@@ -652,6 +670,14 @@ mod tests {
     use super::*;
     use slopwatch_protocol::step::Outputs;
     use slopwatch_protocol::{PrStatus, RunEvent, StepInfo};
+
+    #[test]
+    fn the_list_narrows_on_a_narrow_window_to_keep_the_pr_pane() {
+        assert_eq!(list_width(1440., 210., false), LIST_WIDTH);
+        assert_eq!(list_width(960., 210., false), 310.);
+        assert_eq!(list_width(700., 210., false), GRAPH_MODE_LIST_WIDTH);
+        assert_eq!(list_width(960., 0., true), GRAPH_MODE_LIST_WIDTH);
+    }
 
     fn summary(id: u64, end: Option<EndReason>) -> RunSummary {
         RunSummary {

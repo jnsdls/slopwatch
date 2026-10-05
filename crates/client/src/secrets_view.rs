@@ -9,7 +9,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Command, SecretInfo};
 
-use crate::components::{ButtonLooks, ChipKind, chip, list_row, section};
+use crate::components::{ButtonLooks, ChipKind, chip, list_row, section, truncated};
 use crate::outbox::Outbox;
 use crate::outbox_view::{Pending, loading, refusal};
 use crate::secrets::{SecretsList, granted_line, needed, state_line};
@@ -138,21 +138,29 @@ impl SecretsView {
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(div().text_sm().font_family(theme::MONO).child(name.clone()))
                             .child(
-                                div()
+                                truncated("name", name.clone())
+                                    .text_sm()
+                                    .font_family(theme::MONO),
+                            )
+                            .child(
+                                truncated("granted", granted_line(secret))
                                     .text_xs()
-                                    .text_color(theme::DIM)
-                                    .child(granted_line(secret)),
+                                    .text_color(theme::DIM),
                             )
                             .children(refusal(&self.outbox, &delete_action(&name))),
                     )
                     .child(if missing {
                         chip(ChipKind::Bad, state).flex_none()
                     } else {
-                        div().text_xs().text_color(theme::DIM).child(state)
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme::DIM)
+                            .child(state)
                     })
                     .when(secret.is_set(), |this| {
                         this.child(
@@ -216,6 +224,7 @@ impl Render for SecretsView {
         div()
             .id("secrets")
             .flex_1()
+            .min_w_0()
             .h_full()
             .flex()
             .flex_col()

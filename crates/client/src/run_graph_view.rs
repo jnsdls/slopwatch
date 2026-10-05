@@ -9,7 +9,7 @@ use gpui_kit::*;
 use slopwatch_core::{GateState, Verdict};
 use slopwatch_protocol::{GateTerm, RunView, StepStatus, StepView};
 
-use crate::components::{ChipKind, chip, dot, dot_grid, gate_pill, verdict_label};
+use crate::components::{ChipKind, chip, dot, dot_grid, gate_pill, truncated, verdict_label};
 use crate::run_graph::{
     self, ALL_OF_HEIGHT, ANY_OF_HEADER, EdgeKind, GATE_BORDER, GATE_PADDING, GATE_TITLE_HEIGHT,
     Layout, NodeId, Rect, Role, TERM_HEIGHT,
@@ -31,7 +31,9 @@ pub fn run_graph(view: &RunView, open: Option<&str>, on_select: OnSelect) -> imp
         .relative()
         .flex_none()
         .w(px(layout.width))
+        .min_w_full()
         .h(px(layout.height))
+        .child(dot_grid())
         .child(edges(&layout).absolute().size_full());
     for node in &layout.nodes {
         let element = match &node.id {
@@ -57,8 +59,9 @@ pub fn run_graph(view: &RunView, open: Option<&str>, on_select: OnSelect) -> imp
         .border(px(GRAPH_BORDER))
         .border_color(theme::LINE)
         .bg(theme::BG)
+        // The pane scrolls up and down, and the canvas only sideways.
         .overflow_x_scroll()
-        .child(dot_grid())
+        .restrict_scroll_to_axis()
         .child(inner)
 }
 
@@ -187,12 +190,9 @@ fn step_node(step: &StepView, role: Role, open: bool, rect: Rect) -> Stateful<Di
                 .gap(px(6.))
                 .child(dot(look))
                 .child(
-                    div()
+                    truncated("name", info.id.clone())
                         .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(info.id.clone()),
+                        .font_weight(FontWeight::SEMIBOLD),
                 ),
         )
         .child(detail)
@@ -271,7 +271,10 @@ fn gate_term(view: &RunView, term: &GateTerm) -> Div {
                 .gap(px(6.))
                 .text_size(px(12.))
                 .child(dot(look))
-                .child(div().min_w_0().truncate().child(id.clone()))
+                .child(truncated(
+                    SharedString::from(format!("term-{id}")),
+                    id.clone(),
+                ))
                 .when(*accepts_skipped, |this| {
                     this.child(chip(ChipKind::Required, "skip ok").flex_none())
                 })
@@ -302,7 +305,9 @@ fn gate_term(view: &RunView, term: &GateTerm) -> Div {
             .flex()
             .items_center()
             .text_size(px(12.))
-            .truncate()
-            .child(text.clone()),
+            .child(truncated(
+                SharedString::from(format!("term-{text}")),
+                text.clone(),
+            )),
     }
 }

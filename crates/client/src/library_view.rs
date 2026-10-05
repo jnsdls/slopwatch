@@ -10,7 +10,7 @@ use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use slopwatch_protocol::{Command, LibraryStep};
 
-use crate::components::{ButtonLooks, list_row, section};
+use crate::components::{ButtonLooks, list_row, section, truncated};
 use crate::library::{LibraryEditor, NEW_STEP_TEXT};
 use crate::outbox::Outbox;
 use crate::outbox_view::{Pending, loading, refusal};
@@ -152,6 +152,7 @@ impl LibraryView {
         let mut list = div()
             .id("library-steps")
             .w(px(220.))
+            .flex_none()
             .h_full()
             .flex()
             .flex_col()
@@ -175,10 +176,12 @@ impl LibraryView {
             let selected = open.as_deref() == Some(name.as_str());
             list = list.child(
                 list_row(SharedString::from(format!("library-{name}")), selected)
+                    .flex_none()
                     .justify_between()
-                    .child(format!("lib/{name}"))
+                    .gap_2()
+                    .child(truncated("name", format!("lib/{name}")))
                     .when(step.problem.is_some(), |this| {
-                        this.child(div().text_color(theme::FAIL).child("invalid"))
+                        this.child(div().flex_none().text_color(theme::FAIL).child("invalid"))
                     })
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.open(&name, cx);
@@ -223,8 +226,9 @@ impl LibraryView {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .text_sm()
-                    .child(format!("lib/{}", step.name))
+                    .child(truncated("name", format!("lib/{}", step.name)))
                     .when(unsaved, |this| {
                         this.child(
                             div()
@@ -259,6 +263,7 @@ impl LibraryView {
             );
         div()
             .flex_1()
+            .min_w_0()
             .h_full()
             .flex()
             .flex_col()
@@ -294,6 +299,7 @@ impl Render for LibraryView {
         }
         div()
             .flex_1()
+            .min_w_0()
             .h_full()
             .flex()
             .overflow_hidden()
